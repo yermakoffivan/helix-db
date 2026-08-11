@@ -16,3 +16,7 @@ helix-ast = { path = "../ast", features = ["test-utils"] }
 [[bench]]
 name = "planner_scalability"
 harness = false
+
+[[bench]]
+name = "v2_plan_quality"
+harness = false
