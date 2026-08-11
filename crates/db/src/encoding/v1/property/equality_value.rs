@@ -6,7 +6,7 @@
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
 
-use super::canonical_number::CanonicalNumber;
+use super::canonical_number::{self, CanonicalNumber};
 use super::property_value::PropertyValue;
 use crate::encoding::error::EncodingError;
 
@@ -99,7 +99,7 @@ pub(crate) fn project_equality_value(value: &PropertyValue) -> EqualityValueProj
             Some(())
         }
         PropertyValue::I64(_) | PropertyValue::F64(_) | PropertyValue::F32(_) => {
-            let Some(number) = CanonicalNumber::from_property(value) else {
+            let Some(number) = canonical_number::from_property(value) else {
                 return EqualityValueProjection::NonReflexive;
             };
             canonical.put_u8(NUMBER_TAG);
@@ -195,14 +195,14 @@ fn put_number(bytes: &mut Vec<u8>, value: CanonicalNumber) {
         CanonicalNumber::NegativeInfinity => bytes.put_u8(NEGATIVE_INFINITY_TAG),
         CanonicalNumber::NegativeFinite(value) => {
             bytes.put_u8(NEGATIVE_FINITE_TAG);
-            bytes.put_i16(value.exponent);
-            bytes.put_u64(value.odd_significand);
+            bytes.put_i16(value.exponent());
+            bytes.put_u64(value.odd_significand());
         }
         CanonicalNumber::Zero => bytes.put_u8(ZERO_TAG),
         CanonicalNumber::PositiveFinite(value) => {
             bytes.put_u8(POSITIVE_FINITE_TAG);
-            bytes.put_i16(value.exponent);
-            bytes.put_u64(value.odd_significand);
+            bytes.put_i16(value.exponent());
+            bytes.put_u64(value.odd_significand());
         }
         CanonicalNumber::PositiveInfinity => bytes.put_u8(POSITIVE_INFINITY_TAG),
     }

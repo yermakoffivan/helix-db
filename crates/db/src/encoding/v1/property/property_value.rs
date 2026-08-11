@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use std::{cmp::Ordering, collections::BTreeMap};
 
 use crate::encoding::property::{datetime_millis_to_rfc3339, sortable_i64_index_string};
-use crate::encoding::v1::property::canonical_number::CanonicalNumber;
+use crate::encoding::v1::property::canonical_number::{self, CanonicalNumber};
 
 ///
 /// Supports primitive types (bool, i64, f64, string, bytes) and arrays.
@@ -128,8 +128,8 @@ impl PropertyValue {
             (
                 PropertyValue::I64(_) | PropertyValue::F64(_) | PropertyValue::F32(_),
                 PropertyValue::I64(_) | PropertyValue::F64(_) | PropertyValue::F32(_),
-            ) => CanonicalNumber::from_property(self)
-                .zip(CanonicalNumber::from_property(other))
+            ) => canonical_number::from_property(self)
+                .zip(canonical_number::from_property(other))
                 .map(|(left, right)| left.cmp(&right)),
             (PropertyValue::DateTime(left), PropertyValue::DateTime(right)) => {
                 Some(left.cmp(right))
@@ -167,8 +167,8 @@ impl PropertyValue {
                     PropertyValue::I64(_) | PropertyValue::F64(_) | PropertyValue::F32(_),
                     PropertyValue::I64(_) | PropertyValue::F64(_) | PropertyValue::F32(_),
                 ) => match (
-                    CanonicalNumber::from_property(self),
-                    CanonicalNumber::from_property(other),
+                    canonical_number::from_property(self),
+                    canonical_number::from_property(other),
                 ) {
                     (Some(left), Some(right)) => left.cmp(&right),
                     (None, None) => numeric_bits(self).cmp(&numeric_bits(other)),
@@ -206,8 +206,8 @@ impl PropertyValue {
             (
                 PropertyValue::I64(_) | PropertyValue::F64(_) | PropertyValue::F32(_),
                 PropertyValue::I64(_) | PropertyValue::F64(_) | PropertyValue::F32(_),
-            ) => CanonicalNumber::from_property(self)
-                .zip(CanonicalNumber::from_property(other))
+            ) => canonical_number::from_property(self)
+                .zip(canonical_number::from_property(other))
                 .is_some_and(|(left, right)| left == right),
             (PropertyValue::DateTime(a), PropertyValue::DateTime(b)) => a == b,
             (PropertyValue::String(a), PropertyValue::String(b)) => a == b,

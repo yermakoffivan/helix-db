@@ -7,6 +7,7 @@ edition = "2024"
 slatedb = { git = "https://github.com/HelixDB/slatedb.git", rev = "dfe4b4dc38609db8b3fe8dc6f2d3de64bfe63f0e" }
 helix-ast = { path = "../ast" }
 helix-planner = { path = "../planner" }
+helix-value-semantics = { path = "../value-semantics" }
 helix-metrics = { path = "../metrics" }
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "time"] }

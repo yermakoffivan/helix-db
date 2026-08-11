@@ -11,6 +11,23 @@ pub enum SecondaryIndexLiteralError {
     NestedValue,
 }
 
+/// Storage behavior proven for an equality-index lookup value.
+///
+/// This classification deliberately contains no physical key information.
+/// The database remains responsible for encoding an indexed value and for
+/// resolving authoritative null and runtime-dependent behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EqualityIndexValueSemantics {
+    /// Value has one canonical secondary-equality encoding.
+    Indexed,
+    /// Null is served by an authoritative graph scan because it is not stored.
+    AuthoritativeNull,
+    /// Equality is non-reflexive and is therefore statically empty.
+    NonReflexive,
+    /// Runtime parameter must be classified after binding.
+    RuntimeDependent,
+}
+
 /// Literal value that can be looked up in a secondary equality index.
 ///
 /// Secondary equality indexes share the storage-side value contract used by
@@ -63,6 +80,49 @@ impl SecondaryIndexLiteral {
     pub fn as_property_value(&self) -> &PropertyValue {
         &self.value
     }
+
+    /// Return the storage behavior implied by this validated literal.
+    ///
+    /// ```
+    /// use helix_ast::value::PropertyValue;
+    /// use helix_planner::ir::{EqualityIndexValueSemantics, SecondaryIndexLiteral};
+    ///
+    /// let nan = SecondaryIndexLiteral::new(PropertyValue::F64(f64::NAN)).unwrap();
+    /// let null = SecondaryIndexLiteral::new(PropertyValue::Null).unwrap();
+    /// assert_eq!(nan.semantics(), EqualityIndexValueSemantics::NonReflexive);
+    /// assert_eq!(null.semantics(), EqualityIndexValueSemantics::AuthoritativeNull);
+    /// ```
+    pub fn semantics(&self) -> EqualityIndexValueSemantics {
+        match &self.value {
+            PropertyValue::Null => EqualityIndexValueSemantics::AuthoritativeNull,
+            PropertyValue::F64(value) if value.is_nan() => {
+                EqualityIndexValueSemantics::NonReflexive
+            }
+            PropertyValue::F32(value) if value.is_nan() => {
+                EqualityIndexValueSemantics::NonReflexive
+            }
+            PropertyValue::F64Array(values) if values.iter().any(|value| value.is_nan()) => {
+                EqualityIndexValueSemantics::NonReflexive
+            }
+            PropertyValue::F32Array(values) if values.iter().any(|value| value.is_nan()) => {
+                EqualityIndexValueSemantics::NonReflexive
+            }
+            PropertyValue::Bool(_)
+            | PropertyValue::I64(_)
+            | PropertyValue::DateTime(_)
+            | PropertyValue::F64(_)
+            | PropertyValue::F32(_)
+            | PropertyValue::String(_)
+            | PropertyValue::Bytes(_)
+            | PropertyValue::I64Array(_)
+            | PropertyValue::F64Array(_)
+            | PropertyValue::F32Array(_)
+            | PropertyValue::StringArray(_) => EqualityIndexValueSemantics::Indexed,
+            PropertyValue::Array(_) | PropertyValue::Object(_) => {
+                unreachable!("secondary-index literals reject nested values")
+            }
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for SecondaryIndexLiteral {
@@ -83,4 +143,14 @@ pub enum IndexValue {
     Literal(SecondaryIndexLiteral),
     /// Runtime parameter value.
     Param(NonEmptyString),
+}
+
+impl IndexValue {
+    /// Return the statically known storage behavior for this lookup value.
+    pub fn semantics(&self) -> EqualityIndexValueSemantics {
+        match self {
+            Self::Literal(value) => value.semantics(),
+            Self::Param(_) => EqualityIndexValueSemantics::RuntimeDependent,
+        }
+    }
 }

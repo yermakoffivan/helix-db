@@ -8,7 +8,7 @@ use std::ops::Bound;
 
 use bytes::{BufMut, Bytes};
 
-use super::canonical_number::CanonicalNumber;
+use super::canonical_number::{self, CanonicalNumber};
 use super::property_value::PropertyValue;
 use crate::encoding::error::EncodingError;
 use crate::encoding::indexes::range::RangeIndexDirection;
@@ -92,7 +92,7 @@ pub(crate) fn project_range_value(
     let mut encoded = Vec::new();
     match value {
         PropertyValue::I64(_) | PropertyValue::F64(_) | PropertyValue::F32(_) => {
-            let Some(number) = CanonicalNumber::from_property(value) else {
+            let Some(number) = canonical_number::from_property(value) else {
                 return RangeValueProjection::NaN;
             };
             encoded.put_u8(NUMERIC_DOMAIN);
@@ -145,14 +145,14 @@ fn put_ordered_number(encoded: &mut Vec<u8>, number: CanonicalNumber) {
         CanonicalNumber::NegativeInfinity => encoded.put_u8(NEGATIVE_INFINITY_CLASS),
         CanonicalNumber::NegativeFinite(finite) => {
             encoded.put_u8(NEGATIVE_FINITE_CLASS);
-            encoded.put_u16(!biased_exponent(finite.floor_log2));
-            encoded.put_u64(!finite.normalized_significand);
+            encoded.put_u16(!biased_exponent(finite.floor_log2()));
+            encoded.put_u64(!finite.normalized_significand());
         }
         CanonicalNumber::Zero => encoded.put_u8(ZERO_CLASS),
         CanonicalNumber::PositiveFinite(finite) => {
             encoded.put_u8(POSITIVE_FINITE_CLASS);
-            encoded.put_u16(biased_exponent(finite.floor_log2));
-            encoded.put_u64(finite.normalized_significand);
+            encoded.put_u16(biased_exponent(finite.floor_log2()));
+            encoded.put_u64(finite.normalized_significand());
         }
         CanonicalNumber::PositiveInfinity => encoded.put_u8(POSITIVE_INFINITY_CLASS),
     }
