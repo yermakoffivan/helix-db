@@ -5,19 +5,93 @@
 //! measurements are informational; stable plan digests, costs, and operator
 //! census fields make semantic plan changes reviewable.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use helix_ast::batch::{self, ReadBatch};
 use helix_ast::expr::Predicate;
 use helix_ast::index::RangeIndexDirection;
 use helix_ast::traversal::{self, Order};
-use helix_planner::{catalog, context, cost, diagnostics, digest, ir, planning};
+use helix_planner::{catalog, context, cost, diagnostics, digest, exec, ir, planning};
 use serde::Serialize;
 
-const SCHEMA_VERSION: u8 = 1;
+const SCHEMA_VERSION: u8 = 2;
 const WARMUP_REPETITIONS: usize = 3;
 const MEASURED_REPETITIONS: usize = 10;
 const POPULATIONS: [u64; 2] = [1_000, 10_000];
+
+#[global_allocator]
+static ALLOCATOR: TrackingAllocator = TrackingAllocator::new();
+
+struct TrackingAllocator {
+    enabled: AtomicBool,
+    allocations: AtomicU64,
+    allocated_bytes: AtomicU64,
+}
+
+impl TrackingAllocator {
+    const fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            allocations: AtomicU64::new(0),
+            allocated_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn start(&self) {
+        self.allocations.store(0, Ordering::Relaxed);
+        self.allocated_bytes.store(0, Ordering::Relaxed);
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    fn finish(&self) -> (u64, u64) {
+        self.enabled.store(false, Ordering::Release);
+        (
+            self.allocations.load(Ordering::Relaxed),
+            self.allocated_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+// SAFETY: allocations and deallocations preserve the system allocator's
+// pointer and layout contracts. The relaxed counters are observational only.
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if self.enabled.load(Ordering::Acquire) {
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            self.allocated_bytes
+                .fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        // SAFETY: this method preserves the caller-provided layout contract.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: the pointer and layout came from the delegated allocation.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if self.enabled.load(Ordering::Acquire) {
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            self.allocated_bytes
+                .fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        // SAFETY: this method preserves the caller-provided layout contract.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if self.enabled.load(Ordering::Acquire) {
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            self.allocated_bytes
+                .fetch_add(new_size as u64, Ordering::Relaxed);
+        }
+        // SAFETY: this method preserves the delegated reallocation contract.
+        unsafe { System.realloc(pointer, layout, new_size) }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum BenchmarkCase {
@@ -219,10 +293,14 @@ struct CaseReport {
     name: &'static str,
     element: catalog::ElementKind,
     population: u64,
+    selected_shape: &'static str,
     plan_digest: digest::PlanDigest,
     selected_cost: cost::CostVector,
     planning_nanos_p50: u64,
     planning_nanos_p95: u64,
+    planning_throughput_per_second_p50: f64,
+    allocations_per_plan: f64,
+    allocated_bytes_per_plan: f64,
     planner_statistics: diagnostics::PlannerStatistics,
 }
 
@@ -243,6 +321,7 @@ fn main() {
 
             let mut elapsed = Vec::with_capacity(MEASURED_REPETITIONS);
             let mut representative = None;
+            ALLOCATOR.start();
             for _ in 0..MEASURED_REPETITIONS {
                 let started = Instant::now();
                 let output = planning::plan_read_batch_with_diagnostics(&batch, &ctx)
@@ -250,19 +329,25 @@ fn main() {
                 elapsed.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
                 representative.get_or_insert(output);
             }
+            let (allocations, allocated_bytes) = ALLOCATOR.finish();
             elapsed.sort_unstable();
             let output = representative.expect("measured repetitions are non-empty");
+            let planning_nanos_p50 = percentile(&elapsed, 50);
             cases.push(CaseReport {
                 name: case.name(),
                 element: case.element(),
                 population,
+                selected_shape: selected_shape(output.plan()),
                 plan_digest: digest::PlanDigest::for_tagged_value(
                     "v2_plan_quality_exec_steps:v1",
                     &output.plan().steps(),
                 ),
                 selected_cost: output.plan().metrics().selected_cost,
-                planning_nanos_p50: percentile(&elapsed, 50),
+                planning_nanos_p50,
                 planning_nanos_p95: percentile(&elapsed, 95),
+                planning_throughput_per_second_p50: 1_000_000_000_f64 / planning_nanos_p50 as f64,
+                allocations_per_plan: allocations as f64 / MEASURED_REPETITIONS as f64,
+                allocated_bytes_per_plan: allocated_bytes as f64 / MEASURED_REPETITIONS as f64,
                 planner_statistics: output.diagnostics().statistics.clone(),
             });
         }
@@ -275,10 +360,59 @@ fn main() {
         measured_repetitions: MEASURED_REPETITIONS,
         cases,
     };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report).expect("benchmark report serializes")
-    );
+    let json = serde_json::to_string_pretty(&report).expect("benchmark report serializes");
+    if let Ok(output) = std::env::var("HELIX_PLANNER_BENCH_OUTPUT") {
+        std::fs::write(output, &json).expect("benchmark report output is writable");
+    }
+    println!("{json}");
+}
+
+fn selected_shape(plan: &exec::ExecutablePlan) -> &'static str {
+    let value = serde_json::to_value(plan.steps()).expect("executable steps serialize");
+    classify_serialized_shape(&value)
+}
+
+fn classify_serialized_shape(value: &serde_json::Value) -> &'static str {
+    let serialized = value.to_string();
+    if serialized.contains("ordered_intersect") {
+        return "ordered_range_bitmap_filter";
+    }
+    if serialized.contains("secondary_set") && serialized.contains("intersect") {
+        return "bitmap_intersection";
+    }
+    if serialized.contains("secondary_set") && serialized.contains("union") {
+        return "bitmap_union";
+    }
+    if serialized.contains("secondary_set") && has_multi_value_equality(value) {
+        return "batched_bitmap_equality";
+    }
+    if serialized.contains("equality_index") && serialized.contains("\"uniqueness\":\"unique\"") {
+        return "unique_equality_verified_point";
+    }
+    if serialized.contains("equality_index") || serialized.contains("secondary_set") {
+        return "bitmap_equality_point";
+    }
+    if serialized.contains("range_index") {
+        return "ordered_range_verified_scan";
+    }
+    if serialized.contains("access") {
+        return "row_stream_access";
+    }
+    "no_access"
+}
+
+fn has_multi_value_equality(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(has_multi_value_equality),
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            (key == "values" && value.as_array().is_some_and(|values| values.len() > 1))
+                || has_multi_value_equality(value)
+        }),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => false,
+    }
 }
 
 fn planner_context(population: u64) -> context::PlannerContext {
