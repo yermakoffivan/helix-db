@@ -83,6 +83,8 @@ use super::IndexScopeGates;
 #[cfg(any(test, feature = "production-coverage"))]
 static BENCHMARK_POINT_READS: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, feature = "production-coverage"))]
+static BENCHMARK_MULTI_GETS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "production-coverage"))]
 static BENCHMARK_SCANS: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, feature = "production-coverage"))]
 static BENCHMARK_GRAPH_READS: AtomicU64 = AtomicU64::new(0);
@@ -93,6 +95,7 @@ static BENCHMARK_GRAPH_READS: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SecondaryEqualityReadMetrics {
     pub(crate) point_reads: u64,
+    pub(crate) multi_get_calls: u64,
     pub(crate) scans: u64,
     pub(crate) graph_reads: u64,
 }
@@ -100,6 +103,7 @@ pub(crate) struct SecondaryEqualityReadMetrics {
 #[cfg(any(test, feature = "production-coverage"))]
 pub(crate) fn reset_equality_read_metrics() {
     BENCHMARK_POINT_READS.store(0, AtomicOrdering::Relaxed);
+    BENCHMARK_MULTI_GETS.store(0, AtomicOrdering::Relaxed);
     BENCHMARK_SCANS.store(0, AtomicOrdering::Relaxed);
     BENCHMARK_GRAPH_READS.store(0, AtomicOrdering::Relaxed);
 }
@@ -108,6 +112,7 @@ pub(crate) fn reset_equality_read_metrics() {
 pub(crate) fn equality_read_metrics() -> SecondaryEqualityReadMetrics {
     SecondaryEqualityReadMetrics {
         point_reads: BENCHMARK_POINT_READS.load(AtomicOrdering::Relaxed),
+        multi_get_calls: BENCHMARK_MULTI_GETS.load(AtomicOrdering::Relaxed),
         scans: BENCHMARK_SCANS.load(AtomicOrdering::Relaxed),
         graph_reads: BENCHMARK_GRAPH_READS.load(AtomicOrdering::Relaxed),
     }
@@ -2893,6 +2898,65 @@ pub(crate) async fn lookup_active_equality_generation(
         .map(Option::unwrap_or_default)
 }
 
+/// Reads and unions equality values from one exact Active generation.
+///
+/// Non-unique indexed values use one `multi_get` over their V4 bitmap rows.
+/// Unique, null, non-reflexive, and error projections retain the authoritative
+/// single-value path so their verification contracts remain unchanged.
+pub(crate) async fn lookup_active_equality_generations(
+    reader: &(impl DbReadOps + Sync),
+    handle: &ActiveIndexHandle,
+    values: &[PropertyValue],
+) -> Result<roaring::RoaringTreemap> {
+    let Some(definition) = handle.secondary_definition() else {
+        return Err(corruption(
+            "secondary equality batch serving received a non-secondary Active handle",
+        ));
+    };
+    if !definition_uses_equality_bitmap(definition) {
+        let mut owners = roaring::RoaringTreemap::new();
+        for value in values {
+            owners |= lookup_active_equality_generation(reader, handle, value).await?;
+        }
+        return Ok(owners);
+    }
+
+    let mut canonical = Vec::with_capacity(values.len());
+    for value in values {
+        let EqualityValueProjection::Indexed(value) = project_equality_value(value) else {
+            let mut owners = roaring::RoaringTreemap::new();
+            for value in values {
+                owners |= lookup_active_equality_generation(reader, handle, value).await?;
+            }
+            return Ok(owners);
+        };
+        canonical.push(CanonicalSecondaryValue::equality(value));
+    }
+    let mut keys = canonical
+        .into_iter()
+        .map(|value| {
+            secondary_entry_key(
+                handle.scope(),
+                handle.index_id(),
+                handle.generation(),
+                definition,
+                value,
+                IndexEntityId::initial(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    keys.sort_unstable();
+    keys.dedup();
+    keys.iter().for_each(|_| record_equality_point_read());
+    #[cfg(any(test, feature = "production-coverage"))]
+    BENCHMARK_MULTI_GETS.fetch_add(1, AtomicOrdering::Relaxed);
+    let mut owners = roaring::RoaringTreemap::new();
+    for bytes in reader.multi_get(&keys).await?.into_iter().flatten() {
+        owners |= SecondaryEqualityBitmapValue::decode(&bytes)?.into_ids();
+    }
+    Ok(owners)
+}
+
 async fn scan_authoritative_null_equality(
     reader: &(impl DbReadOps + Sync),
     handle: &ActiveIndexHandle,
@@ -4800,6 +4864,7 @@ mod tests {
             equality_read_metrics(),
             SecondaryEqualityReadMetrics {
                 point_reads: 1,
+                multi_get_calls: 0,
                 scans: 0,
                 graph_reads: 0,
             }

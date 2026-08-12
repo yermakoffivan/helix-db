@@ -73,6 +73,44 @@ impl<'db> ExecutionContext<'db> {
         }
     }
 
+    pub(super) async fn lookup_managed_equality_union(
+        &self,
+        element_kind: crate::index_lifecycle::IndexElementKind,
+        key: &catalog::ScopedPropertyKey,
+        values: &[DbPropertyValue],
+    ) -> Result<roaring::RoaringTreemap> {
+        let identity = secondary_identity(
+            crate::index_lifecycle::IndexIdentityFamily::SecondaryEquality,
+            element_kind,
+            key.label.as_ref(),
+            key.property.as_ref(),
+        )?;
+        if let Some(active) = self.active_write_tx() {
+            return lookup_managed_equalities_in_view(self, &active.txn, &identity, values).await;
+        }
+        if let Some(view) = self.request_read_view() {
+            return lookup_managed_equalities_in_view(self, view, &identity, values).await;
+        }
+        #[cfg(test)]
+        {
+            match self.db.storage() {
+                HelixStorage::Reader(reader) => {
+                    lookup_managed_equalities_in_view(self, reader.as_ref(), &identity, values)
+                        .await
+                }
+                HelixStorage::Writer(writer) => {
+                    lookup_managed_equalities_in_view(self, writer.db(), &identity, values).await
+                }
+            }
+        }
+        #[cfg(not(test))]
+        {
+            Err(HelixDbError::InvariantViolation(
+                "secondary equality batch escaped its request read view".to_string(),
+            ))
+        }
+    }
+
     pub(super) async fn lookup_global_edge_label_index(
         &self,
         label: &str,
@@ -412,6 +450,15 @@ async fn lookup_managed_equality_in_view(
     identity: &crate::index_lifecycle::IndexIdentity,
     value: &DbPropertyValue,
 ) -> Result<roaring::RoaringTreemap> {
+    lookup_managed_equalities_in_view(context, reader, identity, core::slice::from_ref(value)).await
+}
+
+async fn lookup_managed_equalities_in_view(
+    context: &ExecutionContext<'_>,
+    reader: &(impl DbReadOps + Send + Sync),
+    identity: &crate::index_lifecycle::IndexIdentity,
+    values: &[DbPropertyValue],
+) -> Result<roaring::RoaringTreemap> {
     if let Some(active_write) = context.active_write_tx() {
         let Some(active) = active_write.index_context.active_handle(identity) else {
             return Err(HelixDbError::IndexLifecycleUnavailable {
@@ -419,7 +466,7 @@ async fn lookup_managed_equality_in_view(
                 reason: crate::error::IndexLifecycleUnavailableReason::CanonicalStateUnavailable,
             });
         };
-        return lookup_managed_active_equality_in_view(reader, active, value).await;
+        return lookup_managed_active_equalities_in_view(reader, active, values).await;
     }
 
     if let Some(catalog) = context.request_read_index_catalog() {
@@ -429,7 +476,7 @@ async fn lookup_managed_equality_in_view(
                 reason: crate::error::IndexLifecycleUnavailableReason::CanonicalStateUnavailable,
             });
         };
-        return lookup_managed_active_equality_in_view(reader, active, value).await;
+        return lookup_managed_active_equalities_in_view(reader, active, values).await;
     }
 
     crate::index_lifecycle::secondary::record_equality_point_read();
@@ -453,13 +500,13 @@ async fn lookup_managed_equality_in_view(
             reason: crate::error::IndexLifecycleUnavailableReason::CanonicalStateUnavailable,
         });
     };
-    lookup_managed_active_equality_in_view(reader, &active, value).await
+    lookup_managed_active_equalities_in_view(reader, &active, values).await
 }
 
-async fn lookup_managed_active_equality_in_view(
+async fn lookup_managed_active_equalities_in_view(
     reader: &(impl DbReadOps + Send + Sync),
     active: &crate::index_lifecycle::ActiveIndexHandle,
-    value: &DbPropertyValue,
+    values: &[DbPropertyValue],
 ) -> Result<roaring::RoaringTreemap> {
     if !matches!(
         active,
@@ -469,7 +516,7 @@ async fn lookup_managed_active_equality_in_view(
             "secondary equality identity resolved another Active family".to_string(),
         ));
     }
-    crate::index_lifecycle::secondary::lookup_active_equality_generation(reader, active, value)
+    crate::index_lifecycle::secondary::lookup_active_equality_generations(reader, active, values)
         .await
 }
 

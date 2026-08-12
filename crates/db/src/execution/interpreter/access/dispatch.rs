@@ -72,14 +72,20 @@ impl<'db> ExecutionContext<'db> {
             ),
             exec::ExecNodeAccessPlan::EqualityIndex { key, value, .. } => {
                 let value = self.index_value(value)?;
-                limited_index_ids(
+                let ids = limited_index_ids(
                     self.lookup_equality_index_set(&scoped_property_key(key), &value)
                         .await?,
                     limit,
-                )
+                );
+                return self.verified_node_rows(ids);
             }
             exec::ExecNodeAccessPlan::RangeIndex { key, range, .. } => {
-                self.node_range_index_ids(key, range, limit).await?
+                let ids = self.node_range_index_ids(key, range, limit).await?;
+                return self.verified_node_rows(ids);
+            }
+            exec::ExecNodeAccessPlan::SecondarySet { set } => {
+                let ids = self.node_secondary_set_ids(set, limit).await?;
+                return self.verified_node_rows(ids);
             }
             exec::ExecNodeAccessPlan::VectorSearch {
                 key,
@@ -144,14 +150,20 @@ impl<'db> ExecutionContext<'db> {
             ),
             exec::ExecEdgeAccessPlan::EqualityIndex { key, value, .. } => {
                 let value = self.index_value(value)?;
-                limited_index_ids(
+                let ids = limited_index_ids(
                     self.lookup_global_edge_equality_index(&scoped_property_key(key), &value)
                         .await?,
                     limit,
-                )
+                );
+                return self.verified_edge_rows(ids);
             }
             exec::ExecEdgeAccessPlan::RangeIndex { key, range, .. } => {
-                self.edge_range_index_ids(key, range, limit).await?
+                let ids = self.edge_range_index_ids(key, range, limit).await?;
+                return self.verified_edge_rows(ids);
+            }
+            exec::ExecEdgeAccessPlan::SecondarySet { set } => {
+                let ids = self.edge_secondary_set_ids(set, limit).await?;
+                return self.verified_edge_rows(ids);
             }
             exec::ExecEdgeAccessPlan::VectorSearch {
                 key,

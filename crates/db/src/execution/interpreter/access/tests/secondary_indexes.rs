@@ -453,6 +453,170 @@ async fn managed_secondary_access_uses_active_v2_rows() {
 }
 
 #[tokio::test]
+async fn secondary_set_batches_same_index_values_without_graph_hydration() {
+    let db = test_support::open_db("access-secondary-set-batch").await;
+    let active = test_support::add_node_with_properties(
+        &db,
+        "User",
+        vec![("status", PropertyValue::from("active"))],
+    )
+    .await;
+    let paused = test_support::add_node_with_properties(
+        &db,
+        "User",
+        vec![("status", PropertyValue::from("paused"))],
+    )
+    .await;
+    let inactive = test_support::add_node_with_properties(
+        &db,
+        "User",
+        vec![("status", PropertyValue::from("inactive"))],
+    )
+    .await;
+    seed_active_secondary_generation(
+        &db,
+        SecondaryIndexDefinition::node_equality("User", "status").unwrap(),
+        51,
+        &[
+            ("active", active),
+            ("paused", paused),
+            ("inactive", inactive),
+        ],
+    )
+    .await;
+    let values = ir::AtLeast::<_, 1>::try_from_vec(vec![
+        ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from("active")).unwrap(),
+        ),
+        ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from("paused")).unwrap(),
+        ),
+    ])
+    .unwrap();
+    crate::index_lifecycle::secondary::reset_equality_read_metrics();
+
+    let actual = run_node_access(
+        &db,
+        exec::ExecNodeAccessPlan::SecondarySet {
+            set: exec::ExecNodeSecondarySetPlan::Equality {
+                index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                    "node_eq:User:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                values,
+            },
+        },
+    )
+    .await;
+
+    let mut expected = vec![active, paused];
+    expected.sort_unstable();
+    assert_eq!(
+        actual,
+        ExecutionValue::Scalars(expected.into_iter().map(ExecutionScalar::NodeId).collect())
+    );
+    let metrics = crate::index_lifecycle::secondary::equality_read_metrics();
+    // The unprepared test path reads one catalog row before the two bitmap keys.
+    assert_eq!(metrics.point_reads, 3);
+    assert_eq!(metrics.multi_get_calls, 1);
+    assert_eq!(metrics.graph_reads, 0);
+}
+
+#[tokio::test]
+async fn ordered_edge_secondary_intersection_filters_before_applying_limit() {
+    let db = test_support::open_db("access-ordered-edge-secondary-set").await;
+    let from = test_support::add_user(&db, "from").await;
+    let to = test_support::add_user(&db, "to").await;
+    let active_low = test_support::add_edge_with_properties(
+        &db,
+        from,
+        to,
+        "FOLLOWS",
+        vec![
+            ("status", PropertyValue::from("active")),
+            ("weight", PropertyValue::from("a")),
+        ],
+    )
+    .await;
+    let inactive_middle = test_support::add_edge_with_properties(
+        &db,
+        from,
+        to,
+        "FOLLOWS",
+        vec![
+            ("status", PropertyValue::from("inactive")),
+            ("weight", PropertyValue::from("b")),
+        ],
+    )
+    .await;
+    let active_high = test_support::add_edge_with_properties(
+        &db,
+        from,
+        to,
+        "FOLLOWS",
+        vec![
+            ("status", PropertyValue::from("active")),
+            ("weight", PropertyValue::from("c")),
+        ],
+    )
+    .await;
+    seed_active_secondary_generation(
+        &db,
+        SecondaryIndexDefinition::edge_equality("FOLLOWS", "status").unwrap(),
+        52,
+        &[
+            ("active", active_low),
+            ("inactive", inactive_middle),
+            ("active", active_high),
+        ],
+    )
+    .await;
+    seed_active_secondary_generation(
+        &db,
+        SecondaryIndexDefinition::edge_range("FOLLOWS", "weight").unwrap(),
+        53,
+        &[
+            ("a", active_low),
+            ("b", inactive_middle),
+            ("c", active_high),
+        ],
+    )
+    .await;
+    let equality = exec::ExecEdgeSecondarySetPlan::Equality {
+        index: catalog::EdgeEqualityIndexMeta::new(test_support::name("edge_eq:FOLLOWS:status")),
+        key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+        values: ir::AtLeast::from_one(ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from("active")).unwrap(),
+        )),
+    };
+    let plan = exec::ExecEdgeAccessPlan::SecondarySet {
+        set: exec::ExecEdgeSecondarySetPlan::OrderedIntersect {
+            driver: exec::ExecEdgeSecondaryRangePlan {
+                index: catalog::EdgeRangeIndexMeta::new(test_support::name(
+                    "edge_range:FOLLOWS:weight:asc",
+                )),
+                key: catalog::ScopedPropertyDirectionKey::try_new(
+                    "FOLLOWS",
+                    "weight",
+                    helix_ast::index::RangeIndexDirection::Asc,
+                )
+                .unwrap(),
+                range: ir::IndexRange::All,
+            },
+            filters: ir::AtLeast::from_one(equality),
+        },
+    };
+
+    assert_eq!(
+        run_limited_edge_access(&db, plan, 2).await,
+        ExecutionValue::Scalars(vec![
+            ExecutionScalar::EdgeId(active_low),
+            ExecutionScalar::EdgeId(active_high),
+        ])
+    );
+}
+
+#[tokio::test]
 async fn edge_equality_access_uses_global_label_scoped_index() {
     let config = test_support::in_memory_config("access-edge-equality-index")
         .with_edge_equality_index("FOLLOWS", "status");

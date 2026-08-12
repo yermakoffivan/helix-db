@@ -97,7 +97,8 @@ fn required_for_access(plan: &exec::ExecAccessPlan) -> RequiredMutationVisibilit
         exec::ExecAccessPlan::Limited(plan) => required_for_access(plan.source()),
         exec::ExecAccessPlan::Node(plan) => match plan {
             exec::ExecNodeAccessPlan::EqualityIndex { .. }
-            | exec::ExecNodeAccessPlan::RangeIndex { .. } => {
+            | exec::ExecNodeAccessPlan::RangeIndex { .. }
+            | exec::ExecNodeAccessPlan::SecondarySet { .. } => {
                 RequiredMutationVisibility::one(DeferredMutationFamily::Secondary)
             }
             exec::ExecNodeAccessPlan::VectorSearch { .. } => {
@@ -116,7 +117,8 @@ fn required_for_access(plan: &exec::ExecAccessPlan) -> RequiredMutationVisibilit
         },
         exec::ExecAccessPlan::Edge(plan) => match plan {
             exec::ExecEdgeAccessPlan::EqualityIndex { .. }
-            | exec::ExecEdgeAccessPlan::RangeIndex { .. } => {
+            | exec::ExecEdgeAccessPlan::RangeIndex { .. }
+            | exec::ExecEdgeAccessPlan::SecondarySet { .. } => {
                 RequiredMutationVisibility::one(DeferredMutationFamily::Secondary)
             }
             exec::ExecEdgeAccessPlan::VectorSearch { .. } => {

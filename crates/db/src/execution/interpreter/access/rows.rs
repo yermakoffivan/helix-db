@@ -12,6 +12,32 @@ use crate::search::text::TextSearchHit;
 use crate::search::vector::{DistanceOutputVersion, TypedVectorSearchResult, VectorEntityId};
 
 impl<'db> ExecutionContext<'db> {
+    pub(in crate::execution::interpreter) fn verified_node_rows(
+        &self,
+        ids: Vec<u64>,
+    ) -> Result<ExecutionValue> {
+        ids.iter()
+            .try_for_each(|_| self.check_execution_deadline())?;
+        Ok(ExecutionValue::Stream(
+            ids.into_iter()
+                .map(|id| ExecutionRow::current(ElementRef::Node(id)))
+                .collect(),
+        ))
+    }
+
+    pub(in crate::execution::interpreter) fn verified_edge_rows(
+        &self,
+        ids: Vec<u64>,
+    ) -> Result<ExecutionValue> {
+        ids.iter()
+            .try_for_each(|_| self.check_execution_deadline())?;
+        Ok(ExecutionValue::Stream(
+            ids.into_iter()
+                .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
+                .collect(),
+        ))
+    }
+
     pub(in crate::execution::interpreter) async fn node_rows(
         &self,
         ids: Vec<u64>,
