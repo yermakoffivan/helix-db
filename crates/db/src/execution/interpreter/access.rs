@@ -13,4 +13,4 @@ mod secondary_set;
 pub(in crate::execution::interpreter) use search::SearchReadLimit;
 
 #[cfg(test)]
-mod tests;
+pub(in crate::execution::interpreter) mod tests;

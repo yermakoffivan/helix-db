@@ -233,4 +233,116 @@ fn equality_unions_match_batch_only_when_every_literal_has_one_non_unique_identi
         &edge_explicit,
         &physical::PhysicalAccess::BitmapBatchUnion,
     ));
+
+    let node_non_equality_first = ir::NodeAccessPlan::Union(ir::AtLeast::from_pair(
+        ir::NodeAccessSourcePlan::new(ir::NodeAccessPlan::Empty).unwrap(),
+        source("status", literal("active")),
+    ));
+    assert!(!node::selected_node_access_matches(
+        &node_non_equality_first,
+        &physical::PhysicalAccess::BitmapBatchUnion,
+    ));
+    assert!(node::selected_node_access_matches(
+        &node_non_equality_first,
+        &physical::PhysicalAccess::SetUnion,
+    ));
+
+    let edge_non_equality_first = ir::EdgeAccessPlan::Union(ir::AtLeast::from_pair(
+        ir::EdgeAccessSourcePlan::new(ir::EdgeAccessPlan::Empty).unwrap(),
+        edge_source("status", literal("active")),
+    ));
+    assert!(!edge::selected_edge_access_matches(
+        &edge_non_equality_first,
+        &physical::PhysicalAccess::BitmapBatchUnion,
+    ));
+    assert!(edge::selected_edge_access_matches(
+        &edge_non_equality_first,
+        &physical::PhysicalAccess::SetUnion,
+    ));
+
+    let node_same_index_other_key = ir::NodeAccessPlan::Union(ir::AtLeast::from_pair(
+        source("status", literal("active")),
+        ir::NodeAccessSourcePlan::new(ir::NodeAccessPlan::EqualityIndex {
+            index: catalog::NodeEqualityIndexMeta::try_new("node_eq:User:status").unwrap(),
+            key: catalog::ScopedPropertyKey::try_new("User", "role").unwrap(),
+            value: literal("admin"),
+        })
+        .unwrap(),
+    ));
+    assert!(node::selected_node_access_matches(
+        &node_same_index_other_key,
+        &physical::PhysicalAccess::SetUnion,
+    ));
+
+    let node_unique_first = ir::NodeAccessPlan::Union(ir::AtLeast::from_pair(
+        ir::NodeAccessSourcePlan::new(ir::NodeAccessPlan::EqualityIndex {
+            index: catalog::NodeEqualityIndexMeta::try_new("node_eq:User:status")
+                .unwrap()
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            value: literal("active"),
+        })
+        .unwrap(),
+        source("status", literal("paused")),
+    ));
+    assert!(node::selected_node_access_matches(
+        &node_unique_first,
+        &physical::PhysicalAccess::SetUnion,
+    ));
+
+    let node_null_first = ir::NodeAccessPlan::Union(ir::AtLeast::from_pair(
+        source(
+            "status",
+            ir::IndexValue::Literal(
+                ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::Null).unwrap(),
+            ),
+        ),
+        source("status", literal("active")),
+    ));
+    assert!(node::selected_node_access_matches(
+        &node_null_first,
+        &physical::PhysicalAccess::SetUnion,
+    ));
+
+    let edge_same_index_other_key = ir::EdgeAccessPlan::Union(ir::AtLeast::from_pair(
+        edge_source("status", literal("active")),
+        ir::EdgeAccessSourcePlan::new(ir::EdgeAccessPlan::EqualityIndex {
+            index: catalog::EdgeEqualityIndexMeta::try_new("edge_eq:FOLLOWS:status").unwrap(),
+            key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "kind").unwrap(),
+            value: literal("friend"),
+        })
+        .unwrap(),
+    ));
+    assert!(edge::selected_edge_access_matches(
+        &edge_same_index_other_key,
+        &physical::PhysicalAccess::SetUnion,
+    ));
+
+    let edge_null_first = ir::EdgeAccessPlan::Union(ir::AtLeast::from_pair(
+        edge_source(
+            "status",
+            ir::IndexValue::Literal(
+                ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::Null).unwrap(),
+            ),
+        ),
+        edge_source("status", literal("active")),
+    ));
+    assert!(edge::selected_edge_access_matches(
+        &edge_null_first,
+        &physical::PhysicalAccess::SetUnion,
+    ));
+
+    let edge_null_child = ir::EdgeAccessPlan::Union(ir::AtLeast::from_pair(
+        edge_source("status", literal("active")),
+        edge_source(
+            "status",
+            ir::IndexValue::Literal(
+                ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::Null).unwrap(),
+            ),
+        ),
+    ));
+    assert!(edge::selected_edge_access_matches(
+        &edge_null_child,
+        &physical::PhysicalAccess::SetUnion,
+    ));
 }

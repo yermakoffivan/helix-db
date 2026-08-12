@@ -173,10 +173,9 @@ impl TryFrom<ir::SecondaryIndexLiteral> for ExecIndexedEqualityValue {
 
     fn try_from(value: ir::SecondaryIndexLiteral) -> Result<Self, Self::Error> {
         match value.semantics() {
-            ir::EqualityIndexValueSemantics::Indexed => Ok(Self(value)),
-            ir::EqualityIndexValueSemantics::AuthoritativeNull
-            | ir::EqualityIndexValueSemantics::NonReflexive
-            | ir::EqualityIndexValueSemantics::RuntimeDependent => {
+            ir::LiteralEqualityIndexValueSemantics::Indexed => Ok(Self(value)),
+            ir::LiteralEqualityIndexValueSemantics::AuthoritativeNull
+            | ir::LiteralEqualityIndexValueSemantics::NonReflexive => {
                 Err(ExecEqualityContractError::ExpectedIndexedValue)
             }
         }
@@ -1083,11 +1082,11 @@ impl ExecCountPlan {
         match self {
             Self::InputRows { .. } => Ok(ExecCountDependency::Rows),
             Self::InputScalars { .. } => Ok(ExecCountDependency::Scalars),
-            Self::Stream(plan) => match cursor_row_input_count(&plan.cursor)? {
-                0 => Ok(ExecCountDependency::Direct),
-                1 => Ok(ExecCountDependency::Rows),
-                _ => Err(ExecCountDependencyError::MultipleRowInputs),
-            },
+            Self::Stream(plan) => Ok(if cursor_row_input_count(&plan.cursor)? == 0 {
+                ExecCountDependency::Direct
+            } else {
+                ExecCountDependency::Rows
+            }),
             Self::Constant(_)
             | Self::NodeBitmap(_)
             | Self::EdgeBitmap(_)
@@ -1270,7 +1269,14 @@ fn cursor_row_input_count(cursor: &ExecCountCursorPlan) -> Result<usize, ExecCou
 
 #[cfg(test)]
 mod tests {
-    use helix_ast::value::PropertyValue;
+    use std::num::NonZeroUsize;
+
+    use helix_ast::{
+        expr::Predicate,
+        index::RangeIndexDirection,
+        traversal::Order,
+        value::{PropertyInput, PropertyValue},
+    };
     use proptest::prelude::*;
 
     use super::*;
@@ -1281,6 +1287,243 @@ mod tests {
 
     fn literal(value: usize) -> ExecUsizeExpr {
         ExecUsizeExpr::Literal(value)
+    }
+
+    fn indexed(value: &str) -> ExecIndexedEqualityValue {
+        ExecIndexedEqualityValue::try_from(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from(value)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn node_index() -> ExecNodeNonUniqueEqualityIndex {
+        catalog::NodeEqualityIndexMeta::new(name("node_eq:User:status"))
+            .try_into()
+            .unwrap()
+    }
+
+    fn edge_index() -> ExecEdgeNonUniqueEqualityIndex {
+        ExecEdgeNonUniqueEqualityIndex::new(catalog::EdgeEqualityIndexMeta::new(name(
+            "edge_eq:LIKES:status",
+        )))
+    }
+
+    fn node_point(value: &str) -> ExecNodeBitmapExpr {
+        ExecNodeBitmapExpr::PointRead {
+            index: node_index(),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            value: indexed(value),
+        }
+    }
+
+    fn edge_point(value: &str) -> ExecEdgeBitmapExpr {
+        ExecEdgeBitmapExpr::PointRead {
+            index: edge_index(),
+            key: catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+            value: indexed(value),
+        }
+    }
+
+    fn unique_parts() -> (
+        ExecNodeUniqueOwnerReadPlan,
+        ExecNodeAuthoritativeVerificationPlan,
+    ) {
+        let key = catalog::ScopedPropertyKey::try_new("User", "email").unwrap();
+        let value = indexed("alice@example.test");
+        (
+            ExecNodeUniqueOwnerReadPlan {
+                index: catalog::NodeEqualityIndexMeta::new(name("node_eq:User:email"))
+                    .with_uniqueness(catalog::IndexUniqueness::Unique)
+                    .try_into()
+                    .unwrap(),
+                key: key.clone(),
+                value: value.clone(),
+            },
+            ExecNodeAuthoritativeVerificationPlan { key, value },
+        )
+    }
+
+    fn node_range() -> ExecNodeVerifiedRangeScanPlan {
+        ExecNodeVerifiedRangeScanPlan {
+            index: catalog::NodeRangeIndexMeta::try_new("node_range:User:age:asc").unwrap(),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "User",
+                "age",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        }
+    }
+
+    fn edge_range() -> ExecEdgeVerifiedRangeScanPlan {
+        ExecEdgeVerifiedRangeScanPlan {
+            index: catalog::EdgeRangeIndexMeta::try_new("edge_range:LIKES:age:desc").unwrap(),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "LIKES",
+                "age",
+                RangeIndexDirection::Desc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        }
+    }
+
+    fn ids() -> ir::ElementIds {
+        ir::ElementIds::new(ir::AtLeast::from_one_and_rest(1, vec![2])).unwrap()
+    }
+
+    fn search_index() -> ir::SearchIndexPlan {
+        ir::SearchIndexPlan {
+            index_id: name("search-index"),
+            tenant: ir::SearchTenantPlan::Unscoped,
+        }
+    }
+
+    fn search_limit() -> ir::SearchLimitPlan {
+        ir::SearchLimitPlan::Literal(NonZeroUsize::MIN)
+    }
+
+    fn vector_input() -> ir::VectorQueryInputPlan {
+        ir::VectorQueryInputPlan::new(PropertyInput::from(vec![1.0_f32])).unwrap()
+    }
+
+    fn text_input() -> ir::TextQueryInputPlan {
+        ir::TextQueryInputPlan::new(PropertyInput::from("needle")).unwrap()
+    }
+
+    fn predicate() -> ir::PredicatePlan {
+        ir::PredicatePlan::new(Predicate::has_key("status")).unwrap()
+    }
+
+    fn cursor_leaves() -> Vec<ExecCountCursorPlan> {
+        let (lookup, verification) = unique_parts();
+        vec![
+            ExecCountCursorPlan::EmptyRows,
+            ExecCountCursorPlan::InputRows,
+            ExecCountCursorPlan::NodeBitmap(node_point("active")),
+            ExecCountCursorPlan::EdgeBitmap(edge_point("active")),
+            ExecCountCursorPlan::NodeUnique {
+                lookup,
+                verification,
+            },
+            ExecCountCursorPlan::NodeRange(node_range()),
+            ExecCountCursorPlan::EdgeRange(edge_range()),
+            ExecCountCursorPlan::NodeAuthoritativeScan(
+                ExecNodeAuthoritativeScanPredicate::NullEquality {
+                    key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                },
+            ),
+            ExecCountCursorPlan::EdgeAuthoritativeScan(
+                ExecEdgeAuthoritativeScanPredicate::Predicate(predicate()),
+            ),
+            ExecCountCursorPlan::NodePointReads(ids()),
+            ExecCountCursorPlan::EdgePointReads(ids()),
+            ExecCountCursorPlan::NodeRuntimeInput(ExecRuntimeInputPlan::Param(name("nodes"))),
+            ExecCountCursorPlan::EdgeRuntimeInput(ExecRuntimeInputPlan::Variable(name("edges"))),
+            ExecCountCursorPlan::RuntimeInput(ExecRuntimeInputPlan::Param(name("rows"))),
+            ExecCountCursorPlan::NodeFullScan,
+            ExecCountCursorPlan::EdgeFullScan,
+            ExecCountCursorPlan::NodeLabelBitmap(name("User")),
+            ExecCountCursorPlan::EdgeLabelBitmap(name("LIKES")),
+            ExecCountCursorPlan::NodeVectorSearch {
+                key: catalog::NodeSearchIndexKey::try_new("User", "embedding").unwrap(),
+                index: search_index(),
+                query_vector: vector_input(),
+                k: search_limit(),
+            },
+            ExecCountCursorPlan::EdgeVectorSearch {
+                key: catalog::EdgeSearchIndexKey::try_new("LIKES", "embedding").unwrap(),
+                index: search_index(),
+                query_vector: vector_input(),
+                k: search_limit(),
+            },
+            ExecCountCursorPlan::NodeTextSearch {
+                key: catalog::NodeSearchIndexKey::try_new("User", "body").unwrap(),
+                index: search_index(),
+                query_text: text_input(),
+                k: search_limit(),
+            },
+            ExecCountCursorPlan::EdgeTextSearch {
+                key: catalog::EdgeSearchIndexKey::try_new("LIKES", "body").unwrap(),
+                index: search_index(),
+                query_text: text_input(),
+                k: search_limit(),
+            },
+            ExecCountCursorPlan::NodeDynamicEquality {
+                index: catalog::NodeEqualityIndexMeta::new(name("node_eq:User:status")),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                param: name("status"),
+            },
+            ExecCountCursorPlan::EdgeDynamicEquality {
+                index: catalog::EdgeEqualityIndexMeta::new(name("edge_eq:LIKES:status")),
+                key: catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+                param: name("status"),
+            },
+        ]
+    }
+
+    fn wrapped_cursors() -> Vec<ExecCountCursorPlan> {
+        let direct = || ExecCountCursorPlan::NodeFullScan;
+        vec![
+            ExecCountCursorPlan::Union {
+                driver: Box::new(direct()),
+                rest: ir::AtLeast::from_one(ExecCountCursorPlan::EdgeFullScan),
+            },
+            ExecCountCursorPlan::Intersect {
+                driver: Box::new(direct()),
+                rest: ir::AtLeast::from_one(ExecCountCursorPlan::NodeLabelBitmap(name("User"))),
+            },
+            ExecCountCursorPlan::Filter {
+                input: Box::new(direct()),
+                predicate: predicate(),
+            },
+            ExecCountCursorPlan::Window {
+                input: Box::new(direct()),
+                window: ExecCountWindowPlan::identity().then_limit(literal(3)),
+            },
+            ExecCountCursorPlan::Order {
+                input: Box::new(direct()),
+                plan: ir::OrderPlan::ExplicitSort(ir::OrderKeys::from(ir::OrderKey {
+                    property: name("age"),
+                    order: Order::Asc,
+                })),
+            },
+            ExecCountCursorPlan::Expand {
+                input: Box::new(direct()),
+                plan: ir::ExpandPlan {
+                    direction: ir::ExpandDirection::Out,
+                    output: ir::ExpandOutput::Nodes,
+                    label: ir::ExpandLabelPlan::Any,
+                },
+            },
+            ExecCountCursorPlan::VectorSearch {
+                input: Box::new(direct()),
+                plan: Box::new(ir::RestrictedVectorSearchPlan::Nodes {
+                    key: catalog::NodeSearchIndexKey::try_new("User", "embedding").unwrap(),
+                    index: search_index(),
+                    query_vector: vector_input(),
+                    k: search_limit(),
+                }),
+            },
+            ExecCountCursorPlan::TextSearch {
+                input: Box::new(direct()),
+                plan: Box::new(ir::RestrictedTextSearchPlan::Edges {
+                    key: catalog::EdgeSearchIndexKey::try_new("LIKES", "body").unwrap(),
+                    index: search_index(),
+                    query_text: text_input(),
+                    k: search_limit(),
+                }),
+            },
+            ExecCountCursorPlan::Variable {
+                input: Box::new(direct()),
+                op: crate::logical::PureStreamVariableOp::Select(name("saved")),
+            },
+            ExecCountCursorPlan::Distinct {
+                input: Box::new(direct()),
+                plan: ExecCountDistinctPlan::OrderedRows,
+            },
+        ]
     }
 
     #[test]
@@ -1306,9 +1549,13 @@ mod tests {
         let unique = catalog::NodeEqualityIndexMeta::new(name("unique"))
             .with_uniqueness(catalog::IndexUniqueness::Unique);
         let json = serde_json::to_string(&unique).unwrap();
+        let value = serde_json::to_value(&unique).unwrap();
 
         assert!(serde_json::from_str::<ExecNodeUniqueEqualityIndex>(&json).is_ok());
         assert!(serde_json::from_str::<ExecNodeNonUniqueEqualityIndex>(&json).is_err());
+        assert!(serde_json::from_value::<ExecNodeUniqueEqualityIndex>(value).is_ok());
+        assert!(serde_json::from_str::<ExecNodeUniqueEqualityIndex>("{}").is_err());
+        assert!(serde_json::from_str::<ExecNodeNonUniqueEqualityIndex>("{}").is_err());
     }
 
     #[test]
@@ -1334,6 +1581,10 @@ mod tests {
         let json = serde_json::to_string(&null).unwrap();
 
         assert!(serde_json::from_str::<ExecIndexedEqualityValue>(&json).is_err());
+        assert!(
+            serde_json::from_value::<ExecIndexedEqualityValue>(serde_json::json!(null)).is_err()
+        );
+        assert!(serde_json::from_str::<ExecIndexedEqualityValue>("{}").is_err());
     }
 
     #[test]
@@ -1363,6 +1614,22 @@ mod tests {
             ExecUsizeExpr::saturating_sub(literal(7), literal(7)),
             literal(0)
         );
+        assert_eq!(
+            ExecUsizeExpr::saturating_add(literal(0), ExecUsizeExpr::Param(name("n"))),
+            ExecUsizeExpr::Param(name("n"))
+        );
+        assert_eq!(
+            ExecUsizeExpr::saturating_sub(literal(0), ExecUsizeExpr::Param(name("n"))),
+            literal(0)
+        );
+        assert_eq!(
+            ExecUsizeExpr::saturating_add(ExecUsizeExpr::Param(name("n")), literal(0)),
+            ExecUsizeExpr::Param(name("n"))
+        );
+        assert_eq!(
+            ExecUsizeExpr::saturating_sub(ExecUsizeExpr::Param(name("n")), literal(0)),
+            ExecUsizeExpr::Param(name("n"))
+        );
     }
 
     #[test]
@@ -1381,6 +1648,10 @@ mod tests {
 
         assert_eq!(expression.evaluate(&mut resolve), Ok(usize::MAX - 3));
         assert_eq!(expression.node_count(), 7);
+        assert_eq!(
+            ExecUsizeExpr::Param(name("unknown")).evaluate(&mut resolve),
+            Err(())
+        );
     }
 
     #[test]
@@ -1391,6 +1662,7 @@ mod tests {
             .then_skip(literal(3))
             .then_range(literal(2), literal(5));
         let mut resolve = |_name: &ir::NonEmptyString| -> Result<usize, ()> { Err(()) };
+        assert_eq!(resolve(&name("unused")), Err(()));
 
         assert_eq!(window.skip, literal(105));
         assert_eq!(window.take, ExecCountTake::AtMost(literal(3)));
@@ -1403,6 +1675,7 @@ mod tests {
         let skipped = ExecCountWindowPlan::identity().then_skip(literal(4));
         let limited = skipped.then_limit(literal(0));
         let mut resolve = |_name: &ir::NonEmptyString| -> Result<usize, ()> { Err(()) };
+        assert_eq!(resolve(&name("unused")), Err(()));
 
         assert_eq!(limited.skip, literal(4));
         assert_eq!(limited.take, ExecCountTake::AtMost(literal(0)));
@@ -1456,9 +1729,33 @@ mod tests {
                 }
             }
 
-            let mut resolve = |_name: &ir::NonEmptyString| -> Result<usize, ()> { Err(()) };
+            let mut resolve = |_name: &ir::NonEmptyString| -> Result<usize, ()> { Ok(0) };
+            prop_assert_eq!(resolve(&name("unused")), Ok(0));
             prop_assert_eq!(plan.apply(input_len, &mut resolve), Ok(oracle_len));
         }
+    }
+
+    #[test]
+    fn every_arithmetic_expression_deserializes_through_its_validated_shape() {
+        for expression in [
+            ExecUsizeExpr::Literal(1),
+            ExecUsizeExpr::Param(name("n")),
+            ExecUsizeExpr::Min(Box::new(literal(1)), Box::new(literal(2))),
+            ExecUsizeExpr::SaturatingAdd(Box::new(literal(1)), Box::new(literal(2))),
+            ExecUsizeExpr::SaturatingSub(Box::new(literal(2)), Box::new(literal(1))),
+        ] {
+            let json = serde_json::to_string(&expression).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ExecUsizeExpr>(&json).unwrap(),
+                expression
+            );
+            assert_eq!(
+                serde_json::from_value::<ExecUsizeExpr>(serde_json::to_value(&expression).unwrap())
+                    .unwrap(),
+                expression
+            );
+        }
+        assert!(serde_json::from_str::<ExecUsizeExpr>("{}").is_err());
     }
 
     #[test]
@@ -1569,5 +1866,458 @@ mod tests {
             plan.validate(),
             Err(ExecCountValidationError::UniqueVerificationMismatch)
         );
+
+        let (lookup, mut verification) = unique_parts();
+        verification.value = indexed("bob@example.com");
+        let plan = ExecCountPlan::NodeUnique(ExecNodeUniqueCountPlan {
+            lookup,
+            verification,
+            window: ExecCountWindowPlan::identity(),
+        });
+        assert_eq!(
+            plan.validate(),
+            Err(ExecCountValidationError::UniqueVerificationMismatch)
+        );
+    }
+
+    #[test]
+    fn equality_wrappers_expose_owned_and_borrowed_validated_payloads() {
+        let non_unique = node_index();
+        assert_eq!(
+            non_unique.metadata().index_id.as_ref(),
+            "node_eq:User:status"
+        );
+        assert_eq!(
+            non_unique.into_metadata().uniqueness,
+            catalog::IndexUniqueness::NonUnique
+        );
+
+        let (lookup, _) = unique_parts();
+        assert_eq!(
+            lookup.index.metadata().uniqueness,
+            catalog::IndexUniqueness::Unique
+        );
+        assert_eq!(
+            lookup.index.into_metadata().uniqueness,
+            catalog::IndexUniqueness::Unique
+        );
+
+        let edge = edge_index();
+        assert_eq!(edge.metadata().index_id.as_ref(), "edge_eq:LIKES:status");
+        assert_eq!(
+            edge.into_metadata().index_id.as_ref(),
+            "edge_eq:LIKES:status"
+        );
+
+        let value = indexed("active");
+        assert_eq!(
+            value.literal().as_property_value(),
+            &PropertyValue::from("active")
+        );
+        assert_eq!(
+            value.into_literal().as_property_value(),
+            &PropertyValue::from("active")
+        );
+
+        for error in [
+            ExecEqualityContractError::ExpectedNodeNonUnique,
+            ExecEqualityContractError::ExpectedNodeUnique,
+            ExecEqualityContractError::ExpectedIndexedValue,
+        ] {
+            assert!(!error.to_string().is_empty());
+            let error: &dyn std::error::Error = &error;
+            assert!(error.source().is_none());
+        }
+    }
+
+    #[test]
+    fn arithmetic_unsimplified_branches_and_default_window_are_executable() {
+        let n = ExecUsizeExpr::Param(name("n"));
+        let m = ExecUsizeExpr::Param(name("m"));
+        assert!(matches!(
+            ExecUsizeExpr::min(n.clone(), m.clone()),
+            ExecUsizeExpr::Min(_, _)
+        ));
+        assert!(matches!(
+            ExecUsizeExpr::saturating_add(n.clone(), m.clone()),
+            ExecUsizeExpr::SaturatingAdd(_, _)
+        ));
+        assert!(matches!(
+            ExecUsizeExpr::saturating_sub(n, m),
+            ExecUsizeExpr::SaturatingSub(_, _)
+        ));
+        assert_eq!(
+            ExecCountWindowPlan::default(),
+            ExecCountWindowPlan::identity()
+        );
+    }
+
+    #[test]
+    fn every_cursor_variant_round_trips_and_validates() {
+        let cursors = cursor_leaves()
+            .into_iter()
+            .chain(wrapped_cursors())
+            .collect::<Vec<_>>();
+        for cursor in cursors {
+            let plan = ExecCountPlan::Stream(ExecCountStreamPlan {
+                cursor,
+                window: ExecCountWindowPlan::identity(),
+            });
+            let json = serde_json::to_string(&plan).unwrap();
+            assert_eq!(serde_json::from_str::<ExecCountPlan>(&json).unwrap(), plan);
+            assert!(plan.validate().is_ok());
+        }
+
+        let dependency_wrappers = [
+            ExecCountCursorPlan::Filter {
+                input: Box::new(ExecCountCursorPlan::InputRows),
+                predicate: predicate(),
+            },
+            ExecCountCursorPlan::Window {
+                input: Box::new(ExecCountCursorPlan::InputRows),
+                window: ExecCountWindowPlan::identity(),
+            },
+            ExecCountCursorPlan::Order {
+                input: Box::new(ExecCountCursorPlan::InputRows),
+                plan: ir::OrderPlan::ExplicitSort(ir::OrderKeys::from(ir::OrderKey {
+                    property: name("age"),
+                    order: Order::Desc,
+                })),
+            },
+            ExecCountCursorPlan::Expand {
+                input: Box::new(ExecCountCursorPlan::InputRows),
+                plan: ir::ExpandPlan {
+                    direction: ir::ExpandDirection::Both,
+                    output: ir::ExpandOutput::Edges,
+                    label: ir::ExpandLabelPlan::Any,
+                },
+            },
+            ExecCountCursorPlan::Variable {
+                input: Box::new(ExecCountCursorPlan::InputRows),
+                op: crate::logical::PureStreamVariableOp::Bind(name("row")),
+            },
+            ExecCountCursorPlan::Distinct {
+                input: Box::new(ExecCountCursorPlan::InputRows),
+                plan: ExecCountDistinctPlan::HashRows,
+            },
+        ];
+        for cursor in dependency_wrappers {
+            let plan = ExecCountPlan::Stream(ExecCountStreamPlan {
+                cursor,
+                window: ExecCountWindowPlan::identity(),
+            });
+            assert_eq!(plan.dependency(), Ok(ExecCountDependency::Rows));
+        }
+    }
+
+    #[test]
+    fn every_direct_plan_variant_round_trips_validates_and_is_dependency_free() {
+        let window = ExecCountWindowPlan::identity();
+        let (lookup, verification) = unique_parts();
+        let node_batch = ExecNodeBitmapExpr::BatchedUnionRead {
+            index: node_index(),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            values: ir::AtLeast::from_pair(indexed("active"), indexed("inactive")),
+        };
+        let edge_batch = ExecEdgeBitmapExpr::BatchedUnionRead {
+            index: edge_index(),
+            key: catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+            values: ir::AtLeast::from_pair(indexed("active"), indexed("inactive")),
+        };
+        let plans = vec![
+            ExecCountPlan::Constant(7),
+            ExecCountPlan::NodeBitmap(ExecNodeBitmapCountPlan {
+                bitmap: ExecNodeBitmapExpr::Union {
+                    driver: Box::new(node_batch),
+                    rest: ir::AtLeast::from_one(node_point("pending")),
+                },
+                window: window.clone(),
+            }),
+            ExecCountPlan::EdgeBitmap(ExecEdgeBitmapCountPlan {
+                bitmap: ExecEdgeBitmapExpr::Intersect {
+                    driver: Box::new(edge_batch),
+                    rest: ir::AtLeast::from_one(edge_point("pending")),
+                },
+                window: window.clone(),
+            }),
+            ExecCountPlan::NodeUnique(ExecNodeUniqueCountPlan {
+                lookup,
+                verification,
+                window: window.clone(),
+            }),
+            ExecCountPlan::NodeRange(ExecNodeRangeCountPlan {
+                driver: node_range(),
+                membership: ExecNodeRangeMembershipPlan::BitmapFilters(ir::AtLeast::from_one(
+                    node_point("active"),
+                )),
+                window: window.clone(),
+            }),
+            ExecCountPlan::EdgeRange(ExecEdgeRangeCountPlan {
+                driver: edge_range(),
+                membership: ExecEdgeRangeMembershipPlan::BitmapFilters(ir::AtLeast::from_one(
+                    edge_point("active"),
+                )),
+                window: window.clone(),
+            }),
+            ExecCountPlan::NodeAuthoritativeScan(ExecNodeScanCountPlan {
+                predicate: ExecNodeAuthoritativeScanPredicate::Predicate(predicate()),
+                window: window.clone(),
+            }),
+            ExecCountPlan::EdgeAuthoritativeScan(ExecEdgeScanCountPlan {
+                predicate: ExecEdgeAuthoritativeScanPredicate::NullEquality {
+                    key: catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+                },
+                window: window.clone(),
+            }),
+            ExecCountPlan::NodePointReads {
+                ids: ids(),
+                window: window.clone(),
+            },
+            ExecCountPlan::EdgePointReads {
+                ids: ids(),
+                window: window.clone(),
+            },
+            ExecCountPlan::NodeRuntimeInput {
+                input: ExecRuntimeInputPlan::Param(name("nodes")),
+                window: window.clone(),
+            },
+            ExecCountPlan::EdgeRuntimeInput {
+                input: ExecRuntimeInputPlan::Variable(name("edges")),
+                window: window.clone(),
+            },
+            ExecCountPlan::RuntimeInput {
+                input: ExecRuntimeInputPlan::Param(name("rows")),
+                window: window.clone(),
+            },
+            ExecCountPlan::NodeFullScan {
+                window: window.clone(),
+            },
+            ExecCountPlan::EdgeFullScan {
+                window: window.clone(),
+            },
+            ExecCountPlan::NodeLabelBitmap {
+                label: name("User"),
+                window: window.clone(),
+            },
+            ExecCountPlan::EdgeLabelBitmap {
+                label: name("LIKES"),
+                window: window.clone(),
+            },
+            ExecCountPlan::NodeVectorSearch(ExecNodeVectorSearchCountPlan {
+                key: catalog::NodeSearchIndexKey::try_new("User", "embedding").unwrap(),
+                index: search_index(),
+                query_vector: vector_input(),
+                k: search_limit(),
+                window: window.clone(),
+            }),
+            ExecCountPlan::EdgeVectorSearch(ExecEdgeVectorSearchCountPlan {
+                key: catalog::EdgeSearchIndexKey::try_new("LIKES", "embedding").unwrap(),
+                index: search_index(),
+                query_vector: vector_input(),
+                k: search_limit(),
+                window: window.clone(),
+            }),
+            ExecCountPlan::NodeTextSearch(ExecNodeTextSearchCountPlan {
+                key: catalog::NodeSearchIndexKey::try_new("User", "body").unwrap(),
+                index: search_index(),
+                query_text: text_input(),
+                k: search_limit(),
+                window: window.clone(),
+            }),
+            ExecCountPlan::EdgeTextSearch(ExecEdgeTextSearchCountPlan {
+                key: catalog::EdgeSearchIndexKey::try_new("LIKES", "body").unwrap(),
+                index: search_index(),
+                query_text: text_input(),
+                k: search_limit(),
+                window: window.clone(),
+            }),
+            ExecCountPlan::NodeDynamicEquality(ExecNodeDynamicEqualityCountPlan {
+                index: catalog::NodeEqualityIndexMeta::new(name("node_eq:User:status")),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                param: name("status"),
+                window: window.clone(),
+            }),
+            ExecCountPlan::EdgeDynamicEquality(ExecEdgeDynamicEqualityCountPlan {
+                index: catalog::EdgeEqualityIndexMeta::new(name("edge_eq:LIKES:status")),
+                key: catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+                param: name("status"),
+                window: window.clone(),
+            }),
+            ExecCountPlan::InputRows {
+                window: window.clone(),
+            },
+            ExecCountPlan::InputScalars { window },
+        ];
+
+        for plan in plans {
+            let json = serde_json::to_string(&plan).unwrap();
+            assert_eq!(serde_json::from_str::<ExecCountPlan>(&json).unwrap(), plan);
+            assert!(plan.validate().is_ok());
+            if !matches!(
+                plan,
+                ExecCountPlan::InputRows { .. } | ExecCountPlan::InputScalars { .. }
+            ) {
+                assert_eq!(plan.dependency(), Ok(ExecCountDependency::Direct));
+            }
+        }
+    }
+
+    #[test]
+    fn nested_validation_rejects_each_recursive_invalid_state() {
+        let (lookup, mut verification) = unique_parts();
+        verification.value = indexed("bob@example.test");
+        let invalid_unique = ExecCountCursorPlan::NodeUnique {
+            lookup,
+            verification,
+        };
+        let plan = ExecCountPlan::Stream(ExecCountStreamPlan {
+            cursor: ExecCountCursorPlan::Union {
+                driver: Box::new(ExecCountCursorPlan::NodeFullScan),
+                rest: ir::AtLeast::from_one(invalid_unique),
+            },
+            window: ExecCountWindowPlan::identity(),
+        });
+        assert_eq!(
+            plan.validate(),
+            Err(ExecCountValidationError::UniqueVerificationMismatch)
+        );
+
+        let mut too_large = ExecUsizeExpr::literal(0);
+        for value in 0..33 {
+            too_large = ExecUsizeExpr::SaturatingAdd(
+                Box::new(too_large),
+                Box::new(ExecUsizeExpr::literal(value)),
+            );
+        }
+        let plan = ExecCountPlan::Stream(ExecCountStreamPlan {
+            cursor: ExecCountCursorPlan::Window {
+                input: Box::new(ExecCountCursorPlan::EmptyRows),
+                window: ExecCountWindowPlan {
+                    skip: ExecUsizeExpr::literal(0),
+                    take: ExecCountTake::AtMost(too_large),
+                },
+            },
+            window: ExecCountWindowPlan::identity(),
+        });
+        assert_eq!(
+            plan.validate(),
+            Err(ExecCountValidationError::WindowExpressionTooLarge)
+        );
+    }
+
+    #[test]
+    fn arithmetic_and_recursive_error_propagation_is_exhaustive() {
+        for expression in [
+            ExecUsizeExpr::Min(
+                Box::new(ExecUsizeExpr::Param(name("missing"))),
+                Box::new(literal(1)),
+            ),
+            ExecUsizeExpr::Min(
+                Box::new(literal(1)),
+                Box::new(ExecUsizeExpr::Param(name("missing"))),
+            ),
+            ExecUsizeExpr::SaturatingAdd(
+                Box::new(ExecUsizeExpr::Param(name("missing"))),
+                Box::new(literal(1)),
+            ),
+            ExecUsizeExpr::SaturatingAdd(
+                Box::new(literal(1)),
+                Box::new(ExecUsizeExpr::Param(name("missing"))),
+            ),
+            ExecUsizeExpr::SaturatingSub(
+                Box::new(ExecUsizeExpr::Param(name("missing"))),
+                Box::new(literal(1)),
+            ),
+            ExecUsizeExpr::SaturatingSub(
+                Box::new(literal(1)),
+                Box::new(ExecUsizeExpr::Param(name("missing"))),
+            ),
+        ] {
+            let mut resolve = |_name: &ir::NonEmptyString| -> Result<usize, ()> { Err(()) };
+            assert_eq!(expression.evaluate(&mut resolve), Err(()));
+        }
+        for window in [
+            ExecCountWindowPlan {
+                skip: ExecUsizeExpr::Param(name("missing")),
+                take: ExecCountTake::All,
+            },
+            ExecCountWindowPlan {
+                skip: literal(0),
+                take: ExecCountTake::AtMost(ExecUsizeExpr::Param(name("missing"))),
+            },
+        ] {
+            let mut resolve = |_name: &ir::NonEmptyString| -> Result<usize, ()> { Err(()) };
+            assert_eq!(window.apply(10, &mut resolve), Err(()));
+        }
+
+        let invalid_pair = || ExecCountCursorPlan::Union {
+            driver: Box::new(ExecCountCursorPlan::InputRows),
+            rest: ir::AtLeast::from_one(ExecCountCursorPlan::InputRows),
+        };
+        for cursor in [
+            ExecCountCursorPlan::Union {
+                driver: Box::new(invalid_pair()),
+                rest: ir::AtLeast::from_one(ExecCountCursorPlan::EmptyRows),
+            },
+            ExecCountCursorPlan::Union {
+                driver: Box::new(ExecCountCursorPlan::EmptyRows),
+                rest: ir::AtLeast::from_one(invalid_pair()),
+            },
+            ExecCountCursorPlan::Filter {
+                input: Box::new(invalid_pair()),
+                predicate: predicate(),
+            },
+        ] {
+            let plan = ExecCountPlan::Stream(ExecCountStreamPlan {
+                cursor,
+                window: ExecCountWindowPlan::identity(),
+            });
+            assert_eq!(
+                plan.dependency(),
+                Err(ExecCountDependencyError::MultipleRowInputs)
+            );
+        }
+
+        let (lookup, mut verification) = unique_parts();
+        verification.key = catalog::ScopedPropertyKey::try_new("User", "other_email").unwrap();
+        let plan = ExecCountPlan::Stream(ExecCountStreamPlan {
+            cursor: ExecCountCursorPlan::NodeUnique {
+                lookup,
+                verification,
+            },
+            window: ExecCountWindowPlan::identity(),
+        });
+        assert_eq!(
+            plan.validate(),
+            Err(ExecCountValidationError::UniqueVerificationMismatch)
+        );
+
+        let invalid_unique = || {
+            let (lookup, mut verification) = unique_parts();
+            verification.value = indexed("other@example.test");
+            ExecCountCursorPlan::NodeUnique {
+                lookup,
+                verification,
+            }
+        };
+        for cursor in [
+            ExecCountCursorPlan::Union {
+                driver: Box::new(invalid_unique()),
+                rest: ir::AtLeast::from_one(ExecCountCursorPlan::EmptyRows),
+            },
+            ExecCountCursorPlan::Window {
+                input: Box::new(invalid_unique()),
+                window: ExecCountWindowPlan::identity(),
+            },
+        ] {
+            assert_eq!(
+                ExecCountPlan::Stream(ExecCountStreamPlan {
+                    cursor,
+                    window: ExecCountWindowPlan::identity(),
+                })
+                .validate(),
+                Err(ExecCountValidationError::UniqueVerificationMismatch)
+            );
+        }
     }
 }

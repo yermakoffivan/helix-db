@@ -16,7 +16,6 @@ use helix_planner::{exec, ir, properties};
 use super::access::SearchReadLimit;
 use super::*;
 use crate::config::{TextElementType, VectorElementType};
-use crate::search::vector::VectorEntityId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EvaluatedCountWindow {
@@ -43,6 +42,37 @@ impl EvaluatedCountWindow {
     }
 }
 
+fn count_plan_window(plan: &exec::ExecCountPlan) -> Option<&exec::ExecCountWindowPlan> {
+    match plan {
+        exec::ExecCountPlan::Constant(_) => None,
+        exec::ExecCountPlan::NodeBitmap(plan) => Some(&plan.window),
+        exec::ExecCountPlan::EdgeBitmap(plan) => Some(&plan.window),
+        exec::ExecCountPlan::NodeUnique(plan) => Some(&plan.window),
+        exec::ExecCountPlan::NodeRange(plan) => Some(&plan.window),
+        exec::ExecCountPlan::EdgeRange(plan) => Some(&plan.window),
+        exec::ExecCountPlan::NodeAuthoritativeScan(plan) => Some(&plan.window),
+        exec::ExecCountPlan::EdgeAuthoritativeScan(plan) => Some(&plan.window),
+        exec::ExecCountPlan::NodePointReads { window, .. }
+        | exec::ExecCountPlan::EdgePointReads { window, .. }
+        | exec::ExecCountPlan::NodeRuntimeInput { window, .. }
+        | exec::ExecCountPlan::EdgeRuntimeInput { window, .. }
+        | exec::ExecCountPlan::RuntimeInput { window, .. }
+        | exec::ExecCountPlan::NodeFullScan { window }
+        | exec::ExecCountPlan::EdgeFullScan { window }
+        | exec::ExecCountPlan::NodeLabelBitmap { window, .. }
+        | exec::ExecCountPlan::EdgeLabelBitmap { window, .. }
+        | exec::ExecCountPlan::InputRows { window }
+        | exec::ExecCountPlan::InputScalars { window } => Some(window),
+        exec::ExecCountPlan::NodeVectorSearch(plan) => Some(&plan.window),
+        exec::ExecCountPlan::EdgeVectorSearch(plan) => Some(&plan.window),
+        exec::ExecCountPlan::NodeTextSearch(plan) => Some(&plan.window),
+        exec::ExecCountPlan::EdgeTextSearch(plan) => Some(&plan.window),
+        exec::ExecCountPlan::NodeDynamicEquality(plan) => Some(&plan.window),
+        exec::ExecCountPlan::EdgeDynamicEquality(plan) => Some(&plan.window),
+        exec::ExecCountPlan::Stream(plan) => Some(&plan.window),
+    }
+}
+
 impl<'db> ExecutionContext<'db> {
     pub(in crate::execution::interpreter) async fn execute_count(
         &mut self,
@@ -52,30 +82,27 @@ impl<'db> ExecutionContext<'db> {
         plan.validate().map_err(|error| {
             HelixDbError::InvariantViolation(format!("invalid count program: {error:?}"))
         })?;
-        let dependency_contract = plan
-            .dependency()
-            .expect("validated count programs have valid dependencies");
+        let evaluated_window = count_plan_window(plan)
+            .map(|window| self.count_window(window))
+            .transpose()?;
         let count = match plan {
             exec::ExecCountPlan::Constant(count) => *count,
             exec::ExecCountPlan::NodeBitmap(plan) => {
-                let window = self.count_window(&plan.window)?;
+                let window = evaluated_window.expect("bitmap counts carry a window");
                 window.apply(self.node_bitmap(&plan.bitmap).await?.len() as usize)
             }
             exec::ExecCountPlan::EdgeBitmap(plan) => {
-                let window = self.count_window(&plan.window)?;
+                let window = evaluated_window.expect("bitmap counts carry a window");
                 window.apply(self.edge_bitmap(&plan.bitmap).await?.len() as usize)
             }
             exec::ExecCountPlan::NodeUnique(plan) => {
-                let window = self.count_window(&plan.window)?;
-                window.apply(usize::from(
-                    self.verified_node_unique_owner(&plan.lookup, &plan.verification)
-                        .await?
-                        .is_some(),
-                ))
+                let window = evaluated_window.expect("unique counts carry a window");
+                let read = self.verified_node_unique_owner(&plan.lookup, &plan.verification);
+                window.apply(usize::from(read.await?.is_some()))
             }
             exec::ExecCountPlan::NodeRange(plan) => {
                 validate_range_index("node_range:", &plan.driver.index.index_id, &plan.driver.key)?;
-                let window = self.count_window(&plan.window)?;
+                let window = evaluated_window.expect("range counts carry a window");
                 let filters = match &plan.membership {
                     exec::ExecNodeRangeMembershipPlan::All => Vec::new(),
                     exec::ExecNodeRangeMembershipPlan::BitmapFilters(filters) => {
@@ -86,20 +113,18 @@ impl<'db> ExecutionContext<'db> {
                         bitmaps
                     }
                 };
-                let accepted = self
-                    .node_range_index_ids_with_membership(
-                        &plan.driver.key,
-                        &plan.driver.range,
-                        &filters,
-                        window.threshold(),
-                    )
-                    .await?
-                    .len();
+                let read = self.node_range_index_ids_with_membership(
+                    &plan.driver.key,
+                    &plan.driver.range,
+                    &filters,
+                    window.threshold(),
+                );
+                let accepted = read.await?.len();
                 window.apply(accepted)
             }
             exec::ExecCountPlan::EdgeRange(plan) => {
                 validate_range_index("edge_range:", &plan.driver.index.index_id, &plan.driver.key)?;
-                let window = self.count_window(&plan.window)?;
+                let window = evaluated_window.expect("range counts carry a window");
                 let filters = match &plan.membership {
                     exec::ExecEdgeRangeMembershipPlan::All => Vec::new(),
                     exec::ExecEdgeRangeMembershipPlan::BitmapFilters(filters) => {
@@ -110,209 +135,189 @@ impl<'db> ExecutionContext<'db> {
                         bitmaps
                     }
                 };
-                let accepted = self
-                    .edge_range_index_ids_with_membership(
-                        &plan.driver.key,
-                        &plan.driver.range,
-                        &filters,
-                        window.threshold(),
-                    )
-                    .await?
-                    .len();
+                let read = self.edge_range_index_ids_with_membership(
+                    &plan.driver.key,
+                    &plan.driver.range,
+                    &filters,
+                    window.threshold(),
+                );
+                let accepted = read.await?.len();
                 window.apply(accepted)
             }
             exec::ExecCountPlan::NodeAuthoritativeScan(plan) => {
-                let window = self.count_window(&plan.window)?;
-                let rows = self
-                    .authoritative_node_rows(&plan.predicate, window.threshold())
-                    .await?;
+                let window = evaluated_window.expect("scan counts carry a window");
+                let read = self.authoritative_node_rows(&plan.predicate, window.threshold());
+                let rows = read.await?;
                 window.apply(rows)
             }
             exec::ExecCountPlan::EdgeAuthoritativeScan(plan) => {
-                let window = self.count_window(&plan.window)?;
-                let rows = self
-                    .authoritative_edge_rows(&plan.predicate, window.threshold())
-                    .await?;
+                let window = evaluated_window.expect("scan counts carry a window");
+                let read = self.authoritative_edge_rows(&plan.predicate, window.threshold());
+                let rows = read.await?;
                 window.apply(rows)
             }
-            exec::ExecCountPlan::NodePointReads { ids, window } => {
-                let window = self.count_window(window)?;
-                window.apply(
-                    self.existing_node_count(ids.as_ref(), window.threshold())
-                        .await?,
-                )
+            exec::ExecCountPlan::NodePointReads { ids, .. } => {
+                let window = evaluated_window.expect("point-read counts carry a window");
+                let read = self.existing_node_count(ids.as_ref(), window.threshold());
+                window.apply(read.await?)
             }
-            exec::ExecCountPlan::EdgePointReads { ids, window } => {
-                let window = self.count_window(window)?;
-                window.apply(
-                    self.existing_edge_count(ids.as_ref(), window.threshold())
-                        .await?,
-                )
+            exec::ExecCountPlan::EdgePointReads { ids, .. } => {
+                let window = evaluated_window.expect("point-read counts carry a window");
+                let read = self.existing_edge_count(ids.as_ref(), window.threshold());
+                window.apply(read.await?)
             }
-            exec::ExecCountPlan::NodeRuntimeInput { input, window } => {
-                let window = self.count_window(window)?;
+            exec::ExecCountPlan::NodeRuntimeInput { input, .. } => {
+                let window = evaluated_window.expect("runtime counts carry a window");
                 let ids = self.runtime_ids(input)?;
                 window.apply(self.existing_node_count(&ids, window.threshold()).await?)
             }
-            exec::ExecCountPlan::EdgeRuntimeInput { input, window } => {
-                let window = self.count_window(window)?;
+            exec::ExecCountPlan::EdgeRuntimeInput { input, .. } => {
+                let window = evaluated_window.expect("runtime counts carry a window");
                 let ids = self.runtime_ids(input)?;
                 window.apply(self.existing_edge_count(&ids, window.threshold()).await?)
             }
-            exec::ExecCountPlan::RuntimeInput { input, window } => {
-                let window = self.count_window(window)?;
+            exec::ExecCountPlan::RuntimeInput { input, .. } => {
+                let window = evaluated_window.expect("runtime counts carry a window");
                 window.apply(self.runtime_row_count(input)?)
             }
-            exec::ExecCountPlan::NodeFullScan { window } => {
-                let window = self.count_window(window)?;
+            exec::ExecCountPlan::NodeFullScan { .. } => {
+                let window = evaluated_window.expect("full-scan counts carry a window");
                 let limit = positive_limit(window.threshold());
-                let ids = self
-                    .scan_element_ids(exec::ElementKeyspace::NodeProperty, limit)
-                    .await?;
+                let read = self.scan_element_ids(exec::ElementKeyspace::NodeProperty, limit);
+                let ids = read.await?;
                 window.apply(ids.len())
             }
-            exec::ExecCountPlan::EdgeFullScan { window } => {
-                let window = self.count_window(window)?;
+            exec::ExecCountPlan::EdgeFullScan { .. } => {
+                let window = evaluated_window.expect("full-scan counts carry a window");
                 let limit = positive_limit(window.threshold());
-                let ids = self
-                    .scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, limit)
-                    .await?;
+                let read = self.scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, limit);
+                let ids = read.await?;
                 window.apply(ids.len())
             }
-            exec::ExecCountPlan::NodeLabelBitmap { label, window } => {
-                let window = self.count_window(window)?;
-                let bitmap = self
-                    .lookup_equality_index_set(
-                        "$label",
-                        &DbPropertyValue::String(label.as_ref().to_string()),
-                    )
-                    .await?;
+            exec::ExecCountPlan::NodeLabelBitmap { label, .. } => {
+                let window = evaluated_window.expect("label counts carry a window");
+                let value = DbPropertyValue::String(label.as_ref().to_string());
+                let read = self.lookup_equality_index_set("$label", &value);
+                let bitmap = read.await?;
                 window.apply(bitmap.len() as usize)
             }
-            exec::ExecCountPlan::EdgeLabelBitmap { label, window } => {
-                let window = self.count_window(window)?;
+            exec::ExecCountPlan::EdgeLabelBitmap { label, .. } => {
+                let window = evaluated_window.expect("label counts carry a window");
                 let bitmap = self.lookup_global_edge_label_index(label.as_ref()).await?;
                 window.apply(bitmap.len() as usize)
             }
             exec::ExecCountPlan::NodeVectorSearch(plan) => {
-                let window = self.count_window(&plan.window)?;
-                let results = self
-                    .vector_search_results(
-                        VectorElementType::Node,
-                        &plan.key.label,
-                        &plan.key.property,
-                        &plan.index,
-                        &plan.query_vector,
-                        SearchReadLimit::new(&plan.k, None),
-                    )
-                    .await?;
+                let window = evaluated_window.expect("search counts carry a window");
+                let read = self.vector_search_results(
+                    VectorElementType::Node,
+                    &plan.key.label,
+                    &plan.key.property,
+                    &plan.index,
+                    &plan.query_vector,
+                    SearchReadLimit::new(&plan.k, None),
+                );
+                let results = read.await?;
                 let ids = results
                     .into_iter()
-                    .map(|result| match result.entity_id() {
-                        VectorEntityId::Node(id) => Ok(id),
-                        VectorEntityId::Edge(_) => Err(HelixDbError::InvariantViolation(
-                            "edge-bound vector result reached exact node count".to_string(),
-                        )),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                window.apply(self.existing_node_count(&ids, window.threshold()).await?)
+                    .map(|result| result.entity_id().local_id())
+                    .collect::<Vec<_>>();
+                return self
+                    .existing_node_count(&ids, window.threshold())
+                    .await
+                    .map(|count| ExecutionValue::Count(window.apply(count)));
             }
             exec::ExecCountPlan::EdgeVectorSearch(plan) => {
-                let window = self.count_window(&plan.window)?;
-                let results = self
-                    .vector_search_results(
-                        VectorElementType::Edge,
-                        &plan.key.label,
-                        &plan.key.property,
-                        &plan.index,
-                        &plan.query_vector,
-                        SearchReadLimit::new(&plan.k, None),
-                    )
-                    .await?;
+                let window = evaluated_window.expect("search counts carry a window");
+                let read = self.vector_search_results(
+                    VectorElementType::Edge,
+                    &plan.key.label,
+                    &plan.key.property,
+                    &plan.index,
+                    &plan.query_vector,
+                    SearchReadLimit::new(&plan.k, None),
+                );
+                let results = read.await?;
                 let ids = results
                     .into_iter()
-                    .map(|result| match result.entity_id() {
-                        VectorEntityId::Edge(id) => Ok(id),
-                        VectorEntityId::Node(_) => Err(HelixDbError::InvariantViolation(
-                            "node-bound vector result reached exact edge count".to_string(),
-                        )),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                window.apply(self.existing_edge_count(&ids, window.threshold()).await?)
+                    .map(|result| result.entity_id().local_id())
+                    .collect::<Vec<_>>();
+                return self
+                    .existing_edge_count(&ids, window.threshold())
+                    .await
+                    .map(|count| ExecutionValue::Count(window.apply(count)));
             }
             exec::ExecCountPlan::NodeTextSearch(plan) => {
-                let window = self.count_window(&plan.window)?;
-                let results = self
-                    .text_search_hits(
-                        TextElementType::Node,
-                        &plan.key.label,
-                        &plan.key.property,
-                        &plan.index,
-                        &plan.query_text,
-                        SearchReadLimit::new(&plan.k, None),
-                    )
-                    .await?;
+                let window = evaluated_window.expect("search counts carry a window");
+                let read = self.text_search_hits(
+                    TextElementType::Node,
+                    &plan.key.label,
+                    &plan.key.property,
+                    &plan.index,
+                    &plan.query_text,
+                    SearchReadLimit::new(&plan.k, None),
+                );
+                let results = read.await?;
                 let ids = results
                     .into_iter()
                     .map(|result| result.entity_id)
                     .collect::<Vec<_>>();
-                window.apply(self.existing_node_count(&ids, window.threshold()).await?)
+                return self
+                    .existing_node_count(&ids, window.threshold())
+                    .await
+                    .map(|count| ExecutionValue::Count(window.apply(count)));
             }
             exec::ExecCountPlan::EdgeTextSearch(plan) => {
-                let window = self.count_window(&plan.window)?;
-                let results = self
-                    .text_search_hits(
-                        TextElementType::Edge,
-                        &plan.key.label,
-                        &plan.key.property,
-                        &plan.index,
-                        &plan.query_text,
-                        SearchReadLimit::new(&plan.k, None),
-                    )
-                    .await?;
+                let window = evaluated_window.expect("search counts carry a window");
+                let read = self.text_search_hits(
+                    TextElementType::Edge,
+                    &plan.key.label,
+                    &plan.key.property,
+                    &plan.index,
+                    &plan.query_text,
+                    SearchReadLimit::new(&plan.k, None),
+                );
+                let results = read.await?;
                 let ids = results
                     .into_iter()
                     .map(|result| result.entity_id)
                     .collect::<Vec<_>>();
-                window.apply(self.existing_edge_count(&ids, window.threshold()).await?)
+                return self
+                    .existing_edge_count(&ids, window.threshold())
+                    .await
+                    .map(|count| ExecutionValue::Count(window.apply(count)));
             }
             exec::ExecCountPlan::NodeDynamicEquality(plan) => {
                 validate_node_equality_index(&plan.index.index_id, &plan.key)?;
-                let window = self.count_window(&plan.window)?;
+                let window = evaluated_window.expect("dynamic counts carry a window");
                 let value = self.param_value(&plan.param)?;
-                let ids = self
-                    .lookup_managed_equality_union(
-                        crate::index_lifecycle::IndexElementKind::Node,
-                        &plan.key,
-                        core::slice::from_ref(&value),
-                    )
-                    .await?;
+                let read = self.lookup_managed_equality_union(
+                    crate::index_lifecycle::IndexElementKind::Node,
+                    &plan.key,
+                    core::slice::from_ref(&value),
+                );
+                let ids = read.await?;
                 window.apply(ids.len() as usize)
             }
             exec::ExecCountPlan::EdgeDynamicEquality(plan) => {
                 validate_edge_equality_index(&plan.index.index_id, &plan.key)?;
-                let window = self.count_window(&plan.window)?;
+                let window = evaluated_window.expect("dynamic counts carry a window");
                 let value = self.param_value(&plan.param)?;
-                let ids = self
-                    .lookup_managed_equality_union(
-                        crate::index_lifecycle::IndexElementKind::Edge,
-                        &plan.key,
-                        core::slice::from_ref(&value),
-                    )
-                    .await?;
+                let read = self.lookup_managed_equality_union(
+                    crate::index_lifecycle::IndexElementKind::Edge,
+                    &plan.key,
+                    core::slice::from_ref(&value),
+                );
+                let ids = read.await?;
                 window.apply(ids.len() as usize)
             }
             exec::ExecCountPlan::Stream(plan) => {
                 let mut dependency = Some(input);
                 let rows = self.count_cursor(&plan.cursor, &mut dependency).await?;
-                if dependency.is_some() && dependency_contract == exec::ExecCountDependency::Rows {
-                    return Err(HelixDbError::InvariantViolation(
-                        "count cursor did not consume its encoded row dependency".to_string(),
-                    ));
-                }
-                self.count_window(&plan.window)?.apply(rows.len())
+                evaluated_window
+                    .expect("stream counts carry a window")
+                    .apply(rows.len())
             }
-            exec::ExecCountPlan::InputRows { window } => {
+            exec::ExecCountPlan::InputRows { .. } => {
                 let rows = match input {
                     ExecutionValue::Stream(rows) => rows.len(),
                     other @ (ExecutionValue::FoldedStream(_)
@@ -324,9 +329,11 @@ impl<'db> ExecutionContext<'db> {
                         return Err(count_shape_error("rows", &other));
                     }
                 };
-                self.count_window(window)?.apply(rows)
+                evaluated_window
+                    .expect("row-input counts carry a window")
+                    .apply(rows)
             }
-            exec::ExecCountPlan::InputScalars { window } => {
+            exec::ExecCountPlan::InputScalars { .. } => {
                 let scalars = match input {
                     ExecutionValue::Count(_) | ExecutionValue::Bool(_) => 1,
                     ExecutionValue::Scalars(values) => values.len(),
@@ -337,7 +344,9 @@ impl<'db> ExecutionContext<'db> {
                         return Err(count_shape_error("scalar items", &other));
                     }
                 };
-                self.count_window(window)?.apply(scalars)
+                evaluated_window
+                    .expect("scalar-input counts carry a window")
+                    .apply(scalars)
             }
         };
         Ok(ExecutionValue::Count(count))
@@ -466,9 +475,8 @@ impl<'db> ExecutionContext<'db> {
         predicate: &exec::ExecNodeAuthoritativeScanPredicate,
         threshold: Option<usize>,
     ) -> Result<usize> {
-        let ids = self
-            .scan_element_ids(exec::ElementKeyspace::NodeProperty, None)
-            .await?;
+        let read = self.scan_element_ids(exec::ElementKeyspace::NodeProperty, None);
+        let ids = read.await?;
         let mut accepted = 0usize;
         for id in ids {
             if threshold.is_some_and(|threshold| accepted >= threshold) {
@@ -477,10 +485,12 @@ impl<'db> ExecutionContext<'db> {
             let row = ExecutionRow::current(ElementRef::Node(id));
             let matches = match predicate {
                 exec::ExecNodeAuthoritativeScanPredicate::NullEquality { key } => {
-                    self.scoped_null_matches(&row, key).await?
+                    let read = self.scoped_null_matches(&row, key);
+                    read.await?
                 }
                 exec::ExecNodeAuthoritativeScanPredicate::Predicate(predicate) => {
-                    self.eval_predicate(&row, predicate.predicate()).await?
+                    let read = self.eval_predicate(&row, predicate.predicate());
+                    read.await?
                 }
             };
             if matches {
@@ -495,9 +505,8 @@ impl<'db> ExecutionContext<'db> {
         predicate: &exec::ExecEdgeAuthoritativeScanPredicate,
         threshold: Option<usize>,
     ) -> Result<usize> {
-        let ids = self
-            .scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None)
-            .await?;
+        let read = self.scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None);
+        let ids = read.await?;
         let mut accepted = 0usize;
         for id in ids {
             if threshold.is_some_and(|threshold| accepted >= threshold) {
@@ -506,10 +515,12 @@ impl<'db> ExecutionContext<'db> {
             let row = ExecutionRow::current(ElementRef::Edge(id));
             let matches = match predicate {
                 exec::ExecEdgeAuthoritativeScanPredicate::NullEquality { key } => {
-                    self.scoped_null_matches(&row, key).await?
+                    let read = self.scoped_null_matches(&row, key);
+                    read.await?
                 }
                 exec::ExecEdgeAuthoritativeScanPredicate::Predicate(predicate) => {
-                    self.eval_predicate(&row, predicate.predicate()).await?
+                    let read = self.eval_predicate(&row, predicate.predicate());
+                    read.await?
                 }
             };
             if matches {
@@ -524,20 +535,20 @@ impl<'db> ExecutionContext<'db> {
         row: &ExecutionRow,
         key: &helix_planner::catalog::ScopedPropertyKey,
     ) -> Result<bool> {
-        let label = ir::NonEmptyString::from_static("$label");
-        if self
-            .row_property(row, &label)
-            .await?
-            .as_ref()
-            .and_then(DbPropertyValue::as_str)
+        let read = self.row_properties(row);
+        let properties = read.await?;
+        if properties
+            .iter()
+            .find(|property| property.name == "$label")
+            .and_then(|property| property.value.as_str())
             != Some(key.label.as_ref())
         {
             return Ok(false);
         }
-        Ok(self
-            .row_property(row, &key.property)
-            .await?
-            .is_none_or(|value| matches!(value, DbPropertyValue::Null)))
+        Ok(properties
+            .iter()
+            .find(|property| property.name == key.property.as_ref())
+            .is_none_or(|property| matches!(property.value, DbPropertyValue::Null)))
     }
 
     /// Execute the exact unique-owner primitive and verify the authoritative row.
@@ -556,35 +567,32 @@ impl<'db> ExecutionContext<'db> {
                 "unique verification does not match its exact owner lookup".to_string(),
             ));
         }
-        let ids = self
-            .lookup_managed_equality_point_exact(
-                crate::index_lifecycle::IndexElementKind::Node,
-                &lookup.key,
-                &indexed_value(&lookup.value),
-                true,
-            )
-            .await?;
+        let lookup_value = indexed_value(&lookup.value);
+        let read = self.lookup_managed_equality_point_exact(
+            crate::index_lifecycle::IndexElementKind::Node,
+            &lookup.key,
+            &lookup_value,
+            true,
+        );
+        let ids = read.await?;
         let mut ids = ids.into_iter();
         let Some(id) = ids.next() else {
             return Ok(None);
         };
-        if ids.next().is_some() {
-            return Err(HelixDbError::IndexCatalogCorruption(
-                "unique equality owner read returned multiple node IDs".to_string(),
-            ));
-        }
         let row = ExecutionRow::current(ElementRef::Node(id));
         let expected = indexed_value(&verification.value);
         crate::index_lifecycle::secondary::record_equality_graph_read();
-        let properties = self.row_properties(&row).await?;
-        let label_matches = properties.iter().any(|property| {
-            property.name == "$label"
-                && property.value.as_str() == Some(verification.key.label.as_ref())
-        });
-        let value_matches = properties.iter().any(|property| {
-            property.name == verification.key.property.as_ref()
-                && property.value.eq_value(&expected)
-        });
+        let read = self.row_properties(&row);
+        let properties = read.await?;
+        let label_matches = properties
+            .iter()
+            .find(|property| property.name == "$label")
+            .and_then(|property| property.value.as_str())
+            == Some(verification.key.label.as_ref());
+        let value_matches = properties
+            .iter()
+            .find(|property| property.name == verification.key.property.as_ref())
+            .is_some_and(|property| property.value.eq_value(&expected));
         if !label_matches || !value_matches {
             return Err(HelixDbError::IndexCatalogCorruption(
                 "unique equality owner disagrees with its authoritative node".to_string(),
@@ -623,14 +631,24 @@ impl<'db> ExecutionContext<'db> {
                 exec::ExecNodeBitmapExpr::Union { driver, rest } => {
                     let mut result = self.node_bitmap(driver).await?;
                     for child in rest {
-                        result |= self.node_bitmap(child).await?;
+                        let read = self.node_bitmap(child);
+                        let child = match read.await {
+                            Ok(child) => child,
+                            Err(error) => return Err(error),
+                        };
+                        result |= child;
                     }
                     Ok(result)
                 }
                 exec::ExecNodeBitmapExpr::Intersect { driver, rest } => {
                     let mut result = self.node_bitmap(driver).await?;
                     for child in rest {
-                        result &= self.node_bitmap(child).await?;
+                        let read = self.node_bitmap(child);
+                        let child = match read.await {
+                            Ok(child) => child,
+                            Err(error) => return Err(error),
+                        };
+                        result &= child;
                     }
                     Ok(result)
                 }
@@ -669,14 +687,24 @@ impl<'db> ExecutionContext<'db> {
                 exec::ExecEdgeBitmapExpr::Union { driver, rest } => {
                     let mut result = self.edge_bitmap(driver).await?;
                     for child in rest {
-                        result |= self.edge_bitmap(child).await?;
+                        let read = self.edge_bitmap(child);
+                        let child = match read.await {
+                            Ok(child) => child,
+                            Err(error) => return Err(error),
+                        };
+                        result |= child;
                     }
                     Ok(result)
                 }
                 exec::ExecEdgeBitmapExpr::Intersect { driver, rest } => {
                     let mut result = self.edge_bitmap(driver).await?;
                     for child in rest {
-                        result &= self.edge_bitmap(child).await?;
+                        let read = self.edge_bitmap(child);
+                        let child = match read.await {
+                            Ok(child) => child,
+                            Err(error) => return Err(error),
+                        };
+                        result &= child;
                     }
                     Ok(result)
                 }
@@ -701,52 +729,63 @@ impl<'db> ExecutionContext<'db> {
                         "count cursor consumed its row dependency more than once".to_string(),
                     )),
                 },
-                exec::ExecCountCursorPlan::NodeBitmap(bitmap) => Ok(self
-                    .node_bitmap(bitmap)
-                    .await?
-                    .into_iter()
-                    .map(|id| ExecutionRow::current(ElementRef::Node(id)))
-                    .collect()),
-                exec::ExecCountCursorPlan::EdgeBitmap(bitmap) => Ok(self
-                    .edge_bitmap(bitmap)
-                    .await?
-                    .into_iter()
-                    .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
-                    .collect()),
+                exec::ExecCountCursorPlan::NodeBitmap(bitmap) => {
+                    let read = self.node_bitmap(bitmap);
+                    let ids = read.await?;
+                    Ok(ids
+                        .into_iter()
+                        .map(|id| ExecutionRow::current(ElementRef::Node(id)))
+                        .collect())
+                }
+                exec::ExecCountCursorPlan::EdgeBitmap(bitmap) => {
+                    let read = self.edge_bitmap(bitmap);
+                    let ids = read.await?;
+                    Ok(ids
+                        .into_iter()
+                        .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
+                        .collect())
+                }
                 exec::ExecCountCursorPlan::NodeUnique {
                     lookup,
                     verification,
-                } => Ok(self
-                    .verified_node_unique_owner(lookup, verification)
-                    .await?
-                    .into_iter()
-                    .map(|id| ExecutionRow::current(ElementRef::Node(id)))
-                    .collect()),
-                exec::ExecCountCursorPlan::NodeRange(plan) => Ok(self
-                    .validated_node_range_ids(plan)
-                    .await?
-                    .into_iter()
-                    .map(|id| ExecutionRow::current(ElementRef::Node(id)))
-                    .collect()),
-                exec::ExecCountCursorPlan::EdgeRange(plan) => Ok(self
-                    .validated_edge_range_ids(plan)
-                    .await?
-                    .into_iter()
-                    .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
-                    .collect()),
+                } => {
+                    let read = self.verified_node_unique_owner(lookup, verification);
+                    let id = read.await?;
+                    Ok(id
+                        .into_iter()
+                        .map(|id| ExecutionRow::current(ElementRef::Node(id)))
+                        .collect())
+                }
+                exec::ExecCountCursorPlan::NodeRange(plan) => {
+                    let read = self.validated_node_range_ids(plan);
+                    let ids = read.await?;
+                    Ok(ids
+                        .into_iter()
+                        .map(|id| ExecutionRow::current(ElementRef::Node(id)))
+                        .collect())
+                }
+                exec::ExecCountCursorPlan::EdgeRange(plan) => {
+                    let read = self.validated_edge_range_ids(plan);
+                    let ids = read.await?;
+                    Ok(ids
+                        .into_iter()
+                        .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
+                        .collect())
+                }
                 exec::ExecCountCursorPlan::NodeAuthoritativeScan(predicate) => {
-                    let ids = self
-                        .scan_element_ids(exec::ElementKeyspace::NodeProperty, None)
-                        .await?;
+                    let read = self.scan_element_ids(exec::ElementKeyspace::NodeProperty, None);
+                    let ids = read.await?;
                     let mut rows = Vec::new();
                     for id in ids {
                         let row = ExecutionRow::current(ElementRef::Node(id));
                         let matches = match predicate {
                             exec::ExecNodeAuthoritativeScanPredicate::NullEquality { key } => {
-                                self.scoped_null_matches(&row, key).await?
+                                let read = self.scoped_null_matches(&row, key);
+                                read.await?
                             }
                             exec::ExecNodeAuthoritativeScanPredicate::Predicate(predicate) => {
-                                self.eval_predicate(&row, predicate.predicate()).await?
+                                let read = self.eval_predicate(&row, predicate.predicate());
+                                read.await?
                             }
                         };
                         if matches {
@@ -756,18 +795,19 @@ impl<'db> ExecutionContext<'db> {
                     Ok(rows)
                 }
                 exec::ExecCountCursorPlan::EdgeAuthoritativeScan(predicate) => {
-                    let ids = self
-                        .scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None)
-                        .await?;
+                    let read = self.scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None);
+                    let ids = read.await?;
                     let mut rows = Vec::new();
                     for id in ids {
                         let row = ExecutionRow::current(ElementRef::Edge(id));
                         let matches = match predicate {
                             exec::ExecEdgeAuthoritativeScanPredicate::NullEquality { key } => {
-                                self.scoped_null_matches(&row, key).await?
+                                let read = self.scoped_null_matches(&row, key);
+                                read.await?
                             }
                             exec::ExecEdgeAuthoritativeScanPredicate::Predicate(predicate) => {
-                                self.eval_predicate(&row, predicate.predicate()).await?
+                                let read = self.eval_predicate(&row, predicate.predicate());
+                                read.await?
                             }
                         };
                         if matches {
@@ -777,34 +817,18 @@ impl<'db> ExecutionContext<'db> {
                     Ok(rows)
                 }
                 exec::ExecCountCursorPlan::NodePointReads(ids) => {
-                    let ExecutionValue::Stream(rows) =
-                        self.node_rows(ids.as_ref().to_vec()).await?
-                    else {
-                        unreachable!("node row materialization returns a stream")
-                    };
-                    Ok(rows)
+                    self.node_row_vec(ids.as_ref().to_vec()).await
                 }
                 exec::ExecCountCursorPlan::EdgePointReads(ids) => {
-                    let ExecutionValue::Stream(rows) =
-                        self.edge_rows(ids.as_ref().to_vec()).await?
-                    else {
-                        unreachable!("edge row materialization returns a stream")
-                    };
-                    Ok(rows)
+                    self.edge_row_vec(ids.as_ref().to_vec()).await
                 }
                 exec::ExecCountCursorPlan::NodeRuntimeInput(input) => {
                     let ids = self.runtime_ids(input)?;
-                    let ExecutionValue::Stream(rows) = self.node_rows(ids).await? else {
-                        unreachable!("node row materialization returns a stream")
-                    };
-                    Ok(rows)
+                    self.node_row_vec(ids).await
                 }
                 exec::ExecCountCursorPlan::EdgeRuntimeInput(input) => {
                     let ids = self.runtime_ids(input)?;
-                    let ExecutionValue::Stream(rows) = self.edge_rows(ids).await? else {
-                        unreachable!("edge row materialization returns a stream")
-                    };
-                    Ok(rows)
+                    self.edge_row_vec(ids).await
                 }
                 exec::ExecCountCursorPlan::RuntimeInput(input) => match input {
                     exec::ExecRuntimeInputPlan::Variable(variable) => {
@@ -829,58 +853,54 @@ impl<'db> ExecutionContext<'db> {
                     }
                 },
                 exec::ExecCountCursorPlan::NodeFullScan => {
-                    let ids = self
-                        .scan_element_ids(exec::ElementKeyspace::NodeProperty, None)
-                        .await?;
+                    let read = self.scan_element_ids(exec::ElementKeyspace::NodeProperty, None);
+                    let ids = read.await?;
                     Ok(ids
                         .into_iter()
                         .map(|id| ExecutionRow::current(ElementRef::Node(id)))
                         .collect())
                 }
                 exec::ExecCountCursorPlan::EdgeFullScan => {
-                    let ids = self
-                        .scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None)
-                        .await?;
+                    let read = self.scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None);
+                    let ids = read.await?;
                     Ok(ids
                         .into_iter()
                         .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::NodeLabelBitmap(label) => Ok(self
-                    .lookup_equality_index_set(
-                        "$label",
-                        &DbPropertyValue::String(label.as_ref().to_string()),
-                    )
-                    .await?
-                    .into_iter()
-                    .map(|id| ExecutionRow::current(ElementRef::Node(id)))
-                    .collect()),
-                exec::ExecCountCursorPlan::EdgeLabelBitmap(label) => Ok(self
-                    .lookup_global_edge_label_index(label.as_ref())
-                    .await?
-                    .into_iter()
-                    .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
-                    .collect()),
+                exec::ExecCountCursorPlan::NodeLabelBitmap(label) => {
+                    let value = DbPropertyValue::String(label.as_ref().to_string());
+                    let read = self.lookup_equality_index_set("$label", &value);
+                    let ids = read.await?;
+                    Ok(ids
+                        .into_iter()
+                        .map(|id| ExecutionRow::current(ElementRef::Node(id)))
+                        .collect())
+                }
+                exec::ExecCountCursorPlan::EdgeLabelBitmap(label) => {
+                    let read = self.lookup_global_edge_label_index(label.as_ref());
+                    let ids = read.await?;
+                    Ok(ids
+                        .into_iter()
+                        .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
+                        .collect())
+                }
                 exec::ExecCountCursorPlan::NodeVectorSearch {
                     key,
                     index,
                     query_vector,
                     k,
                 } => {
-                    let results = self
-                        .vector_search_results(
-                            VectorElementType::Node,
-                            &key.label,
-                            &key.property,
-                            index,
-                            query_vector,
-                            SearchReadLimit::new(k, None),
-                        )
-                        .await?;
-                    let ExecutionValue::Stream(rows) = self.node_search_rows(results).await? else {
-                        unreachable!("node search materialization returns a stream")
-                    };
-                    Ok(rows)
+                    let read = self.vector_search_results(
+                        VectorElementType::Node,
+                        &key.label,
+                        &key.property,
+                        index,
+                        query_vector,
+                        SearchReadLimit::new(k, None),
+                    );
+                    let results = read.await?;
+                    self.node_search_row_vec(results).await
                 }
                 exec::ExecCountCursorPlan::EdgeVectorSearch {
                     key,
@@ -888,20 +908,16 @@ impl<'db> ExecutionContext<'db> {
                     query_vector,
                     k,
                 } => {
-                    let results = self
-                        .vector_search_results(
-                            VectorElementType::Edge,
-                            &key.label,
-                            &key.property,
-                            index,
-                            query_vector,
-                            SearchReadLimit::new(k, None),
-                        )
-                        .await?;
-                    let ExecutionValue::Stream(rows) = self.edge_search_rows(results).await? else {
-                        unreachable!("edge search materialization returns a stream")
-                    };
-                    Ok(rows)
+                    let read = self.vector_search_results(
+                        VectorElementType::Edge,
+                        &key.label,
+                        &key.property,
+                        index,
+                        query_vector,
+                        SearchReadLimit::new(k, None),
+                    );
+                    let results = read.await?;
+                    self.edge_search_row_vec(results).await
                 }
                 exec::ExecCountCursorPlan::NodeTextSearch {
                     key,
@@ -909,21 +925,16 @@ impl<'db> ExecutionContext<'db> {
                     query_text,
                     k,
                 } => {
-                    let hits = self
-                        .text_search_hits(
-                            TextElementType::Node,
-                            &key.label,
-                            &key.property,
-                            index,
-                            query_text,
-                            SearchReadLimit::new(k, None),
-                        )
-                        .await?;
-                    let ExecutionValue::Stream(rows) = self.node_text_search_rows(hits).await?
-                    else {
-                        unreachable!("node text materialization returns a stream")
-                    };
-                    Ok(rows)
+                    let read = self.text_search_hits(
+                        TextElementType::Node,
+                        &key.label,
+                        &key.property,
+                        index,
+                        query_text,
+                        SearchReadLimit::new(k, None),
+                    );
+                    let hits = read.await?;
+                    self.node_text_search_row_vec(hits).await
                 }
                 exec::ExecCountCursorPlan::EdgeTextSearch {
                     key,
@@ -931,32 +942,27 @@ impl<'db> ExecutionContext<'db> {
                     query_text,
                     k,
                 } => {
-                    let hits = self
-                        .text_search_hits(
-                            TextElementType::Edge,
-                            &key.label,
-                            &key.property,
-                            index,
-                            query_text,
-                            SearchReadLimit::new(k, None),
-                        )
-                        .await?;
-                    let ExecutionValue::Stream(rows) = self.edge_text_search_rows(hits).await?
-                    else {
-                        unreachable!("edge text materialization returns a stream")
-                    };
-                    Ok(rows)
+                    let read = self.text_search_hits(
+                        TextElementType::Edge,
+                        &key.label,
+                        &key.property,
+                        index,
+                        query_text,
+                        SearchReadLimit::new(k, None),
+                    );
+                    let hits = read.await?;
+                    self.edge_text_search_row_vec(hits).await
                 }
                 exec::ExecCountCursorPlan::NodeDynamicEquality { index, key, param } => {
                     validate_node_equality_index(&index.index_id, key)?;
                     let value = self.param_value(param)?;
-                    Ok(self
-                        .lookup_managed_equality_union(
-                            crate::index_lifecycle::IndexElementKind::Node,
-                            key,
-                            core::slice::from_ref(&value),
-                        )
-                        .await?
+                    let read = self.lookup_managed_equality_union(
+                        crate::index_lifecycle::IndexElementKind::Node,
+                        key,
+                        core::slice::from_ref(&value),
+                    );
+                    let ids = read.await?;
+                    Ok(ids
                         .into_iter()
                         .map(|id| ExecutionRow::current(ElementRef::Node(id)))
                         .collect())
@@ -964,13 +970,13 @@ impl<'db> ExecutionContext<'db> {
                 exec::ExecCountCursorPlan::EdgeDynamicEquality { index, key, param } => {
                     validate_edge_equality_index(&index.index_id, key)?;
                     let value = self.param_value(param)?;
-                    Ok(self
-                        .lookup_managed_equality_union(
-                            crate::index_lifecycle::IndexElementKind::Edge,
-                            key,
-                            core::slice::from_ref(&value),
-                        )
-                        .await?
+                    let read = self.lookup_managed_equality_union(
+                        crate::index_lifecycle::IndexElementKind::Edge,
+                        key,
+                        core::slice::from_ref(&value),
+                    );
+                    let ids = read.await?;
+                    Ok(ids
                         .into_iter()
                         .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
                         .collect())
@@ -990,21 +996,16 @@ impl<'db> ExecutionContext<'db> {
                 exec::ExecCountCursorPlan::Intersect { driver, rest } => {
                     let mut rows = self.count_cursor(driver, dependency).await?;
                     for child in rest {
-                        let allowed = self
-                            .count_cursor(child, dependency)
-                            .await?
-                            .into_iter()
-                            .collect::<BTreeSet<_>>();
+                        let read = self.count_cursor(child, dependency);
+                        let allowed = read.await?.into_iter().collect::<BTreeSet<_>>();
                         rows.retain(|row| allowed.contains(row));
                     }
                     Ok(rows)
                 }
                 exec::ExecCountCursorPlan::Filter { input, predicate } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
-                    let ExecutionValue::Stream(rows) = self.filter(input, predicate).await? else {
-                        unreachable!("row filter returns a stream")
-                    };
-                    Ok(rows)
+                    let output = self.filter(input, predicate).await?;
+                    self.stream_rows(output, "exact count filter")
                 }
                 exec::ExecCountCursorPlan::Window { input, window } => {
                     let rows = self.count_cursor(input, dependency).await?;
@@ -1012,56 +1013,38 @@ impl<'db> ExecutionContext<'db> {
                 }
                 exec::ExecCountCursorPlan::Order { input, plan } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
-                    let ExecutionValue::Stream(rows) = self.order(input, plan).await? else {
-                        unreachable!("row order returns a stream")
-                    };
-                    Ok(rows)
+                    let output = self.order(input, plan).await?;
+                    self.stream_rows(output, "exact count order")
                 }
                 exec::ExecCountCursorPlan::Expand { input, plan } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
-                    let ExecutionValue::Stream(rows) = self.expand(input, plan).await? else {
-                        unreachable!("row expansion returns a stream")
-                    };
-                    Ok(rows)
+                    let output = self.expand(input, plan).await?;
+                    self.stream_rows(output, "exact count expansion")
                 }
                 exec::ExecCountCursorPlan::VectorSearch { input, plan } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
-                    let ExecutionValue::Stream(rows) =
-                        self.restricted_vector_search(input, plan).await?
-                    else {
-                        unreachable!("restricted vector search returns a stream")
-                    };
-                    Ok(rows)
+                    let output = self.restricted_vector_search(input, plan).await?;
+                    self.stream_rows(output, "exact count restricted vector search")
                 }
                 exec::ExecCountCursorPlan::TextSearch { input, plan } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
-                    let ExecutionValue::Stream(rows) =
-                        self.restricted_text_search(input, plan).await?
-                    else {
-                        unreachable!("restricted text search returns a stream")
-                    };
-                    Ok(rows)
+                    let output = self.restricted_text_search(input, plan).await?;
+                    self.stream_rows(output, "exact count restricted text search")
                 }
                 exec::ExecCountCursorPlan::Variable { input, op } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
                     let executable = exec::ExecVariableOp::Stream(op.to_stream_op());
-                    let ExecutionValue::Stream(rows) = self.variable(input, &executable)? else {
-                        return Err(HelixDbError::InvariantViolation(
-                            "pure count variable cursor produced a non-row shape".to_string(),
-                        ));
-                    };
-                    Ok(rows)
+                    let output = self.variable(input, &executable)?;
+                    self.stream_rows(output, "exact count variable")
                 }
                 exec::ExecCountCursorPlan::Distinct { input, plan } => {
                     let mut rows = self.count_cursor(input, dependency).await?;
                     match plan {
                         exec::ExecCountDistinctPlan::HashRows => {
-                            let ExecutionValue::Stream(distinct) =
-                                self.distinct(ExecutionValue::Stream(rows))?
-                            else {
-                                unreachable!("row distinct returns a stream")
-                            };
-                            Ok(distinct)
+                            let output = self
+                                .distinct(ExecutionValue::Stream(rows))
+                                .expect("typed count distinct always receives rows");
+                            self.stream_rows(output, "exact count distinct")
                         }
                         exec::ExecCountDistinctPlan::OrderedRows => {
                             rows.dedup();
@@ -1151,9 +1134,13 @@ fn validate_index_id(
 
 #[cfg(test)]
 mod tests {
+    use helix_ast::expr::Predicate;
+    use helix_ast::index::RangeIndexDirection;
+    use helix_ast::query::QueryValue;
     use helix_ast::value::PropertyValue;
     use helix_planner::{catalog, context};
 
+    use super::super::access::tests::support as access_support;
     use super::super::test_support;
     use super::*;
 
@@ -1179,9 +1166,31 @@ mod tests {
         }
     }
 
+    fn edge_equality_index(label: &str, property: &str) -> exec::ExecEdgeNonUniqueEqualityIndex {
+        exec::ExecEdgeNonUniqueEqualityIndex::new(catalog::EdgeEqualityIndexMeta::new(
+            test_support::name(&format!("edge_eq:{label}:{property}")),
+        ))
+    }
+
+    fn edge_point(label: &str, property: &str, value: &str) -> exec::ExecEdgeBitmapExpr {
+        exec::ExecEdgeBitmapExpr::PointRead {
+            index: edge_equality_index(label, property),
+            key: catalog::ScopedPropertyKey::try_new(label, property).unwrap(),
+            value: indexed(value),
+        }
+    }
+
     async fn execute_direct_count(
         db: &HelixDB,
         plan: exec::ExecCountPlan,
+    ) -> Result<ExecutionValue> {
+        execute_direct_count_with_params(db, plan, context::ParamBindings::default()).await
+    }
+
+    async fn execute_direct_count_with_params(
+        db: &HelixDB,
+        plan: exec::ExecCountPlan,
+        params: context::ParamBindings,
     ) -> Result<ExecutionValue> {
         let executable = test_support::executable(
             ir::PlanKind::Read,
@@ -1194,12 +1203,1873 @@ mod tests {
             )],
             1,
         );
-        db.execute(&executable, context::ParamBindings::default())
-            .await?
-            .last
-            .ok_or_else(|| {
-                HelixDbError::InvariantViolation("direct count test has no result".to_string())
-            })
+        db.execute(&executable, params).await?.last.ok_or_else(|| {
+            HelixDbError::InvariantViolation("direct count test has no result".to_string())
+        })
+    }
+
+    fn bounded(skip: usize, take: usize) -> exec::ExecCountWindowPlan {
+        exec::ExecCountWindowPlan::identity()
+            .then_skip(exec::ExecUsizeExpr::literal(skip))
+            .then_limit(exec::ExecUsizeExpr::literal(take))
+    }
+
+    #[test]
+    fn evaluated_windows_and_index_identity_validation_cover_boundaries() {
+        let all = EvaluatedCountWindow {
+            skip: 2,
+            take: None,
+        };
+        assert_eq!(all.apply(5), 3);
+        assert_eq!(
+            all.apply_rows(vec![
+                ExecutionRow::current(ElementRef::Node(1)),
+                ExecutionRow::current(ElementRef::Node(2)),
+                ExecutionRow::current(ElementRef::Node(3)),
+            ]),
+            vec![ExecutionRow::current(ElementRef::Node(3))]
+        );
+        assert_eq!(all.threshold(), None);
+
+        let bounded = EvaluatedCountWindow {
+            skip: usize::MAX,
+            take: Some(2),
+        };
+        assert_eq!(bounded.apply(3), 0);
+        assert!(bounded.apply_rows(Vec::new()).is_empty());
+        assert_eq!(bounded.threshold(), Some(usize::MAX));
+        assert_eq!(positive_limit(None), None);
+        assert_eq!(positive_limit(Some(0)), None);
+        assert_eq!(
+            positive_limit(Some(3)).map(properties::PositiveUsize::get),
+            Some(3)
+        );
+
+        let node = catalog::ScopedPropertyKey::try_new("User", "status").unwrap();
+        assert!(
+            validate_node_equality_index(&test_support::name("node_eq:User:status"), &node).is_ok()
+        );
+        assert!(
+            validate_edge_equality_index(&test_support::name("edge_eq:User:status"), &node).is_ok()
+        );
+        let error = validate_node_equality_index(&test_support::name("wrong"), &node).unwrap_err();
+        assert!(
+            matches!(error, HelixDbError::IndexCatalogCorruption(message)
+            if message.contains("planner logical index identity"))
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_non_search_count_families_match_materialized_sources() {
+        let db = test_support::open_db_with_config(
+            test_support::in_memory_config("count-direct-source-matrix")
+                .with_equality_index("User", "status")
+                .with_edge_equality_index("FOLLOWS", "status")
+                .with_range_index("User", "rank")
+                .with_edge_range_index("FOLLOWS", "rank"),
+        )
+        .await;
+        let first = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![
+                ("status", PropertyValue::from("active")),
+                ("rank", PropertyValue::from("a")),
+            ],
+        )
+        .await;
+        let second = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![
+                ("status", PropertyValue::from("paused")),
+                ("rank", PropertyValue::from("b")),
+            ],
+        )
+        .await;
+        let absent = test_support::add_node_with_properties(&db, "User", Vec::new()).await;
+        test_support::add_node_with_properties(&db, "Other", Vec::new()).await;
+        let first_edge = test_support::add_edge_with_properties(
+            &db,
+            first,
+            second,
+            "FOLLOWS",
+            vec![
+                ("status", PropertyValue::from("active")),
+                ("rank", PropertyValue::from("a")),
+            ],
+        )
+        .await;
+        let second_edge = test_support::add_edge_with_properties(
+            &db,
+            second,
+            first,
+            "FOLLOWS",
+            vec![
+                ("status", PropertyValue::from("paused")),
+                ("rank", PropertyValue::from("b")),
+            ],
+        )
+        .await;
+
+        let node_union = exec::ExecNodeBitmapExpr::Union {
+            driver: Box::new(node_point("User", "status", "active")),
+            rest: ir::AtLeast::from_one(node_point("User", "status", "paused")),
+        };
+        let node_intersection = exec::ExecNodeBitmapExpr::Intersect {
+            driver: Box::new(node_union.clone()),
+            rest: ir::AtLeast::from_one(node_point("User", "status", "active")),
+        };
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeBitmap(exec::ExecNodeBitmapCountPlan {
+                    bitmap: node_intersection,
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+
+        let edge_batch = exec::ExecEdgeBitmapExpr::BatchedUnionRead {
+            index: edge_equality_index("FOLLOWS", "status"),
+            key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+            values: ir::AtLeast::from_pair(indexed("active"), indexed("paused")),
+        };
+        let edge_union = exec::ExecEdgeBitmapExpr::Union {
+            driver: Box::new(edge_batch),
+            rest: ir::AtLeast::from_one(edge_point("FOLLOWS", "status", "missing")),
+        };
+        let edge_intersection = exec::ExecEdgeBitmapExpr::Intersect {
+            driver: Box::new(edge_union),
+            rest: ir::AtLeast::from_one(edge_point("FOLLOWS", "status", "active")),
+        };
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::EdgeBitmap(exec::ExecEdgeBitmapCountPlan {
+                    bitmap: edge_intersection,
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+
+        let node_range = exec::ExecNodeVerifiedRangeScanPlan {
+            index: catalog::NodeRangeIndexMeta::new(test_support::name("node_range:User:rank:Asc")),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "User",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
+                    driver: node_range.clone(),
+                    membership: exec::ExecNodeRangeMembershipPlan::BitmapFilters(
+                        ir::AtLeast::from_one(node_point("User", "status", "active")),
+                    ),
+                    window: bounded(0, 1),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
+                    driver: node_range,
+                    membership: exec::ExecNodeRangeMembershipPlan::All,
+                    window: bounded(1, 1),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+
+        let edge_range = exec::ExecEdgeVerifiedRangeScanPlan {
+            index: catalog::EdgeRangeIndexMeta::new(test_support::name(
+                "edge_range:FOLLOWS:rank:Asc",
+            )),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "FOLLOWS",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::EdgeRange(exec::ExecEdgeRangeCountPlan {
+                    driver: edge_range.clone(),
+                    membership: exec::ExecEdgeRangeMembershipPlan::BitmapFilters(
+                        ir::AtLeast::from_one(edge_point("FOLLOWS", "status", "paused")),
+                    ),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::EdgeRange(exec::ExecEdgeRangeCountPlan {
+                    driver: edge_range,
+                    membership: exec::ExecEdgeRangeMembershipPlan::All,
+                    window: bounded(1, 1),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+
+        let node_null = exec::ExecNodeAuthoritativeScanPredicate::NullEquality {
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+        };
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeAuthoritativeScan(exec::ExecNodeScanCountPlan {
+                    predicate: node_null.clone(),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeAuthoritativeScan(exec::ExecNodeScanCountPlan {
+                    predicate: exec::ExecNodeAuthoritativeScanPredicate::Predicate(
+                        ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+                    ),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        let edge_predicate = exec::ExecEdgeAuthoritativeScanPredicate::Predicate(
+            ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+        );
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::EdgeAuthoritativeScan(exec::ExecEdgeScanCountPlan {
+                    predicate: edge_predicate.clone(),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::EdgeAuthoritativeScan(exec::ExecEdgeScanCountPlan {
+                    predicate: exec::ExecEdgeAuthoritativeScanPredicate::NullEquality {
+                        key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                    },
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(0)
+        );
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::EdgeAuthoritativeScan(exec::ExecEdgeScanCountPlan {
+                    predicate: edge_predicate,
+                    window: bounded(0, 1),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+
+        for (plan, expected) in [
+            (
+                exec::ExecCountPlan::Constant(usize::MAX),
+                ExecutionValue::Count(usize::MAX),
+            ),
+            (
+                exec::ExecCountPlan::NodePointReads {
+                    ids: test_support::ids(vec![first, 999_999, second]),
+                    window: bounded(1, 1),
+                },
+                ExecutionValue::Count(1),
+            ),
+            (
+                exec::ExecCountPlan::NodePointReads {
+                    ids: test_support::ids(vec![first, second, 999_999]),
+                    window: bounded(0, 1),
+                },
+                ExecutionValue::Count(1),
+            ),
+            (
+                exec::ExecCountPlan::EdgePointReads {
+                    ids: test_support::ids(vec![first_edge, 999_999, second_edge]),
+                    window: bounded(1, 1),
+                },
+                ExecutionValue::Count(1),
+            ),
+            (
+                exec::ExecCountPlan::EdgePointReads {
+                    ids: test_support::ids(vec![first_edge, second_edge, 999_999]),
+                    window: bounded(0, 1),
+                },
+                ExecutionValue::Count(1),
+            ),
+            (
+                exec::ExecCountPlan::NodeFullScan {
+                    window: bounded(1, 2),
+                },
+                ExecutionValue::Count(2),
+            ),
+            (
+                exec::ExecCountPlan::EdgeFullScan {
+                    window: bounded(1, 1),
+                },
+                ExecutionValue::Count(1),
+            ),
+            (
+                exec::ExecCountPlan::NodeLabelBitmap {
+                    label: test_support::name("User"),
+                    window: bounded(1, 2),
+                },
+                ExecutionValue::Count(2),
+            ),
+            (
+                exec::ExecCountPlan::EdgeLabelBitmap {
+                    label: test_support::name("FOLLOWS"),
+                    window: bounded(1, 1),
+                },
+                ExecutionValue::Count(1),
+            ),
+        ] {
+            assert_eq!(execute_direct_count(&db, plan).await.unwrap(), expected);
+        }
+
+        let ids_param = test_support::name("ids");
+        let node_dynamic = test_support::name("node_status");
+        let edge_dynamic = test_support::name("edge_status");
+        let params = context::ParamBindings::default()
+            .with_value(
+                ids_param.clone(),
+                PropertyValue::I64Array(vec![first as i64, second as i64, 999_999]),
+            )
+            .with_value(node_dynamic.clone(), PropertyValue::from("active"))
+            .with_value(edge_dynamic.clone(), PropertyValue::from("paused"));
+        for (plan, expected) in [
+            (
+                exec::ExecCountPlan::NodeRuntimeInput {
+                    input: exec::ExecRuntimeInputPlan::Param(ids_param.clone()),
+                    window: exec::ExecCountWindowPlan::identity(),
+                },
+                2,
+            ),
+            (
+                exec::ExecCountPlan::EdgeRuntimeInput {
+                    input: exec::ExecRuntimeInputPlan::Param(ids_param.clone()),
+                    window: exec::ExecCountWindowPlan::identity(),
+                },
+                2,
+            ),
+            (
+                exec::ExecCountPlan::RuntimeInput {
+                    input: exec::ExecRuntimeInputPlan::Param(ids_param),
+                    window: bounded(1, 1),
+                },
+                1,
+            ),
+            (
+                exec::ExecCountPlan::NodeDynamicEquality(exec::ExecNodeDynamicEqualityCountPlan {
+                    index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                        "node_eq:User:status",
+                    )),
+                    key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                    param: node_dynamic,
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+                1,
+            ),
+            (
+                exec::ExecCountPlan::EdgeDynamicEquality(exec::ExecEdgeDynamicEqualityCountPlan {
+                    index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                        "edge_eq:FOLLOWS:status",
+                    )),
+                    key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                    param: edge_dynamic,
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+                1,
+            ),
+        ] {
+            assert_eq!(
+                execute_direct_count_with_params(&db, plan, params.clone())
+                    .await
+                    .unwrap(),
+                ExecutionValue::Count(expected)
+            );
+        }
+
+        let variable = test_support::name("rows");
+        let mut context = ExecutionContext::new(&db, context::ParamBindings::default());
+        context.variables.insert(
+            variable.clone(),
+            ExecutionValue::Stream(vec![
+                ExecutionRow::current(ElementRef::Node(first)),
+                ExecutionRow::current(ElementRef::Node(absent)),
+            ]),
+        );
+        for (plan, expected) in [
+            (
+                exec::ExecCountPlan::NodeRuntimeInput {
+                    input: exec::ExecRuntimeInputPlan::Variable(variable.clone()),
+                    window: bounded(1, 1),
+                },
+                1,
+            ),
+            (
+                exec::ExecCountPlan::RuntimeInput {
+                    input: exec::ExecRuntimeInputPlan::Variable(variable),
+                    window: exec::ExecCountWindowPlan::identity(),
+                },
+                2,
+            ),
+        ] {
+            assert_eq!(
+                context
+                    .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                    .await
+                    .unwrap(),
+                ExecutionValue::Count(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_direct_storage_count_propagates_its_own_read_failure() {
+        let db = test_support::open_db_with_config(
+            test_support::in_memory_config("count-direct-storage-errors")
+                .with_equality_index("User", "status")
+                .with_unique_equality_index("User", "email")
+                .with_edge_equality_index("FOLLOWS", "status")
+                .with_range_index("User", "rank")
+                .with_edge_range_index("FOLLOWS", "rank"),
+        )
+        .await;
+        db.inner_db().close().await.unwrap();
+        let ids = test_support::name("ids");
+        let late = test_support::name("late");
+        let mut execution = ExecutionContext::new(
+            &db,
+            context::ParamBindings::default()
+                .with_value(ids.clone(), PropertyValue::I64Array(vec![1]))
+                .with_value(late.clone(), PropertyValue::from("active")),
+        );
+        let exact_unique = exec::ExecNodeAccessPlan::exact_equality(
+            catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:User:email"))
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+            catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
+            ir::IndexValue::Literal(
+                ir::SecondaryIndexLiteral::new(PropertyValue::from("a@example.com")).unwrap(),
+            ),
+        );
+        let exec::ExecNodeAccessPlan::Unique {
+            lookup,
+            verification,
+        } = exact_unique
+        else {
+            panic!("unique fixture classifies exactly")
+        };
+        let node_range = exec::ExecNodeVerifiedRangeScanPlan {
+            index: catalog::NodeRangeIndexMeta::new(test_support::name("node_range:User:rank:Asc")),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "User",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        let edge_range = exec::ExecEdgeVerifiedRangeScanPlan {
+            index: catalog::EdgeRangeIndexMeta::new(test_support::name(
+                "edge_range:FOLLOWS:rank:Asc",
+            )),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "FOLLOWS",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        let window = exec::ExecCountWindowPlan::identity();
+        let plans = vec![
+            exec::ExecCountPlan::NodeBitmap(exec::ExecNodeBitmapCountPlan {
+                bitmap: node_point("User", "status", "active"),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::EdgeBitmap(exec::ExecEdgeBitmapCountPlan {
+                bitmap: edge_point("FOLLOWS", "status", "active"),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::NodeUnique(exec::ExecNodeUniqueCountPlan {
+                lookup: lookup.clone(),
+                verification: verification.clone(),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
+                driver: node_range.clone(),
+                membership: exec::ExecNodeRangeMembershipPlan::All,
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::EdgeRange(exec::ExecEdgeRangeCountPlan {
+                driver: edge_range.clone(),
+                membership: exec::ExecEdgeRangeMembershipPlan::All,
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::NodeAuthoritativeScan(exec::ExecNodeScanCountPlan {
+                predicate: exec::ExecNodeAuthoritativeScanPredicate::Predicate(
+                    ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+                ),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::EdgeAuthoritativeScan(exec::ExecEdgeScanCountPlan {
+                predicate: exec::ExecEdgeAuthoritativeScanPredicate::Predicate(
+                    ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+                ),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::NodePointReads {
+                ids: test_support::ids(vec![1]),
+                window: window.clone(),
+            },
+            exec::ExecCountPlan::EdgePointReads {
+                ids: test_support::ids(vec![1]),
+                window: window.clone(),
+            },
+            exec::ExecCountPlan::NodeRuntimeInput {
+                input: exec::ExecRuntimeInputPlan::Param(ids.clone()),
+                window: window.clone(),
+            },
+            exec::ExecCountPlan::EdgeRuntimeInput {
+                input: exec::ExecRuntimeInputPlan::Param(ids),
+                window: window.clone(),
+            },
+            exec::ExecCountPlan::NodeFullScan {
+                window: window.clone(),
+            },
+            exec::ExecCountPlan::EdgeFullScan {
+                window: window.clone(),
+            },
+            exec::ExecCountPlan::NodeLabelBitmap {
+                label: test_support::name("User"),
+                window: window.clone(),
+            },
+            exec::ExecCountPlan::EdgeLabelBitmap {
+                label: test_support::name("FOLLOWS"),
+                window: window.clone(),
+            },
+            exec::ExecCountPlan::NodeDynamicEquality(exec::ExecNodeDynamicEqualityCountPlan {
+                index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                    "node_eq:User:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                param: late.clone(),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::EdgeDynamicEquality(exec::ExecEdgeDynamicEqualityCountPlan {
+                index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                    "edge_eq:FOLLOWS:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                param: late,
+                window,
+            }),
+        ];
+        for plan in plans {
+            assert!(execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                .await
+                .is_err());
+        }
+        let cursors = vec![
+            exec::ExecCountCursorPlan::NodeBitmap(node_point("User", "status", "active")),
+            exec::ExecCountCursorPlan::EdgeBitmap(edge_point("FOLLOWS", "status", "active")),
+            exec::ExecCountCursorPlan::NodeUnique {
+                lookup,
+                verification,
+            },
+            exec::ExecCountCursorPlan::NodeRange(node_range),
+            exec::ExecCountCursorPlan::EdgeRange(edge_range),
+            exec::ExecCountCursorPlan::NodeAuthoritativeScan(
+                exec::ExecNodeAuthoritativeScanPredicate::Predicate(
+                    ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+                ),
+            ),
+            exec::ExecCountCursorPlan::EdgeAuthoritativeScan(
+                exec::ExecEdgeAuthoritativeScanPredicate::Predicate(
+                    ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+                ),
+            ),
+            exec::ExecCountCursorPlan::NodePointReads(test_support::ids(vec![1])),
+            exec::ExecCountCursorPlan::EdgePointReads(test_support::ids(vec![1])),
+            exec::ExecCountCursorPlan::NodeRuntimeInput(exec::ExecRuntimeInputPlan::Param(
+                test_support::name("ids"),
+            )),
+            exec::ExecCountCursorPlan::EdgeRuntimeInput(exec::ExecRuntimeInputPlan::Param(
+                test_support::name("ids"),
+            )),
+            exec::ExecCountCursorPlan::NodeFullScan,
+            exec::ExecCountCursorPlan::EdgeFullScan,
+            exec::ExecCountCursorPlan::NodeLabelBitmap(test_support::name("User")),
+            exec::ExecCountCursorPlan::EdgeLabelBitmap(test_support::name("FOLLOWS")),
+            exec::ExecCountCursorPlan::NodeDynamicEquality {
+                index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                    "node_eq:User:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                param: test_support::name("late"),
+            },
+            exec::ExecCountCursorPlan::EdgeDynamicEquality {
+                index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                    "edge_eq:FOLLOWS:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                param: test_support::name("late"),
+            },
+        ];
+        for cursor in cursors {
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor,
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+            assert!(execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_and_cursor_authoritative_counts_propagate_each_predicate_failure() {
+        let db = test_support::open_db("count-corrupt-authority-errors").await;
+        let node = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        let edge = test_support::add_edge_with_properties(
+            &db,
+            node,
+            node,
+            "FOLLOWS",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        db.inner_db()
+            .put(
+                keys::Key::Data {
+                    scope: crate::encoding::v1::keys::tenant::DataScope::LegacyUnscoped,
+                    kind: keys::DataKeyKind::NodeProperty(keys::NodePropertyKey::new(node)),
+                }
+                .to_bytes(),
+                bytes::Bytes::from_static(b"malformed node authority"),
+            )
+            .await
+            .unwrap();
+        db.inner_db()
+            .put(
+                keys::Key::Data {
+                    scope: crate::encoding::v1::keys::tenant::DataScope::LegacyUnscoped,
+                    kind: keys::DataKeyKind::EdgePropertyById(keys::EdgePropertyByIdKey::new(edge)),
+                }
+                .to_bytes(),
+                bytes::Bytes::from_static(b"malformed edge authority"),
+            )
+            .await
+            .unwrap();
+        let node_predicates = [
+            exec::ExecNodeAuthoritativeScanPredicate::NullEquality {
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            },
+            exec::ExecNodeAuthoritativeScanPredicate::Predicate(
+                ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+            ),
+        ];
+        let edge_predicates = [
+            exec::ExecEdgeAuthoritativeScanPredicate::NullEquality {
+                key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+            },
+            exec::ExecEdgeAuthoritativeScanPredicate::Predicate(
+                ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+            ),
+        ];
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        for predicate in node_predicates {
+            for plan in [
+                exec::ExecCountPlan::NodeAuthoritativeScan(exec::ExecNodeScanCountPlan {
+                    predicate: predicate.clone(),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+                exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                    cursor: exec::ExecCountCursorPlan::NodeAuthoritativeScan(predicate),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            ] {
+                assert!(execution
+                    .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                    .await
+                    .is_err());
+            }
+        }
+        for predicate in edge_predicates {
+            for plan in [
+                exec::ExecCountPlan::EdgeAuthoritativeScan(exec::ExecEdgeScanCountPlan {
+                    predicate: predicate.clone(),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+                exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                    cursor: exec::ExecCountCursorPlan::EdgeAuthoritativeScan(predicate),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            ] {
+                assert!(execution
+                    .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                    .await
+                    .is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn count_window_parameters_shapes_and_runtime_variables_fail_closed() {
+        let db = test_support::open_db("count-window-shape-errors").await;
+        let property = test_support::name("property");
+        let negative = test_support::name("negative");
+        let query = test_support::name("query");
+        let query_negative = test_support::name("query_negative");
+        let query_string = test_support::name("query_string");
+        let missing = test_support::name("missing");
+        let params = context::ParamBindings::default()
+            .with_value(property.clone(), PropertyValue::I64(4))
+            .with_value(negative.clone(), PropertyValue::I64(-1))
+            .with_query_value(query.clone(), QueryValue::I64(5))
+            .with_query_value(query_negative.clone(), QueryValue::I64(-2))
+            .with_query_value(query_string.clone(), QueryValue::String("five".to_string()));
+        let mut execution = ExecutionContext::new(&db, params);
+
+        assert_eq!(execution.count_bound_param(&property).unwrap(), 4);
+        assert_eq!(execution.count_bound_param(&query).unwrap(), 5);
+        for name in [&negative, &query_negative, &query_string, &missing] {
+            assert!(
+                execution
+                    .count_bound_param(name)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not a non-negative integer")
+                    || execution
+                        .count_bound_param(name)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("not bound")
+            );
+        }
+
+        let non_integer = test_support::name("non_integer");
+        execution
+            .params
+            .values
+            .insert(non_integer.clone(), PropertyValue::Bool(true));
+        assert!(execution
+            .count_bound_param(&non_integer)
+            .unwrap_err()
+            .to_string()
+            .contains("not a non-negative integer"));
+        let window = exec::ExecCountWindowPlan {
+            skip: exec::ExecUsizeExpr::Param(property),
+            take: exec::ExecCountTake::All,
+        };
+        assert_eq!(
+            execution.count_window(&window).unwrap(),
+            EvaluatedCountWindow {
+                skip: 4,
+                take: None,
+            }
+        );
+
+        let scalar_plan = exec::ExecCountPlan::InputScalars {
+            window: exec::ExecCountWindowPlan::identity(),
+        };
+        for (input, expected) in [
+            (ExecutionValue::Count(99), 1),
+            (ExecutionValue::Bool(false), 1),
+            (
+                ExecutionValue::Scalars(vec![
+                    ExecutionScalar::NodeId(1),
+                    ExecutionScalar::String("value".to_string()),
+                ]),
+                2,
+            ),
+        ] {
+            assert_eq!(
+                execution.execute_count(input, &scalar_plan).await.unwrap(),
+                ExecutionValue::Count(expected)
+            );
+        }
+
+        let row_plan = exec::ExecCountPlan::InputRows {
+            window: exec::ExecCountWindowPlan::identity(),
+        };
+        for input in [
+            ExecutionValue::FoldedStream(FoldedStream::new(Vec::new())),
+            ExecutionValue::Count(0),
+            ExecutionValue::Bool(false),
+            ExecutionValue::Scalars(Vec::new()),
+        ] {
+            assert!(execution.execute_count(input, &row_plan).await.is_err());
+        }
+        assert!(execution
+            .execute_count(ExecutionValue::Stream(Vec::new()), &scalar_plan)
+            .await
+            .is_err());
+        assert!(execution
+            .execute_count(
+                ExecutionValue::IndexDdlReceipt(
+                    crate::index_lifecycle::IndexDdlReceipt::ExistingOperation {
+                        operation_id: crate::index_lifecycle::IndexOperationId::from_bytes([9; 16])
+                            .unwrap(),
+                    },
+                ),
+                &scalar_plan,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("index lifecycle value"));
+
+        let rows = test_support::name("rows");
+        execution
+            .variables
+            .insert(rows.clone(), ExecutionValue::Count(2));
+        for input in [
+            exec::ExecRuntimeInputPlan::Variable(rows.clone()),
+            exec::ExecRuntimeInputPlan::Variable(test_support::name("unbound")),
+        ] {
+            assert!(execution.runtime_ids(&input).is_err());
+            assert!(execution.runtime_row_count(&input).is_err());
+        }
+
+        let mut scalar_dependency = Some(ExecutionValue::Scalars(Vec::new()));
+        assert!(execution
+            .count_cursor(
+                &exec::ExecCountCursorPlan::InputRows,
+                &mut scalar_dependency,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("expected rows"));
+        let scalar_rows = test_support::name("scalar_rows");
+        execution
+            .variables
+            .insert(scalar_rows.clone(), ExecutionValue::Bool(true));
+        let mut no_dependency = Some(ExecutionValue::Stream(Vec::new()));
+        assert!(execution
+            .count_cursor(
+                &exec::ExecCountCursorPlan::RuntimeInput(exec::ExecRuntimeInputPlan::Variable(
+                    scalar_rows
+                ),),
+                &mut no_dependency,
+            )
+            .await
+            .is_err());
+
+        let multiple_inputs = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+            cursor: exec::ExecCountCursorPlan::Union {
+                driver: Box::new(exec::ExecCountCursorPlan::InputRows),
+                rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::InputRows),
+            },
+            window: exec::ExecCountWindowPlan::identity(),
+        });
+        assert!(execution
+            .execute_count(ExecutionValue::Stream(Vec::new()), &multiple_inputs)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid count program"));
+
+        let mut oversized_expression = exec::ExecUsizeExpr::literal(0);
+        for _ in 0..exec::MAX_EXEC_USIZE_EXPR_NODES {
+            oversized_expression = exec::ExecUsizeExpr::SaturatingAdd(
+                Box::new(oversized_expression),
+                Box::new(exec::ExecUsizeExpr::literal(1)),
+            );
+        }
+        let invalid_window = exec::ExecCountPlan::InputRows {
+            window: exec::ExecCountWindowPlan {
+                skip: oversized_expression,
+                take: exec::ExecCountTake::All,
+            },
+        };
+        assert!(execution
+            .execute_count(ExecutionValue::Stream(Vec::new()), &invalid_window)
+            .await
+            .is_err());
+
+        let unique_index = exec::ExecNodeUniqueEqualityIndex::try_from(
+            catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:User:email"))
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+        )
+        .unwrap();
+        let email = catalog::ScopedPropertyKey::try_new("User", "email").unwrap();
+        let lookup = exec::ExecNodeUniqueOwnerReadPlan {
+            index: unique_index,
+            key: email.clone(),
+            value: indexed("a@example.com"),
+        };
+        for verification in [
+            exec::ExecNodeAuthoritativeVerificationPlan {
+                key: catalog::ScopedPropertyKey::try_new("Other", "email").unwrap(),
+                value: indexed("a@example.com"),
+            },
+            exec::ExecNodeAuthoritativeVerificationPlan {
+                key: email,
+                value: indexed("b@example.com"),
+            },
+        ] {
+            assert!(execution
+                .verified_node_unique_owner(&lookup, &verification)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("does not match"));
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_count_cursor_matrix_preserves_identity_and_child_order() {
+        let db = test_support::open_db_with_config(
+            test_support::in_memory_config("count-recursive-cursor-matrix")
+                .with_equality_index("User", "status")
+                .with_unique_equality_index("User", "email")
+                .with_edge_equality_index("FOLLOWS", "status")
+                .with_range_index("User", "rank")
+                .with_edge_range_index("FOLLOWS", "rank"),
+        )
+        .await;
+        let first = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![
+                ("status", PropertyValue::from("active")),
+                ("email", PropertyValue::from("a@example.com")),
+                ("rank", PropertyValue::from("a")),
+            ],
+        )
+        .await;
+        let second = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![
+                ("status", PropertyValue::from("paused")),
+                ("email", PropertyValue::from("b@example.com")),
+                ("rank", PropertyValue::from("b")),
+            ],
+        )
+        .await;
+        let null_node = test_support::add_node_with_properties(&db, "User", Vec::new()).await;
+        let first_edge = test_support::add_edge_with_properties(
+            &db,
+            first,
+            second,
+            "FOLLOWS",
+            vec![
+                ("status", PropertyValue::from("active")),
+                ("rank", PropertyValue::from("a")),
+            ],
+        )
+        .await;
+        let second_edge = test_support::add_edge_with_properties(
+            &db,
+            second,
+            first,
+            "FOLLOWS",
+            vec![("rank", PropertyValue::from("b"))],
+        )
+        .await;
+        let ids = test_support::name("ids");
+        let late_node = test_support::name("late_node");
+        let late_edge = test_support::name("late_edge");
+        let params = context::ParamBindings::default()
+            .with_value(
+                ids.clone(),
+                PropertyValue::I64Array(vec![first as i64, second as i64]),
+            )
+            .with_value(late_node.clone(), PropertyValue::from("active"))
+            .with_value(late_edge.clone(), PropertyValue::from("active"));
+        let mut execution = ExecutionContext::new(&db, params);
+        execution.enable_request_read_view().await.unwrap();
+        let node_rows_variable = test_support::name("node_rows");
+        let edge_rows_variable = test_support::name("edge_rows");
+        let mixed_rows_variable = test_support::name("mixed_rows");
+        execution.variables.insert(
+            node_rows_variable.clone(),
+            ExecutionValue::Stream(vec![ExecutionRow::current(ElementRef::Node(first))]),
+        );
+        execution.variables.insert(
+            edge_rows_variable.clone(),
+            ExecutionValue::Stream(vec![ExecutionRow::current(ElementRef::Edge(first_edge))]),
+        );
+        execution.variables.insert(
+            mixed_rows_variable.clone(),
+            ExecutionValue::Stream(vec![
+                ExecutionRow::current(ElementRef::Node(first)),
+                ExecutionRow::current(ElementRef::Edge(first_edge)),
+            ]),
+        );
+
+        let exact_unique = exec::ExecNodeAccessPlan::exact_equality(
+            catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:User:email"))
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+            catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
+            ir::IndexValue::Literal(
+                ir::SecondaryIndexLiteral::new(PropertyValue::from("a@example.com")).unwrap(),
+            ),
+        );
+        let exec::ExecNodeAccessPlan::Unique {
+            lookup,
+            verification,
+        } = exact_unique
+        else {
+            panic!("unique fixture selects unique owner verification")
+        };
+        let node_range = exec::ExecNodeVerifiedRangeScanPlan {
+            index: catalog::NodeRangeIndexMeta::new(test_support::name("node_range:User:rank:Asc")),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "User",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        let edge_range = exec::ExecEdgeVerifiedRangeScanPlan {
+            index: catalog::EdgeRangeIndexMeta::new(test_support::name(
+                "edge_range:FOLLOWS:rank:Asc",
+            )),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "FOLLOWS",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+
+        let sources = vec![
+            (exec::ExecCountCursorPlan::EmptyRows, 0),
+            (
+                exec::ExecCountCursorPlan::NodeBitmap(node_point("User", "status", "active")),
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::EdgeBitmap(edge_point("FOLLOWS", "status", "active")),
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::NodeUnique {
+                    lookup,
+                    verification,
+                },
+                1,
+            ),
+            (exec::ExecCountCursorPlan::NodeRange(node_range.clone()), 2),
+            (exec::ExecCountCursorPlan::EdgeRange(edge_range.clone()), 2),
+            (
+                exec::ExecCountCursorPlan::NodeAuthoritativeScan(
+                    exec::ExecNodeAuthoritativeScanPredicate::Predicate(
+                        ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+                    ),
+                ),
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::NodeAuthoritativeScan(
+                    exec::ExecNodeAuthoritativeScanPredicate::NullEquality {
+                        key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                    },
+                ),
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::EdgeAuthoritativeScan(
+                    exec::ExecEdgeAuthoritativeScanPredicate::NullEquality {
+                        key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                    },
+                ),
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::EdgeAuthoritativeScan(
+                    exec::ExecEdgeAuthoritativeScanPredicate::Predicate(
+                        ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+                    ),
+                ),
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::NodePointReads(test_support::ids(vec![
+                    first, 999_999, second,
+                ])),
+                2,
+            ),
+            (
+                exec::ExecCountCursorPlan::EdgePointReads(test_support::ids(vec![
+                    first_edge,
+                    999_999,
+                    second_edge,
+                ])),
+                2,
+            ),
+            (
+                exec::ExecCountCursorPlan::NodeRuntimeInput(exec::ExecRuntimeInputPlan::Param(
+                    ids.clone(),
+                )),
+                2,
+            ),
+            (
+                exec::ExecCountCursorPlan::EdgeRuntimeInput(exec::ExecRuntimeInputPlan::Param(
+                    ids.clone(),
+                )),
+                2,
+            ),
+            (
+                exec::ExecCountCursorPlan::RuntimeInput(exec::ExecRuntimeInputPlan::Param(
+                    ids.clone(),
+                )),
+                2,
+            ),
+            (
+                exec::ExecCountCursorPlan::NodeRuntimeInput(exec::ExecRuntimeInputPlan::Variable(
+                    node_rows_variable,
+                )),
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::EdgeRuntimeInput(exec::ExecRuntimeInputPlan::Variable(
+                    edge_rows_variable,
+                )),
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::RuntimeInput(exec::ExecRuntimeInputPlan::Variable(
+                    mixed_rows_variable,
+                )),
+                2,
+            ),
+            (exec::ExecCountCursorPlan::NodeFullScan, 3),
+            (exec::ExecCountCursorPlan::EdgeFullScan, 2),
+            (
+                exec::ExecCountCursorPlan::NodeLabelBitmap(test_support::name("User")),
+                3,
+            ),
+            (
+                exec::ExecCountCursorPlan::EdgeLabelBitmap(test_support::name("FOLLOWS")),
+                2,
+            ),
+            (
+                exec::ExecCountCursorPlan::NodeDynamicEquality {
+                    index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                        "node_eq:User:status",
+                    )),
+                    key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                    param: late_node,
+                },
+                1,
+            ),
+            (
+                exec::ExecCountCursorPlan::EdgeDynamicEquality {
+                    index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                        "edge_eq:FOLLOWS:status",
+                    )),
+                    key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                    param: late_edge,
+                },
+                1,
+            ),
+        ];
+        for (cursor, expected) in sources {
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor,
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+            assert_eq!(
+                execution
+                    .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                    .await
+                    .unwrap(),
+                ExecutionValue::Count(expected)
+            );
+        }
+
+        let union = exec::ExecCountCursorPlan::Union {
+            driver: Box::new(exec::ExecCountCursorPlan::NodePointReads(
+                test_support::ids(vec![first]),
+            )),
+            rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::NodePointReads(
+                test_support::ids(vec![first, second]),
+            )),
+        };
+        let intersection = exec::ExecCountCursorPlan::Intersect {
+            driver: Box::new(union.clone()),
+            rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::NodePointReads(
+                test_support::ids(vec![second, null_node]),
+            )),
+        };
+        let filtered = exec::ExecCountCursorPlan::Filter {
+            input: Box::new(union.clone()),
+            predicate: ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+        };
+        let positioned = exec::ExecCountCursorPlan::Window {
+            input: Box::new(union.clone()),
+            window: bounded(1, 1),
+        };
+        let ordered = exec::ExecCountCursorPlan::Order {
+            input: Box::new(union.clone()),
+            plan: ir::OrderPlan::RangeIndex {
+                key: ir::OrderKey {
+                    property: test_support::name("rank"),
+                    order: helix_ast::traversal::Order::Asc,
+                },
+                index_id: test_support::name("node_range:User:rank:Asc"),
+            },
+        };
+        let bound = exec::ExecCountCursorPlan::Variable {
+            input: Box::new(union.clone()),
+            op: helix_planner::logical::PureStreamVariableOp::Bind(test_support::name("current")),
+        };
+        let expanded = exec::ExecCountCursorPlan::Expand {
+            input: Box::new(exec::ExecCountCursorPlan::NodePointReads(
+                test_support::ids(vec![first]),
+            )),
+            plan: ir::ExpandPlan {
+                direction: ir::ExpandDirection::Out,
+                output: ir::ExpandOutput::Nodes,
+                label: ir::ExpandLabelPlan::Any,
+            },
+        };
+        for (cursor, expected) in [
+            (union, 2),
+            (intersection, 1),
+            (filtered, 1),
+            (positioned, 1),
+            (ordered, 2),
+            (bound, 2),
+            (expanded, 1),
+        ] {
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor,
+                window: bounded(0, expected),
+            });
+            assert_eq!(
+                execution
+                    .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                    .await
+                    .unwrap(),
+                ExecutionValue::Count(expected)
+            );
+        }
+
+        for algorithm in [
+            exec::ExecCountDistinctPlan::HashRows,
+            exec::ExecCountDistinctPlan::OrderedRows,
+        ] {
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor: exec::ExecCountCursorPlan::Distinct {
+                    input: Box::new(exec::ExecCountCursorPlan::InputRows),
+                    plan: algorithm,
+                },
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+            assert_eq!(
+                execution
+                    .execute_count(
+                        ExecutionValue::Stream(vec![
+                            ExecutionRow::current(ElementRef::Node(first)),
+                            ExecutionRow::current(ElementRef::Node(first)),
+                            ExecutionRow::current(ElementRef::Node(second)),
+                        ]),
+                        &plan,
+                    )
+                    .await
+                    .unwrap(),
+                ExecutionValue::Count(2)
+            );
+        }
+
+        let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+        assert!(execution
+            .count_cursor(&exec::ExecCountCursorPlan::InputRows, &mut dependency)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(execution
+            .count_cursor(&exec::ExecCountCursorPlan::InputRows, &mut dependency)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+        execution.close_request_read_view().unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_recursive_cursor_wrapper_propagates_child_failure_in_encoded_order() {
+        let db = test_support::open_db("count-recursive-child-errors").await;
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        let invalid = || exec::ExecCountCursorPlan::NodeDynamicEquality {
+            index: catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:Other:status")),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            param: test_support::name("missing"),
+        };
+        let index = access_support::search_index("missing-search-index");
+        let k = access_support::literal_search_limit(1);
+        let wrappers = vec![
+            exec::ExecCountCursorPlan::Union {
+                driver: Box::new(invalid()),
+                rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::EmptyRows),
+            },
+            exec::ExecCountCursorPlan::Union {
+                driver: Box::new(exec::ExecCountCursorPlan::EmptyRows),
+                rest: ir::AtLeast::from_one(invalid()),
+            },
+            exec::ExecCountCursorPlan::Intersect {
+                driver: Box::new(invalid()),
+                rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::EmptyRows),
+            },
+            exec::ExecCountCursorPlan::Intersect {
+                driver: Box::new(exec::ExecCountCursorPlan::EmptyRows),
+                rest: ir::AtLeast::from_one(invalid()),
+            },
+            exec::ExecCountCursorPlan::Filter {
+                input: Box::new(invalid()),
+                predicate: ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+            },
+            exec::ExecCountCursorPlan::Window {
+                input: Box::new(invalid()),
+                window: exec::ExecCountWindowPlan::identity(),
+            },
+            exec::ExecCountCursorPlan::Order {
+                input: Box::new(invalid()),
+                plan: ir::OrderPlan::RangeIndex {
+                    key: ir::OrderKey {
+                        property: test_support::name("rank"),
+                        order: helix_ast::traversal::Order::Asc,
+                    },
+                    index_id: test_support::name("node_range:User:rank:Asc"),
+                },
+            },
+            exec::ExecCountCursorPlan::Expand {
+                input: Box::new(invalid()),
+                plan: ir::ExpandPlan {
+                    direction: ir::ExpandDirection::Out,
+                    output: ir::ExpandOutput::Nodes,
+                    label: ir::ExpandLabelPlan::Any,
+                },
+            },
+            exec::ExecCountCursorPlan::VectorSearch {
+                input: Box::new(invalid()),
+                plan: Box::new(ir::RestrictedVectorSearchPlan::Nodes {
+                    key: catalog::NodeSearchIndexKey::try_new("User", "embedding").unwrap(),
+                    index: index.clone(),
+                    query_vector: ir::VectorQueryInputPlan::Vector(
+                        ir::SearchVector::new(vec![1.0]).unwrap(),
+                    ),
+                    k: k.clone(),
+                }),
+            },
+            exec::ExecCountCursorPlan::TextSearch {
+                input: Box::new(invalid()),
+                plan: Box::new(ir::RestrictedTextSearchPlan::Nodes {
+                    key: catalog::NodeSearchIndexKey::try_new("User", "body").unwrap(),
+                    index,
+                    query_text: ir::TextQueryInputPlan::Text(test_support::name("rust")),
+                    k,
+                }),
+            },
+            exec::ExecCountCursorPlan::Variable {
+                input: Box::new(invalid()),
+                op: helix_planner::logical::PureStreamVariableOp::Bind(test_support::name("bound")),
+            },
+            exec::ExecCountCursorPlan::Distinct {
+                input: Box::new(invalid()),
+                plan: exec::ExecCountDistinctPlan::HashRows,
+            },
+        ];
+        for cursor in wrappers {
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert!(execution
+                .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_recursive_cursor_operation_propagates_its_primitive_failure() {
+        let db = test_support::open_db("count-recursive-operation-errors").await;
+        let node = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        db.inner_db()
+            .put(
+                keys::Key::Data {
+                    scope: crate::encoding::v1::keys::tenant::DataScope::LegacyUnscoped,
+                    kind: keys::DataKeyKind::NodeProperty(keys::NodePropertyKey::new(node)),
+                }
+                .to_bytes(),
+                bytes::Bytes::from_static(b"malformed operation authority"),
+            )
+            .await
+            .unwrap();
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        for cursor in [
+            exec::ExecCountCursorPlan::Filter {
+                input: Box::new(exec::ExecCountCursorPlan::NodePointReads(
+                    test_support::ids(vec![node]),
+                )),
+                predicate: ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+            },
+            exec::ExecCountCursorPlan::Order {
+                input: Box::new(exec::ExecCountCursorPlan::NodePointReads(
+                    test_support::ids(vec![node]),
+                )),
+                plan: ir::OrderPlan::ExplicitSort(ir::OrderKeys::from(ir::OrderKey {
+                    property: test_support::name("status"),
+                    order: helix_ast::traversal::Order::Asc,
+                })),
+            },
+        ] {
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert!(execution
+                .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
+        }
+        for op in [
+            helix_planner::logical::PureStreamVariableOp::Select(test_support::name("missing")),
+            helix_planner::logical::PureStreamVariableOp::Inject(test_support::name("missing")),
+            helix_planner::logical::PureStreamVariableOp::Within(test_support::name("missing")),
+            helix_planner::logical::PureStreamVariableOp::Without(test_support::name("missing")),
+        ] {
+            let cursor = exec::ExecCountCursorPlan::Variable {
+                input: Box::new(exec::ExecCountCursorPlan::EmptyRows),
+                op,
+            };
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert!(execution
+                .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
+        }
+
+        let closed_db = test_support::open_db("count-recursive-closed-operation-errors").await;
+        closed_db.inner_db().close().await.unwrap();
+        let index = access_support::search_index("missing-search-index");
+        let k = access_support::literal_search_limit(1);
+        let mut closed = ExecutionContext::new(&closed_db, context::ParamBindings::default());
+        let cursors = [
+            exec::ExecCountCursorPlan::Expand {
+                input: Box::new(exec::ExecCountCursorPlan::InputRows),
+                plan: ir::ExpandPlan {
+                    direction: ir::ExpandDirection::Out,
+                    output: ir::ExpandOutput::Nodes,
+                    label: ir::ExpandLabelPlan::Any,
+                },
+            },
+            exec::ExecCountCursorPlan::VectorSearch {
+                input: Box::new(exec::ExecCountCursorPlan::InputRows),
+                plan: Box::new(ir::RestrictedVectorSearchPlan::Nodes {
+                    key: catalog::NodeSearchIndexKey::try_new("User", "embedding").unwrap(),
+                    index: index.clone(),
+                    query_vector: ir::VectorQueryInputPlan::Vector(
+                        ir::SearchVector::new(vec![1.0]).unwrap(),
+                    ),
+                    k: k.clone(),
+                }),
+            },
+            exec::ExecCountCursorPlan::TextSearch {
+                input: Box::new(exec::ExecCountCursorPlan::InputRows),
+                plan: Box::new(ir::RestrictedTextSearchPlan::Nodes {
+                    key: catalog::NodeSearchIndexKey::try_new("User", "body").unwrap(),
+                    index,
+                    query_text: ir::TextQueryInputPlan::Text(test_support::name("rust")),
+                    k,
+                }),
+            },
+        ];
+        for cursor in cursors {
+            let mut dependency = Some(ExecutionValue::Stream(vec![ExecutionRow::current(
+                ElementRef::Node(1),
+            )]));
+            assert!(closed.count_cursor(&cursor, &mut dependency).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_and_restricted_search_count_families_use_selected_search_primitives() {
+        let db = test_support::open_db_with_config(
+            test_support::in_memory_config("count-search-family-matrix")
+                .with_node_vector_index(
+                    "Doc",
+                    "embedding",
+                    2,
+                    crate::search::vector::VectorDistanceMetric::Cosine,
+                )
+                .with_edge_vector_index(
+                    "MENTIONS",
+                    "embedding",
+                    2,
+                    crate::search::vector::VectorDistanceMetric::Euclidean,
+                )
+                .with_node_text_index("Doc", "body")
+                .with_edge_text_index("MENTIONS", "body"),
+        )
+        .await;
+        let node = test_support::add_node_with_properties(
+            &db,
+            "Doc",
+            vec![
+                ("embedding", PropertyValue::F32Array(vec![1.0, 0.0])),
+                ("body", PropertyValue::from("rust planner execution")),
+            ],
+        )
+        .await;
+        let other = test_support::add_node_with_properties(&db, "Doc", Vec::new()).await;
+        let edge = test_support::add_edge_with_properties(
+            &db,
+            node,
+            other,
+            "MENTIONS",
+            vec![
+                ("embedding", PropertyValue::F32Array(vec![1.0, 0.0])),
+                ("body", PropertyValue::from("rust graph edge")),
+            ],
+        )
+        .await;
+        let node_vector_definition = crate::config::VectorIndexDefinition::new_node(
+            "Doc",
+            "embedding",
+            2,
+            crate::search::vector::VectorDistanceMetric::Cosine,
+        )
+        .unwrap();
+        access_support::seed_vector_index::<crate::search::vector::distance::Cosine>(
+            &db,
+            &node_vector_definition,
+            &[(node, vec![1.0, 0.0]), (999_999, vec![0.5, 0.5])],
+        )
+        .await;
+        let edge_vector_definition = crate::config::VectorIndexDefinition::new_edge(
+            "MENTIONS",
+            "embedding",
+            2,
+            crate::search::vector::VectorDistanceMetric::Euclidean,
+        )
+        .unwrap();
+        access_support::seed_vector_index::<crate::search::vector::distance::Euclidean>(
+            &db,
+            &edge_vector_definition,
+            &[(edge, vec![1.0, 0.0]), (999_998, vec![0.5, 0.5])],
+        )
+        .await;
+        let node_text_definition =
+            crate::config::TextIndexDefinition::new_node("Doc", "body").unwrap();
+        access_support::seed_managed_text_index(
+            &db,
+            &node_text_definition,
+            &[crate::search::text::TextDocumentInput::new(
+                node,
+                "rust planner execution",
+            )],
+        )
+        .await;
+        let edge_text_definition =
+            crate::config::TextIndexDefinition::new_edge("MENTIONS", "body").unwrap();
+        access_support::seed_managed_text_index(
+            &db,
+            &edge_text_definition,
+            &[crate::search::text::TextDocumentInput::new(
+                edge,
+                "rust graph edge",
+            )],
+        )
+        .await;
+
+        let node_vector_index = access_support::search_index(&crate::search::vector_index_name(
+            crate::config::VectorElementType::Node,
+            "Doc",
+            "embedding",
+        ));
+        let edge_vector_index = access_support::search_index(&crate::search::vector_index_name(
+            crate::config::VectorElementType::Edge,
+            "MENTIONS",
+            "embedding",
+        ));
+        let node_text_index = access_support::search_index(&crate::search::text_index_name(
+            crate::config::TextElementType::Node,
+            "Doc",
+            "body",
+        ));
+        let edge_text_index = access_support::search_index(&crate::search::text_index_name(
+            crate::config::TextElementType::Edge,
+            "MENTIONS",
+            "body",
+        ));
+        let node_vector = exec::ExecNodeVectorSearchCountPlan {
+            key: catalog::NodeSearchIndexKey::try_new("Doc", "embedding").unwrap(),
+            index: node_vector_index.clone(),
+            query_vector: ir::VectorQueryInputPlan::Vector(
+                ir::SearchVector::new(vec![1.0, 0.0]).unwrap(),
+            ),
+            k: access_support::literal_search_limit(2),
+            window: exec::ExecCountWindowPlan::identity(),
+        };
+        let edge_vector = exec::ExecEdgeVectorSearchCountPlan {
+            key: catalog::EdgeSearchIndexKey::try_new("MENTIONS", "embedding").unwrap(),
+            index: edge_vector_index.clone(),
+            query_vector: ir::VectorQueryInputPlan::Vector(
+                ir::SearchVector::new(vec![1.0, 0.0]).unwrap(),
+            ),
+            k: access_support::literal_search_limit(2),
+            window: exec::ExecCountWindowPlan::identity(),
+        };
+        let node_text = exec::ExecNodeTextSearchCountPlan {
+            key: catalog::NodeSearchIndexKey::try_new("Doc", "body").unwrap(),
+            index: node_text_index.clone(),
+            query_text: ir::TextQueryInputPlan::Text(test_support::name("rust")),
+            k: access_support::literal_search_limit(2),
+            window: exec::ExecCountWindowPlan::identity(),
+        };
+        let edge_text = exec::ExecEdgeTextSearchCountPlan {
+            key: catalog::EdgeSearchIndexKey::try_new("MENTIONS", "body").unwrap(),
+            index: edge_text_index.clone(),
+            query_text: ir::TextQueryInputPlan::Text(test_support::name("rust")),
+            k: access_support::literal_search_limit(2),
+            window: exec::ExecCountWindowPlan::identity(),
+        };
+        for plan in [
+            exec::ExecCountPlan::NodeVectorSearch(node_vector.clone()),
+            exec::ExecCountPlan::EdgeVectorSearch(edge_vector.clone()),
+            exec::ExecCountPlan::NodeTextSearch(node_text.clone()),
+            exec::ExecCountPlan::EdgeTextSearch(edge_text.clone()),
+        ] {
+            assert_eq!(
+                execute_direct_count(&db, plan).await.unwrap(),
+                ExecutionValue::Count(1)
+            );
+        }
+
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        execution.enable_request_read_view().await.unwrap();
+        for cursor in [
+            exec::ExecCountCursorPlan::NodeVectorSearch {
+                key: node_vector.key.clone(),
+                index: node_vector.index.clone(),
+                query_vector: node_vector.query_vector.clone(),
+                k: node_vector.k.clone(),
+            },
+            exec::ExecCountCursorPlan::EdgeVectorSearch {
+                key: edge_vector.key.clone(),
+                index: edge_vector.index.clone(),
+                query_vector: edge_vector.query_vector.clone(),
+                k: edge_vector.k.clone(),
+            },
+            exec::ExecCountCursorPlan::NodeTextSearch {
+                key: node_text.key.clone(),
+                index: node_text.index.clone(),
+                query_text: node_text.query_text.clone(),
+                k: node_text.k.clone(),
+            },
+            exec::ExecCountCursorPlan::EdgeTextSearch {
+                key: edge_text.key.clone(),
+                index: edge_text.index.clone(),
+                query_text: edge_text.query_text.clone(),
+                k: edge_text.k.clone(),
+            },
+            exec::ExecCountCursorPlan::VectorSearch {
+                input: Box::new(exec::ExecCountCursorPlan::NodePointReads(
+                    test_support::ids(vec![node]),
+                )),
+                plan: Box::new(ir::RestrictedVectorSearchPlan::Nodes {
+                    key: node_vector.key,
+                    index: node_vector_index,
+                    query_vector: node_vector.query_vector,
+                    k: node_vector.k,
+                }),
+            },
+            exec::ExecCountCursorPlan::VectorSearch {
+                input: Box::new(exec::ExecCountCursorPlan::EdgePointReads(
+                    test_support::ids(vec![edge]),
+                )),
+                plan: Box::new(ir::RestrictedVectorSearchPlan::Edges {
+                    key: edge_vector.key,
+                    index: edge_vector_index,
+                    query_vector: edge_vector.query_vector,
+                    k: edge_vector.k,
+                }),
+            },
+            exec::ExecCountCursorPlan::TextSearch {
+                input: Box::new(exec::ExecCountCursorPlan::NodePointReads(
+                    test_support::ids(vec![node]),
+                )),
+                plan: Box::new(ir::RestrictedTextSearchPlan::Nodes {
+                    key: node_text.key,
+                    index: node_text_index,
+                    query_text: node_text.query_text,
+                    k: node_text.k,
+                }),
+            },
+            exec::ExecCountCursorPlan::TextSearch {
+                input: Box::new(exec::ExecCountCursorPlan::EdgePointReads(
+                    test_support::ids(vec![edge]),
+                )),
+                plan: Box::new(ir::RestrictedTextSearchPlan::Edges {
+                    key: edge_text.key,
+                    index: edge_text_index,
+                    query_text: edge_text.query_text,
+                    k: edge_text.k,
+                }),
+            },
+        ] {
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor,
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+            assert_eq!(
+                execution
+                    .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                    .await
+                    .unwrap(),
+                ExecutionValue::Count(1)
+            );
+        }
+        execution.close_request_read_view().unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_direct_and_cursor_search_propagates_its_selected_read_failure() {
+        let db = test_support::open_db("count-search-storage-errors").await;
+        db.inner_db().close().await.unwrap();
+        let index = access_support::search_index("missing-search-index");
+        let k = access_support::literal_search_limit(1);
+        let node_key = catalog::NodeSearchIndexKey::try_new("Doc", "body").unwrap();
+        let edge_key = catalog::EdgeSearchIndexKey::try_new("MENTIONS", "body").unwrap();
+        let vector = ir::VectorQueryInputPlan::Vector(ir::SearchVector::new(vec![1.0]).unwrap());
+        let text = ir::TextQueryInputPlan::Text(test_support::name("rust"));
+        let window = exec::ExecCountWindowPlan::identity();
+        let direct = vec![
+            exec::ExecCountPlan::NodeVectorSearch(exec::ExecNodeVectorSearchCountPlan {
+                key: node_key.clone(),
+                index: index.clone(),
+                query_vector: vector.clone(),
+                k: k.clone(),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::EdgeVectorSearch(exec::ExecEdgeVectorSearchCountPlan {
+                key: edge_key.clone(),
+                index: index.clone(),
+                query_vector: vector.clone(),
+                k: k.clone(),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::NodeTextSearch(exec::ExecNodeTextSearchCountPlan {
+                key: node_key.clone(),
+                index: index.clone(),
+                query_text: text.clone(),
+                k: k.clone(),
+                window: window.clone(),
+            }),
+            exec::ExecCountPlan::EdgeTextSearch(exec::ExecEdgeTextSearchCountPlan {
+                key: edge_key.clone(),
+                index: index.clone(),
+                query_text: text.clone(),
+                k: k.clone(),
+                window: window.clone(),
+            }),
+        ];
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        for plan in direct {
+            assert!(execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                .await
+                .is_err());
+        }
+        let cursors = vec![
+            exec::ExecCountCursorPlan::NodeVectorSearch {
+                key: node_key.clone(),
+                index: index.clone(),
+                query_vector: vector.clone(),
+                k: k.clone(),
+            },
+            exec::ExecCountCursorPlan::EdgeVectorSearch {
+                key: edge_key.clone(),
+                index: index.clone(),
+                query_vector: vector,
+                k: k.clone(),
+            },
+            exec::ExecCountCursorPlan::NodeTextSearch {
+                key: node_key,
+                index: index.clone(),
+                query_text: text.clone(),
+                k: k.clone(),
+            },
+            exec::ExecCountCursorPlan::EdgeTextSearch {
+                key: edge_key,
+                index,
+                query_text: text,
+                k,
+            },
+        ];
+        for cursor in cursors {
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor,
+                window: window.clone(),
+            });
+            assert!(execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]
@@ -1236,6 +3106,236 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("count plan expected rows"));
+    }
+
+    #[tokio::test]
+    async fn count_window_runtime_dynamic_range_and_deadline_errors_are_exhaustive() {
+        let db = test_support::open_db("count-contract-error-matrix").await;
+        let missing = test_support::name("missing");
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        for window in [
+            exec::ExecCountWindowPlan {
+                skip: exec::ExecUsizeExpr::Param(missing.clone()),
+                take: exec::ExecCountTake::All,
+            },
+            exec::ExecCountWindowPlan {
+                skip: exec::ExecUsizeExpr::literal(0),
+                take: exec::ExecCountTake::AtMost(exec::ExecUsizeExpr::Param(missing.clone())),
+            },
+        ] {
+            assert!(execution
+                .execute_count(
+                    ExecutionValue::Stream(Vec::new()),
+                    &exec::ExecCountPlan::InputRows { window },
+                )
+                .await
+                .is_err());
+        }
+
+        let invalid_node_range = exec::ExecNodeVerifiedRangeScanPlan {
+            index: catalog::NodeRangeIndexMeta::new(test_support::name(
+                "node_range:Other:rank:Asc",
+            )),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "User",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        let invalid_edge_range = exec::ExecEdgeVerifiedRangeScanPlan {
+            index: catalog::EdgeRangeIndexMeta::new(test_support::name(
+                "edge_range:OTHER:rank:Asc",
+            )),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "FOLLOWS",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        let valid_node_range = exec::ExecNodeVerifiedRangeScanPlan {
+            index: catalog::NodeRangeIndexMeta::new(test_support::name("node_range:User:rank:Asc")),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "User",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        let valid_edge_range = exec::ExecEdgeVerifiedRangeScanPlan {
+            index: catalog::EdgeRangeIndexMeta::new(test_support::name(
+                "edge_range:FOLLOWS:rank:Asc",
+            )),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "FOLLOWS",
+                "rank",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        };
+        let invalid_node_bitmap = exec::ExecNodeBitmapExpr::PointRead {
+            index: node_equality_index("Other", "status"),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            value: indexed("active"),
+        };
+        let invalid_edge_bitmap = exec::ExecEdgeBitmapExpr::PointRead {
+            index: edge_equality_index("OTHER", "status"),
+            key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+            value: indexed("active"),
+        };
+        let direct = vec![
+            exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
+                driver: invalid_node_range.clone(),
+                membership: exec::ExecNodeRangeMembershipPlan::All,
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+            exec::ExecCountPlan::EdgeRange(exec::ExecEdgeRangeCountPlan {
+                driver: invalid_edge_range.clone(),
+                membership: exec::ExecEdgeRangeMembershipPlan::All,
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+            exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
+                driver: valid_node_range,
+                membership: exec::ExecNodeRangeMembershipPlan::BitmapFilters(
+                    ir::AtLeast::from_one(invalid_node_bitmap),
+                ),
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+            exec::ExecCountPlan::EdgeRange(exec::ExecEdgeRangeCountPlan {
+                driver: valid_edge_range,
+                membership: exec::ExecEdgeRangeMembershipPlan::BitmapFilters(
+                    ir::AtLeast::from_one(invalid_edge_bitmap),
+                ),
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+            exec::ExecCountPlan::NodeRuntimeInput {
+                input: exec::ExecRuntimeInputPlan::Param(missing.clone()),
+                window: exec::ExecCountWindowPlan::identity(),
+            },
+            exec::ExecCountPlan::EdgeRuntimeInput {
+                input: exec::ExecRuntimeInputPlan::Variable(missing.clone()),
+                window: exec::ExecCountWindowPlan::identity(),
+            },
+            exec::ExecCountPlan::RuntimeInput {
+                input: exec::ExecRuntimeInputPlan::Variable(missing.clone()),
+                window: exec::ExecCountWindowPlan::identity(),
+            },
+            exec::ExecCountPlan::NodeDynamicEquality(exec::ExecNodeDynamicEqualityCountPlan {
+                index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                    "node_eq:Other:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                param: missing.clone(),
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+            exec::ExecCountPlan::NodeDynamicEquality(exec::ExecNodeDynamicEqualityCountPlan {
+                index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                    "node_eq:User:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                param: missing.clone(),
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+            exec::ExecCountPlan::EdgeDynamicEquality(exec::ExecEdgeDynamicEqualityCountPlan {
+                index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                    "edge_eq:OTHER:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                param: missing.clone(),
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+            exec::ExecCountPlan::EdgeDynamicEquality(exec::ExecEdgeDynamicEqualityCountPlan {
+                index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                    "edge_eq:FOLLOWS:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                param: missing.clone(),
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+        ];
+        for plan in direct {
+            assert!(execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                .await
+                .is_err());
+        }
+
+        let cursors = vec![
+            exec::ExecCountCursorPlan::NodeRange(invalid_node_range),
+            exec::ExecCountCursorPlan::EdgeRange(invalid_edge_range),
+            exec::ExecCountCursorPlan::NodeRuntimeInput(exec::ExecRuntimeInputPlan::Param(
+                missing.clone(),
+            )),
+            exec::ExecCountCursorPlan::EdgeRuntimeInput(exec::ExecRuntimeInputPlan::Variable(
+                missing.clone(),
+            )),
+            exec::ExecCountCursorPlan::RuntimeInput(exec::ExecRuntimeInputPlan::Variable(
+                missing.clone(),
+            )),
+            exec::ExecCountCursorPlan::RuntimeInput(exec::ExecRuntimeInputPlan::Param(
+                missing.clone(),
+            )),
+            exec::ExecCountCursorPlan::NodeDynamicEquality {
+                index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                    "node_eq:User:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                param: missing.clone(),
+            },
+            exec::ExecCountCursorPlan::EdgeDynamicEquality {
+                index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                    "edge_eq:OTHER:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                param: missing.clone(),
+            },
+            exec::ExecCountCursorPlan::EdgeDynamicEquality {
+                index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                    "edge_eq:FOLLOWS:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                param: missing.clone(),
+            },
+            exec::ExecCountCursorPlan::Window {
+                input: Box::new(exec::ExecCountCursorPlan::EmptyRows),
+                window: exec::ExecCountWindowPlan {
+                    skip: exec::ExecUsizeExpr::Param(missing),
+                    take: exec::ExecCountTake::All,
+                },
+            },
+        ];
+        for cursor in cursors {
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert!(execution
+                .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
+        }
+
+        let mut expired = ExecutionContext::new_scoped_controlled(
+            &db,
+            context::ParamBindings::default(),
+            crate::encoding::v1::keys::tenant::DataScope::LegacyUnscoped,
+            crate::execution_control::ExecutionControl::from_timeout(std::time::Duration::ZERO),
+        );
+        assert!(expired
+            .node_bitmap(&node_point("User", "status", "active"))
+            .await
+            .is_err());
+        assert!(expired
+            .edge_bitmap(&edge_point("FOLLOWS", "status", "active"))
+            .await
+            .is_err());
+        let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+        assert!(expired
+            .count_cursor(&exec::ExecCountCursorPlan::EmptyRows, &mut dependency)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1330,13 +3430,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bitmap_validation_and_recursive_error_paths_cover_every_exact_variant() {
+        let db = test_support::open_db_with_config(
+            test_support::in_memory_config("count-bitmap-error-matrix")
+                .with_equality_index("User", "status")
+                .with_edge_equality_index("FOLLOWS", "status"),
+        )
+        .await;
+        let node = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        test_support::add_edge_with_properties(
+            &db,
+            node,
+            node,
+            "FOLLOWS",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        execution.enable_request_read_view().await.unwrap();
+        let invalid_node_point = || exec::ExecNodeBitmapExpr::PointRead {
+            index: node_equality_index("Other", "status"),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            value: indexed("active"),
+        };
+        let invalid_node_batch = exec::ExecNodeBitmapExpr::BatchedUnionRead {
+            index: node_equality_index("Other", "status"),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            values: ir::AtLeast::from_pair(indexed("active"), indexed("paused")),
+        };
+        let valid_node = node_point("User", "status", "active");
+        assert_eq!(execution.node_bitmap(&valid_node).await.unwrap().len(), 1);
+        for expression in [
+            invalid_node_point(),
+            invalid_node_batch,
+            exec::ExecNodeBitmapExpr::Union {
+                driver: Box::new(invalid_node_point()),
+                rest: ir::AtLeast::from_one(valid_node.clone()),
+            },
+            exec::ExecNodeBitmapExpr::Union {
+                driver: Box::new(valid_node.clone()),
+                rest: ir::AtLeast::from_one(invalid_node_point()),
+            },
+            exec::ExecNodeBitmapExpr::Intersect {
+                driver: Box::new(invalid_node_point()),
+                rest: ir::AtLeast::from_one(valid_node.clone()),
+            },
+            exec::ExecNodeBitmapExpr::Intersect {
+                driver: Box::new(valid_node),
+                rest: ir::AtLeast::from_one(invalid_node_point()),
+            },
+        ] {
+            assert!(execution.node_bitmap(&expression).await.is_err());
+        }
+
+        let invalid_edge_point = || exec::ExecEdgeBitmapExpr::PointRead {
+            index: edge_equality_index("OTHER", "status"),
+            key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+            value: indexed("active"),
+        };
+        let invalid_edge_batch = exec::ExecEdgeBitmapExpr::BatchedUnionRead {
+            index: edge_equality_index("OTHER", "status"),
+            key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+            values: ir::AtLeast::from_pair(indexed("active"), indexed("paused")),
+        };
+        let valid_edge = edge_point("FOLLOWS", "status", "active");
+        assert_eq!(execution.edge_bitmap(&valid_edge).await.unwrap().len(), 1);
+        for expression in [
+            invalid_edge_point(),
+            invalid_edge_batch,
+            exec::ExecEdgeBitmapExpr::Union {
+                driver: Box::new(invalid_edge_point()),
+                rest: ir::AtLeast::from_one(valid_edge.clone()),
+            },
+            exec::ExecEdgeBitmapExpr::Union {
+                driver: Box::new(valid_edge.clone()),
+                rest: ir::AtLeast::from_one(invalid_edge_point()),
+            },
+            exec::ExecEdgeBitmapExpr::Intersect {
+                driver: Box::new(invalid_edge_point()),
+                rest: ir::AtLeast::from_one(valid_edge.clone()),
+            },
+            exec::ExecEdgeBitmapExpr::Intersect {
+                driver: Box::new(valid_edge),
+                rest: ir::AtLeast::from_one(invalid_edge_point()),
+            },
+        ] {
+            assert!(execution.edge_bitmap(&expression).await.is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn unique_count_performs_one_owner_read_and_one_authoritative_verification() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("count-exact-unique-owner")
                 .with_unique_equality_index("User", "email"),
         )
         .await;
-        test_support::add_node_with_properties(
+        let owner = test_support::add_node_with_properties(
             &db,
             "User",
             vec![("email", PropertyValue::from("alice@example.com"))],
@@ -1362,8 +3557,8 @@ mod tests {
             execute_direct_count(
                 &db,
                 exec::ExecCountPlan::NodeUnique(exec::ExecNodeUniqueCountPlan {
-                    lookup,
-                    verification,
+                    lookup: lookup.clone(),
+                    verification: verification.clone(),
                     window: exec::ExecCountWindowPlan::identity(),
                 }),
             )
@@ -1380,6 +3575,66 @@ mod tests {
                 graph_reads: 1,
             }
         );
+        let mut invalid_lookup = lookup.clone();
+        invalid_lookup.index = exec::ExecNodeUniqueEqualityIndex::try_from(
+            catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:Other:email"))
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+        )
+        .unwrap();
+        let context = ExecutionContext::new(&db, context::ParamBindings::default());
+        assert!(context
+            .verified_node_unique_owner(&invalid_lookup, &verification)
+            .await
+            .is_err());
+
+        db.inner_db()
+            .put(
+                keys::Key::Data {
+                    scope: crate::encoding::v1::keys::tenant::DataScope::LegacyUnscoped,
+                    kind: keys::DataKeyKind::NodeProperty(keys::NodePropertyKey::new(owner)),
+                }
+                .to_bytes(),
+                crate::encoding::v1::property::encode_properties(&[
+                    crate::encoding::v1::property::Property::string("$label", "Other"),
+                    crate::encoding::v1::property::Property::string("email", "alice@example.com"),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeUnique(exec::ExecNodeUniqueCountPlan {
+                    lookup: lookup.clone(),
+                    verification: verification.clone(),
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await,
+            Err(HelixDbError::IndexCatalogCorruption(message))
+                if message.contains("authoritative node")
+        ));
+        db.inner_db()
+            .put(
+                keys::Key::Data {
+                    scope: crate::encoding::v1::keys::tenant::DataScope::LegacyUnscoped,
+                    kind: keys::DataKeyKind::NodeProperty(keys::NodePropertyKey::new(owner)),
+                }
+                .to_bytes(),
+                bytes::Bytes::from_static(b"malformed unique authority"),
+            )
+            .await
+            .unwrap();
+        assert!(execute_direct_count(
+            &db,
+            exec::ExecCountPlan::NodeUnique(exec::ExecNodeUniqueCountPlan {
+                lookup,
+                verification,
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

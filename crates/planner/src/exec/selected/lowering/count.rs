@@ -37,3 +37,46 @@ impl ExecutableDagBuilder<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependent_count_propagates_child_lowering_failure() {
+        let profile = cost::StorageCostProfile::default();
+        let mut lowering = ExecutableDagBuilder::with_next_id(&profile, None);
+        let child = SelectedExecutableRunRoot::alternative(
+            logical::LogicalExpr::Pure(logical::PureLogicalOp::NoOp),
+            physical::PhysicalAlternative::new(
+                physical::PhysicalExpr::NoOp,
+                properties::DeliveredProperties::default(),
+                cost::CostVector::ZERO,
+            ),
+        );
+        let plan = crate::exec::ExecCountPlan::InputRows {
+            window: crate::exec::ExecCountWindowPlan::identity(),
+        };
+        let alternative = SelectedPhysicalPlan::new(
+            physical::PhysicalExpr::Cardinality(Box::new(physical::PhysicalCountPlan::new(plan))),
+            properties::DeliveredProperties::default(),
+            cost::CostVector::ZERO,
+        );
+        let count = SelectedRootCount::new(
+            alternative,
+            crate::exec::selected::provenance::test_selected_root_provenance(),
+            SelectedCountInput::Rows(Box::new(child)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            lowering.push_selected_count_root(
+                count,
+                Vec::new(),
+                ir::BatchOutputPlan::Discard,
+                ExecCondition::Always,
+            ),
+            Err(ExecPlanError::StepIdSpaceExhausted)
+        );
+    }
+}

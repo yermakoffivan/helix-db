@@ -71,16 +71,13 @@ impl<'db> ExecutionContext<'db> {
                 exec::ExecNodeSecondarySetPlan::Unique {
                     lookup,
                     verification,
-                } => Ok(SecondaryIds::Unordered(
-                    self.verified_node_unique_owner(lookup, verification)
-                        .await?
-                        .into_iter()
-                        .collect(),
-                )),
+                } => {
+                    let read = self.verified_node_unique_owner(lookup, verification);
+                    Ok(SecondaryIds::Unordered(read.await?.into_iter().collect()))
+                }
                 exec::ExecNodeSecondarySetPlan::AuthoritativeScan(predicate) => {
-                    let ids = self
-                        .scan_element_ids(exec::ElementKeyspace::NodeProperty, None)
-                        .await?;
+                    let read = self.scan_element_ids(exec::ElementKeyspace::NodeProperty, None);
+                    let ids = read.await?;
                     let mut matches = roaring::RoaringTreemap::new();
                     for id in ids {
                         let row =
@@ -131,20 +128,16 @@ impl<'db> ExecutionContext<'db> {
                 }
                 exec::ExecNodeSecondarySetPlan::OrderedIntersect { driver, filters } => {
                     let mut filters = filters.iter();
-                    let mut allowed = self
-                        .node_secondary_ids(
-                            filters
-                                .next()
-                                .expect("ordered intersection has at least one filter"),
-                            None,
-                        )
-                        .await?
-                        .into_bitmap();
+                    let first = filters
+                        .next()
+                        .expect("ordered intersection has at least one filter");
+                    let read = self.node_secondary_ids(first, None);
+                    let mut allowed = read.await?.into_bitmap();
                     for filter in filters {
                         allowed &= self.node_secondary_ids(filter, None).await?.into_bitmap();
                     }
-                    let ordered = self
-                        .node_range_index_ids(&driver.key, &driver.range, None)
+                    let read = self.node_range_index_ids(&driver.key, &driver.range, None);
+                    let ordered = read
                         .await?
                         .into_iter()
                         .filter(|id| allowed.contains(*id))
@@ -171,9 +164,8 @@ impl<'db> ExecutionContext<'db> {
                     self.edge_bitmap(bitmap).await.map(SecondaryIds::Unordered)
                 }
                 exec::ExecEdgeSecondarySetPlan::AuthoritativeScan(predicate) => {
-                    let ids = self
-                        .scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None)
-                        .await?;
+                    let read = self.scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None);
+                    let ids = read.await?;
                     let mut matches = roaring::RoaringTreemap::new();
                     for id in ids {
                         let row =
@@ -224,20 +216,16 @@ impl<'db> ExecutionContext<'db> {
                 }
                 exec::ExecEdgeSecondarySetPlan::OrderedIntersect { driver, filters } => {
                     let mut filters = filters.iter();
-                    let mut allowed = self
-                        .edge_secondary_ids(
-                            filters
-                                .next()
-                                .expect("ordered intersection has at least one filter"),
-                            None,
-                        )
-                        .await?
-                        .into_bitmap();
+                    let first = filters
+                        .next()
+                        .expect("ordered intersection has at least one filter");
+                    let read = self.edge_secondary_ids(first, None);
+                    let mut allowed = read.await?.into_bitmap();
                     for filter in filters {
                         allowed &= self.edge_secondary_ids(filter, None).await?.into_bitmap();
                     }
-                    let ordered = self
-                        .edge_range_index_ids(&driver.key, &driver.range, None)
+                    let read = self.edge_range_index_ids(&driver.key, &driver.range, None);
+                    let ordered = read
                         .await?
                         .into_iter()
                         .filter(|id| allowed.contains(*id))

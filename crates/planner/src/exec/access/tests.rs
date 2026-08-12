@@ -353,3 +353,96 @@ fn edge_same_index_equalities_preserve_batch_arity_and_mixed_order() {
         ))
     ));
 }
+
+#[test]
+fn node_exact_equalities_cover_unique_null_nan_dynamic_and_singleton_shapes() {
+    let key = crate::catalog::ScopedPropertyKey::try_new("User", "email").unwrap();
+    let unique = crate::catalog::NodeEqualityIndexMeta::try_new("node_eq:User:email")
+        .unwrap()
+        .with_uniqueness(crate::catalog::IndexUniqueness::Unique);
+    assert!(matches!(
+        ExecNodeSecondarySetPlan::exact_equalities(
+            unique.clone(),
+            key.clone(),
+            crate::ir::AtLeast::from_one(equality_literal(helix_ast::value::PropertyValue::from(
+                "alice@example.test"
+            ))),
+        ),
+        ExecNodeSecondarySetPlan::Unique { .. }
+    ));
+    assert!(matches!(
+        ExecNodeSecondarySetPlan::exact_equalities(
+            unique,
+            key.clone(),
+            crate::ir::AtLeast::from_one(equality_literal(helix_ast::value::PropertyValue::Null)),
+        ),
+        ExecNodeSecondarySetPlan::AuthoritativeScan(_)
+    ));
+    assert_eq!(
+        ExecNodeSecondarySetPlan::exact_equalities(
+            crate::catalog::NodeEqualityIndexMeta::try_new("node_eq:User:email").unwrap(),
+            key.clone(),
+            crate::ir::AtLeast::from_one(equality_literal(helix_ast::value::PropertyValue::F64(
+                f64::NAN
+            ))),
+        ),
+        ExecNodeSecondarySetPlan::Empty
+    );
+    assert!(matches!(
+        ExecNodeSecondarySetPlan::exact_equalities(
+            crate::catalog::NodeEqualityIndexMeta::try_new("node_eq:User:email").unwrap(),
+            key,
+            crate::ir::AtLeast::from_one(crate::ir::IndexValue::Param(
+                crate::ir::NonEmptyString::new("late_email").unwrap()
+            )),
+        ),
+        ExecNodeSecondarySetPlan::DynamicEquality { .. }
+    ));
+}
+
+#[test]
+fn edge_exact_equalities_cover_singleton_null_nan_and_ordered_union_shapes() {
+    let key = crate::catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap();
+    let index = crate::catalog::EdgeEqualityIndexMeta::try_new("edge_eq:LIKES:status").unwrap();
+    assert!(matches!(
+        ExecEdgeSecondarySetPlan::exact_equalities(
+            index.clone(),
+            key.clone(),
+            crate::ir::AtLeast::from_one(equality_literal(helix_ast::value::PropertyValue::from(
+                "active"
+            ))),
+        ),
+        ExecEdgeSecondarySetPlan::Bitmap(crate::exec::ExecEdgeBitmapExpr::PointRead { .. })
+    ));
+    assert!(matches!(
+        ExecEdgeSecondarySetPlan::exact_equalities(
+            index.clone(),
+            key.clone(),
+            crate::ir::AtLeast::from_one(equality_literal(helix_ast::value::PropertyValue::Null)),
+        ),
+        ExecEdgeSecondarySetPlan::AuthoritativeScan(_)
+    ));
+    assert_eq!(
+        ExecEdgeSecondarySetPlan::exact_equalities(
+            index.clone(),
+            key.clone(),
+            crate::ir::AtLeast::from_one(equality_literal(helix_ast::value::PropertyValue::F32(
+                f32::NAN
+            ))),
+        ),
+        ExecEdgeSecondarySetPlan::Empty
+    );
+    assert!(matches!(
+        ExecEdgeSecondarySetPlan::exact_equalities(
+            index,
+            key,
+            crate::ir::AtLeast::from_one_and_rest(
+                equality_literal(helix_ast::value::PropertyValue::Null),
+                vec![equality_literal(helix_ast::value::PropertyValue::from(
+                    "active"
+                ))],
+            ),
+        ),
+        ExecEdgeSecondarySetPlan::Union { .. }
+    ));
+}

@@ -9,7 +9,8 @@ mod range;
 mod search;
 
 pub use equality::{
-    EqualityIndexValueSemantics, IndexValue, SecondaryIndexLiteral, SecondaryIndexLiteralError,
+    EqualityIndexValueSemantics, IndexValue, LiteralEqualityIndexValueSemantics,
+    SecondaryIndexLiteral, SecondaryIndexLiteralError,
 };
 pub use range::{
     BoundInclusivity, IndexBetweenRange, IndexBound, IndexRange, RangeIndexF32, RangeIndexF64,

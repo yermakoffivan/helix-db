@@ -87,45 +87,89 @@ impl ExecNodeAccessPlan {
         key: catalog::ScopedPropertyKey,
         value: ir::IndexValue,
     ) -> Self {
-        match value {
-            ir::IndexValue::Literal(value) => match value.semantics() {
-                ir::EqualityIndexValueSemantics::Indexed => {
-                    let value = exec::ExecIndexedEqualityValue::try_from(value)
-                        .expect("indexed equality semantics produce an executable value");
-                    match index.uniqueness {
-                        catalog::IndexUniqueness::Unique => Self::Unique {
-                            lookup: exec::ExecNodeUniqueOwnerReadPlan {
-                                index: exec::ExecNodeUniqueEqualityIndex::try_from(index)
-                                    .expect("unique metadata produces a unique executable index"),
-                                key: key.clone(),
-                                value: value.clone(),
-                            },
-                            verification: exec::ExecNodeAuthoritativeVerificationPlan {
-                                key,
-                                value,
-                            },
+        exact_node_equality(index, key, value).into()
+    }
+}
+
+pub(in crate::exec) enum ExecNodeEqualityAccessPlan {
+    Empty,
+    Bitmap(exec::ExecNodeBitmapExpr),
+    Unique {
+        lookup: exec::ExecNodeUniqueOwnerReadPlan,
+        verification: exec::ExecNodeAuthoritativeVerificationPlan,
+    },
+    AuthoritativeScan(exec::ExecNodeAuthoritativeScanPredicate),
+    DynamicEquality {
+        index: catalog::NodeEqualityIndexMeta,
+        key: catalog::ScopedPropertyKey,
+        param: ir::NonEmptyString,
+    },
+}
+
+pub(in crate::exec) fn exact_node_equality(
+    index: catalog::NodeEqualityIndexMeta,
+    key: catalog::ScopedPropertyKey,
+    value: ir::IndexValue,
+) -> ExecNodeEqualityAccessPlan {
+    match value {
+        ir::IndexValue::Literal(value) => match value.semantics() {
+            ir::LiteralEqualityIndexValueSemantics::Indexed => {
+                let value = exec::ExecIndexedEqualityValue::try_from(value)
+                    .expect("indexed equality semantics produce an executable value");
+                match index.uniqueness {
+                    catalog::IndexUniqueness::Unique => ExecNodeEqualityAccessPlan::Unique {
+                        lookup: exec::ExecNodeUniqueOwnerReadPlan {
+                            index: exec::ExecNodeUniqueEqualityIndex::try_from(index)
+                                .expect("unique metadata produces a unique executable index"),
+                            key: key.clone(),
+                            value: value.clone(),
                         },
-                        catalog::IndexUniqueness::NonUnique => Self::Bitmap {
-                            bitmap: exec::ExecNodeBitmapExpr::PointRead {
-                                index: exec::ExecNodeNonUniqueEqualityIndex::try_from(index)
-                                    .expect(
-                                    "non-unique metadata produces a non-unique executable index",
-                                ),
-                                key,
-                                value,
-                            },
-                        },
+                        verification: exec::ExecNodeAuthoritativeVerificationPlan { key, value },
+                    },
+                    catalog::IndexUniqueness::NonUnique => {
+                        ExecNodeEqualityAccessPlan::Bitmap(exec::ExecNodeBitmapExpr::PointRead {
+                            index: exec::ExecNodeNonUniqueEqualityIndex::try_from(index).expect(
+                                "non-unique metadata produces a non-unique executable index",
+                            ),
+                            key,
+                            value,
+                        })
                     }
                 }
-                ir::EqualityIndexValueSemantics::AuthoritativeNull => Self::AuthoritativeScan {
-                    predicate: exec::ExecNodeAuthoritativeScanPredicate::NullEquality { key },
-                },
-                ir::EqualityIndexValueSemantics::NonReflexive => Self::Empty,
-                ir::EqualityIndexValueSemantics::RuntimeDependent => {
-                    unreachable!("literal equality semantics are never runtime-dependent")
-                }
+            }
+            ir::LiteralEqualityIndexValueSemantics::AuthoritativeNull => {
+                ExecNodeEqualityAccessPlan::AuthoritativeScan(
+                    exec::ExecNodeAuthoritativeScanPredicate::NullEquality { key },
+                )
+            }
+            ir::LiteralEqualityIndexValueSemantics::NonReflexive => {
+                ExecNodeEqualityAccessPlan::Empty
+            }
+        },
+        ir::IndexValue::Param(param) => {
+            ExecNodeEqualityAccessPlan::DynamicEquality { index, key, param }
+        }
+    }
+}
+
+impl From<ExecNodeEqualityAccessPlan> for ExecNodeAccessPlan {
+    fn from(plan: ExecNodeEqualityAccessPlan) -> Self {
+        match plan {
+            ExecNodeEqualityAccessPlan::Empty => Self::Empty,
+            ExecNodeEqualityAccessPlan::Bitmap(bitmap) => Self::Bitmap { bitmap },
+            ExecNodeEqualityAccessPlan::Unique {
+                lookup,
+                verification,
+            } => Self::Unique {
+                lookup,
+                verification,
             },
-            ir::IndexValue::Param(param) => Self::DynamicEquality { index, key, param },
+            ExecNodeEqualityAccessPlan::AuthoritativeScan(predicate) => {
+                Self::AuthoritativeScan { predicate }
+            }
+            ExecNodeEqualityAccessPlan::DynamicEquality { index, key, param } => {
+                Self::DynamicEquality { index, key, param }
+            }
         }
     }
 }
@@ -206,75 +250,47 @@ impl ExecNodeSecondarySetPlan {
     ) -> Self {
         let mut children = values
             .into_iter()
-            .map(|value| {
-                match ExecNodeAccessPlan::exact_equality(index.clone(), key.clone(), value) {
-                    ExecNodeAccessPlan::Empty => Self::Empty,
-                    ExecNodeAccessPlan::Bitmap { bitmap } => Self::Bitmap(bitmap),
-                    ExecNodeAccessPlan::Unique {
+            .map(
+                |value| match exact_node_equality(index.clone(), key.clone(), value) {
+                    ExecNodeEqualityAccessPlan::Empty => Self::Empty,
+                    ExecNodeEqualityAccessPlan::Bitmap(bitmap) => Self::Bitmap(bitmap),
+                    ExecNodeEqualityAccessPlan::Unique {
                         lookup,
                         verification,
                     } => Self::Unique {
                         lookup,
                         verification,
                     },
-                    ExecNodeAccessPlan::AuthoritativeScan { predicate } => {
+                    ExecNodeEqualityAccessPlan::AuthoritativeScan(predicate) => {
                         Self::AuthoritativeScan(predicate)
                     }
-                    ExecNodeAccessPlan::DynamicEquality { index, key, param } => {
+                    ExecNodeEqualityAccessPlan::DynamicEquality { index, key, param } => {
                         Self::DynamicEquality { index, key, param }
                     }
-                    ExecNodeAccessPlan::FromParam { .. }
-                    | ExecNodeAccessPlan::FromVar { .. }
-                    | ExecNodeAccessPlan::AllScan
-                    | ExecNodeAccessPlan::LabelScan { .. }
-                    | ExecNodeAccessPlan::RangeIndex { .. }
-                    | ExecNodeAccessPlan::SecondarySet { .. }
-                    | ExecNodeAccessPlan::VectorSearch { .. }
-                    | ExecNodeAccessPlan::TextSearch { .. } => {
-                        unreachable!("equality classification returns an equality variant")
-                    }
-                }
-            })
+                },
+            )
             .collect::<Vec<_>>();
-        if children.len() >= 2
-            && children.iter().all(|child| {
-                matches!(
-                    child,
-                    Self::Bitmap(exec::ExecNodeBitmapExpr::PointRead {
-                        index: child_index,
-                        key: child_key,
-                        ..
-                    }) if matches!(
-                        &children[0],
-                        Self::Bitmap(exec::ExecNodeBitmapExpr::PointRead {
-                            index: first_index,
-                            key: first_key,
-                            ..
-                        }) if child_index == first_index && child_key == first_key
-                    )
-                )
+        let batch = children
+            .iter()
+            .map(|child| match child {
+                Self::Bitmap(exec::ExecNodeBitmapExpr::PointRead { index, key, value }) => {
+                    Some((index.clone(), key.clone(), value.clone()))
+                }
+                _ => None,
             })
-        {
-            let Self::Bitmap(exec::ExecNodeBitmapExpr::PointRead { index, key, value }) =
-                children.remove(0)
-            else {
-                unreachable!("same-index batch starts with a point read")
-            };
-            let values = core::iter::once(value)
-                .chain(children.into_iter().map(|child| {
-                    let Self::Bitmap(exec::ExecNodeBitmapExpr::PointRead { value, .. }) = child
-                    else {
-                        unreachable!("same-index batch contains only point reads")
-                    };
-                    value
-                }))
-                .collect::<Vec<_>>();
-            return Self::Bitmap(exec::ExecNodeBitmapExpr::BatchedUnionRead {
-                index,
-                key,
-                values: ir::AtLeast::try_from_vec(values)
-                    .expect("same-index batch has at least two values"),
-            });
+            .collect::<Option<Vec<_>>>();
+        match batch {
+            Some(batch) if batch.len() >= 2 => {
+                let (index, key, _) = batch[0].clone();
+                let values = batch.into_iter().map(|(_, _, value)| value).collect();
+                return Self::Bitmap(exec::ExecNodeBitmapExpr::BatchedUnionRead {
+                    index,
+                    key,
+                    values: ir::AtLeast::try_from_vec(values)
+                        .expect("same-index batch has at least two values"),
+                });
+            }
+            Some(_) | None => {}
         }
         let driver = children.remove(0);
         let Some(rest) = ir::AtLeast::try_from_vec(children) else {

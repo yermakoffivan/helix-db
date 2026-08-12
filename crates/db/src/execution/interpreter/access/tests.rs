@@ -7,4 +7,4 @@ mod expand;
 mod kv;
 mod search_access;
 mod secondary_indexes;
-mod support;
+pub(in crate::execution::interpreter) mod support;

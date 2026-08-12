@@ -255,69 +255,80 @@ fn fold_cursor(
     let mut cursor = cursor;
     let mut positioned_window = exec::ExecCountWindowPlan::identity();
     let mut has_positioned_window = false;
+    macro_rules! flush_positioned_window {
+        () => {
+            if has_positioned_window {
+                cursor = exec::ExecCountCursorPlan::Window {
+                    input: Box::new(cursor),
+                    window: positioned_window,
+                };
+                positioned_window = exec::ExecCountWindowPlan::identity();
+                has_positioned_window = false;
+            }
+        };
+    }
     for op in ops {
-        if matches!(
-            op,
-            logical::StreamPipelineOp::Window { .. }
-                | logical::StreamPipelineOp::Limit { .. }
-                | logical::StreamPipelineOp::Skip { .. }
-                | logical::StreamPipelineOp::Range { .. }
-        ) {
-            positioned_window = append_window(positioned_window, op)?;
-            has_positioned_window = true;
-            continue;
-        }
-        if has_positioned_window {
-            cursor = exec::ExecCountCursorPlan::Window {
-                input: Box::new(cursor),
-                window: positioned_window,
-            };
-            positioned_window = exec::ExecCountWindowPlan::identity();
-            has_positioned_window = false;
-        }
-        cursor = match op {
-            logical::StreamPipelineOp::Filter { predicate } => exec::ExecCountCursorPlan::Filter {
-                input: Box::new(cursor),
-                predicate: predicate.clone(),
-            },
-            logical::StreamPipelineOp::Order { ordering } => exec::ExecCountCursorPlan::Order {
-                input: Box::new(cursor),
-                plan: ir::OrderPlan::ExplicitSort(ordering.clone()),
-            },
-            logical::StreamPipelineOp::Expand { plan } => exec::ExecCountCursorPlan::Expand {
-                input: Box::new(cursor),
-                plan: plan.clone(),
-            },
-            logical::StreamPipelineOp::VectorSearch { plan } => {
-                exec::ExecCountCursorPlan::VectorSearch {
-                    input: Box::new(cursor),
-                    plan: plan.clone(),
-                }
-            }
-            logical::StreamPipelineOp::TextSearch { plan } => {
-                exec::ExecCountCursorPlan::TextSearch {
-                    input: Box::new(cursor),
-                    plan: plan.clone(),
-                }
-            }
-            logical::StreamPipelineOp::Variable { op } => exec::ExecCountCursorPlan::Variable {
-                input: Box::new(cursor),
-                op: op.clone(),
-            },
-            logical::StreamPipelineOp::Distinct => exec::ExecCountCursorPlan::Distinct {
-                input: Box::new(cursor),
-                plan: exec::ExecCountDistinctPlan::HashRows,
-            },
-            logical::StreamPipelineOp::VariableWrite { .. } => {
-                return Err(rejection("count_cursor_crossed_variable_write_barrier"));
-            }
+        match op {
             logical::StreamPipelineOp::Window { .. }
             | logical::StreamPipelineOp::Limit { .. }
             | logical::StreamPipelineOp::Skip { .. }
             | logical::StreamPipelineOp::Range { .. } => {
-                unreachable!("positioned windows are handled before cursor operators")
+                positioned_window = append_window(positioned_window, op)?;
+                has_positioned_window = true;
             }
-        };
+            logical::StreamPipelineOp::VariableWrite { .. } => {
+                return Err(rejection("count_cursor_crossed_variable_write_barrier"));
+            }
+            logical::StreamPipelineOp::Filter { predicate } => {
+                flush_positioned_window!();
+                cursor = exec::ExecCountCursorPlan::Filter {
+                    input: Box::new(cursor),
+                    predicate: predicate.clone(),
+                };
+            }
+            logical::StreamPipelineOp::Order { ordering } => {
+                flush_positioned_window!();
+                cursor = exec::ExecCountCursorPlan::Order {
+                    input: Box::new(cursor),
+                    plan: ir::OrderPlan::ExplicitSort(ordering.clone()),
+                };
+            }
+            logical::StreamPipelineOp::Expand { plan } => {
+                flush_positioned_window!();
+                cursor = exec::ExecCountCursorPlan::Expand {
+                    input: Box::new(cursor),
+                    plan: plan.clone(),
+                };
+            }
+            logical::StreamPipelineOp::VectorSearch { plan } => {
+                flush_positioned_window!();
+                cursor = exec::ExecCountCursorPlan::VectorSearch {
+                    input: Box::new(cursor),
+                    plan: plan.clone(),
+                };
+            }
+            logical::StreamPipelineOp::TextSearch { plan } => {
+                flush_positioned_window!();
+                cursor = exec::ExecCountCursorPlan::TextSearch {
+                    input: Box::new(cursor),
+                    plan: plan.clone(),
+                };
+            }
+            logical::StreamPipelineOp::Variable { op } => {
+                flush_positioned_window!();
+                cursor = exec::ExecCountCursorPlan::Variable {
+                    input: Box::new(cursor),
+                    op: op.clone(),
+                };
+            }
+            logical::StreamPipelineOp::Distinct => {
+                flush_positioned_window!();
+                cursor = exec::ExecCountCursorPlan::Distinct {
+                    input: Box::new(cursor),
+                    plan: exec::ExecCountDistinctPlan::HashRows,
+                };
+            }
+        }
     }
     if has_positioned_window {
         cursor = exec::ExecCountCursorPlan::Window {
@@ -332,9 +343,10 @@ fn bound_expr(bound: &ir::StreamBoundPlan) -> Result<exec::ExecUsizeExpr, RuleRe
     match bound {
         ir::StreamBoundPlan::Literal(value) => Ok(exec::ExecUsizeExpr::literal(*value)),
         ir::StreamBoundPlan::Expr(expr) => match expr.expr() {
-            Expr::Param(param) => ir::NonEmptyString::new(param.clone())
-                .map(exec::ExecUsizeExpr::Param)
-                .ok_or_else(|| rejection("empty_count_window_parameter")),
+            Expr::Param(param) => Ok(exec::ExecUsizeExpr::Param(
+                ir::NonEmptyString::new(param.clone())
+                    .expect("validated stream-bound parameters are non-empty"),
+            )),
             Expr::Property(_)
             | Expr::Id
             | Expr::Timestamp
@@ -586,16 +598,14 @@ fn classify_equality(
         }
     };
     match literal.semantics() {
-        ir::EqualityIndexValueSemantics::Indexed => {
+        ir::LiteralEqualityIndexValueSemantics::Indexed => Ok(EqualityValue::Indexed(
             exec::ExecIndexedEqualityValue::try_from(literal)
-                .map(EqualityValue::Indexed)
-                .map_err(|_| rejection("invalid_indexed_equality_value"))
+                .expect("indexed literal semantics satisfy the executable wrapper"),
+        )),
+        ir::LiteralEqualityIndexValueSemantics::AuthoritativeNull => {
+            Ok(EqualityValue::AuthoritativeNull)
         }
-        ir::EqualityIndexValueSemantics::AuthoritativeNull => Ok(EqualityValue::AuthoritativeNull),
-        ir::EqualityIndexValueSemantics::NonReflexive => Ok(EqualityValue::NonReflexive),
-        ir::EqualityIndexValueSemantics::RuntimeDependent => {
-            Err(rejection("literal_equality_was_runtime_dependent"))
-        }
+        ir::LiteralEqualityIndexValueSemantics::NonReflexive => Ok(EqualityValue::NonReflexive),
     }
 }
 
@@ -628,7 +638,7 @@ fn node_equality_count(
                         index: index
                             .clone()
                             .try_into()
-                            .map_err(|_| rejection("non_unique_index_validation_failed"))?,
+                            .expect("non-unique catalog metadata satisfies the bitmap wrapper"),
                         key: key.clone(),
                         value,
                     },
@@ -637,7 +647,7 @@ fn node_equality_count(
             }
             catalog::IndexUniqueness::Unique => {
                 let index = exec::ExecNodeUniqueEqualityIndex::try_from(index.clone())
-                    .map_err(|_| rejection("unique_index_validation_failed"))?;
+                    .expect("unique catalog metadata satisfies the owner wrapper");
                 exec::ExecCountPlan::NodeUnique(exec::ExecNodeUniqueCountPlan {
                     lookup: exec::ExecNodeUniqueOwnerReadPlan {
                         index,
@@ -955,7 +965,7 @@ fn node_bitmap_expr(
                     index: index
                         .clone()
                         .try_into()
-                        .map_err(|_| rejection("non_unique_index_validation_failed"))?,
+                        .expect("non-unique catalog metadata satisfies the bitmap wrapper"),
                     key: key.clone(),
                     value,
                 }),
@@ -1136,9 +1146,8 @@ fn node_intersection_count_plans(
             .map(|(_, child)| node_bitmap_expr(child.as_ref(), rule))
             .collect::<Result<Option<Vec<_>>, _>>()?;
         let Some(filters) = filters else { continue };
-        let Some(filters) = ir::AtLeast::<_, 1>::try_from_vec(filters) else {
-            continue;
-        };
+        let filters = ir::AtLeast::<_, 1>::try_from_vec(filters)
+            .expect("a range-driver intersection retains at least one bitmap filter");
         alternatives.push(exec::ExecCountPlan::NodeRange(
             exec::ExecNodeRangeCountPlan {
                 driver: exec::ExecNodeVerifiedRangeScanPlan {
@@ -1182,9 +1191,8 @@ fn edge_intersection_count_plans(
             .map(|(_, child)| edge_bitmap_expr(child.as_ref(), rule))
             .collect::<Result<Option<Vec<_>>, _>>()?;
         let Some(filters) = filters else { continue };
-        let Some(filters) = ir::AtLeast::<_, 1>::try_from_vec(filters) else {
-            continue;
-        };
+        let filters = ir::AtLeast::<_, 1>::try_from_vec(filters)
+            .expect("a range-driver intersection retains at least one bitmap filter");
         alternatives.push(exec::ExecCountPlan::EdgeRange(
             exec::ExecEdgeRangeCountPlan {
                 driver: exec::ExecEdgeVerifiedRangeScanPlan {
@@ -1472,8 +1480,15 @@ fn rejection(reason: &'static str) -> RuleRejection {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
 
-    use helix_ast::{index::RangeIndexDirection, query::QueryValue, value::PropertyValue};
+    use helix_ast::{
+        expr::Predicate,
+        index::RangeIndexDirection,
+        query::QueryValue,
+        traversal::Order,
+        value::{PropertyInput, PropertyValue},
+    };
 
     use super::*;
     use crate::optimizer::OptimizerRule;
@@ -1496,6 +1511,150 @@ mod tests {
 
     fn literal(value: PropertyValue) -> ir::IndexValue {
         ir::IndexValue::Literal(ir::SecondaryIndexLiteral::new(value).unwrap())
+    }
+
+    fn exec_indexed(value: &str) -> exec::ExecIndexedEqualityValue {
+        ir::SecondaryIndexLiteral::new(PropertyValue::from(value))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    fn exec_node_point(value: &str) -> exec::ExecNodeBitmapExpr {
+        exec::ExecNodeBitmapExpr::PointRead {
+            index: catalog::NodeEqualityIndexMeta::new(name("node_eq:User:status"))
+                .try_into()
+                .unwrap(),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            value: exec_indexed(value),
+        }
+    }
+
+    fn exec_edge_point(value: &str) -> exec::ExecEdgeBitmapExpr {
+        exec::ExecEdgeBitmapExpr::PointRead {
+            index: exec::ExecEdgeNonUniqueEqualityIndex::new(catalog::EdgeEqualityIndexMeta::new(
+                name("edge_eq:LIKES:status"),
+            )),
+            key: catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+            value: exec_indexed(value),
+        }
+    }
+
+    fn element_ids() -> ir::ElementIds {
+        ir::ElementIds::new(ir::AtLeast::from_one_and_rest(1, vec![2])).unwrap()
+    }
+
+    fn predicate() -> ir::PredicatePlan {
+        ir::PredicatePlan::new(Predicate::has_key("status")).unwrap()
+    }
+
+    fn search_index() -> ir::SearchIndexPlan {
+        ir::SearchIndexPlan {
+            index_id: name("search-index"),
+            tenant: ir::SearchTenantPlan::Unscoped,
+        }
+    }
+
+    fn search_limit() -> ir::SearchLimitPlan {
+        ir::SearchLimitPlan::Literal(NonZeroUsize::MIN)
+    }
+
+    fn ordering() -> ir::OrderKeys {
+        ir::OrderKeys::from(ir::OrderKey {
+            property: name("age"),
+            order: Order::Asc,
+        })
+    }
+
+    fn expand() -> ir::ExpandPlan {
+        ir::ExpandPlan {
+            direction: ir::ExpandDirection::Out,
+            output: ir::ExpandOutput::Nodes,
+            label: ir::ExpandLabelPlan::Any,
+        }
+    }
+
+    fn restricted_vector() -> Box<ir::RestrictedVectorSearchPlan> {
+        Box::new(ir::RestrictedVectorSearchPlan::Nodes {
+            key: catalog::NodeSearchIndexKey::try_new("User", "embedding").unwrap(),
+            index: search_index(),
+            query_vector: ir::VectorQueryInputPlan::new(PropertyInput::from(vec![1.0_f32]))
+                .unwrap(),
+            k: search_limit(),
+        })
+    }
+
+    fn restricted_text() -> Box<ir::RestrictedTextSearchPlan> {
+        Box::new(ir::RestrictedTextSearchPlan::Edges {
+            key: catalog::EdgeSearchIndexKey::try_new("LIKES", "body").unwrap(),
+            index: search_index(),
+            query_text: ir::TextQueryInputPlan::new(PropertyInput::from("needle")).unwrap(),
+            k: search_limit(),
+        })
+    }
+
+    fn node_vector_search() -> ir::NodeAccessPlan {
+        ir::NodeAccessPlan::VectorSearch {
+            key: catalog::NodeSearchIndexKey::try_new("User", "embedding").unwrap(),
+            index: search_index(),
+            query_vector: ir::VectorQueryInputPlan::new(PropertyInput::from(vec![1.0_f32]))
+                .unwrap(),
+            k: search_limit(),
+        }
+    }
+
+    fn edge_vector_search() -> ir::EdgeAccessPlan {
+        ir::EdgeAccessPlan::VectorSearch {
+            key: catalog::EdgeSearchIndexKey::try_new("LIKES", "embedding").unwrap(),
+            index: search_index(),
+            query_vector: ir::VectorQueryInputPlan::new(PropertyInput::from(vec![1.0_f32]))
+                .unwrap(),
+            k: search_limit(),
+        }
+    }
+
+    fn node_text_search() -> ir::NodeAccessPlan {
+        ir::NodeAccessPlan::TextSearch {
+            key: catalog::NodeSearchIndexKey::try_new("User", "body").unwrap(),
+            index: search_index(),
+            query_text: ir::TextQueryInputPlan::new(PropertyInput::from("needle")).unwrap(),
+            k: search_limit(),
+        }
+    }
+
+    fn edge_text_search() -> ir::EdgeAccessPlan {
+        ir::EdgeAccessPlan::TextSearch {
+            key: catalog::EdgeSearchIndexKey::try_new("LIKES", "body").unwrap(),
+            index: search_index(),
+            query_text: ir::TextQueryInputPlan::new(PropertyInput::from("needle")).unwrap(),
+            k: search_limit(),
+        }
+    }
+
+    fn node_range_plan() -> ir::NodeAccessPlan {
+        ir::NodeAccessPlan::RangeIndex {
+            index: catalog::NodeRangeIndexMeta::try_new("node-range").unwrap(),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "User",
+                "age",
+                RangeIndexDirection::Asc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        }
+    }
+
+    fn edge_range_plan() -> ir::EdgeAccessPlan {
+        ir::EdgeAccessPlan::RangeIndex {
+            index: catalog::EdgeRangeIndexMeta::try_new("edge-range").unwrap(),
+            key: catalog::ScopedPropertyDirectionKey::try_new(
+                "LIKES",
+                "age",
+                RangeIndexDirection::Desc,
+            )
+            .unwrap(),
+            range: ir::IndexRange::All,
+        }
     }
 
     fn node_equality(
@@ -1539,6 +1698,32 @@ mod tests {
             storage: &storage,
             indexes: &indexes,
         })
+    }
+
+    fn with_rule_input_bindings<T>(
+        params: context::ParamBindings,
+        late_bound_params: BTreeSet<ir::NonEmptyString>,
+        run: impl FnOnce(&optimizer::RuleInput<'_>) -> T,
+    ) -> T {
+        let expr = logical::LogicalExpr::StreamCardinality(
+            logical::StreamCardinality::new(access(node_path(ir::NodeAccessPlan::AllScan)))
+                .with_planning_bindings(params, late_bound_params),
+        );
+        let storage = cost::StorageCostProfile::default();
+        let indexes = catalog::IndexCatalogSnapshot::default();
+        let limits = context::PlannerLimits::default();
+        let stats = context::StatsSnapshot::default();
+        run(&optimizer::RuleInput {
+            expr: &expr,
+            planner_limits: &limits,
+            stats: &stats,
+            storage: &storage,
+            indexes: &indexes,
+        })
+    }
+
+    fn with_rule_input<T>(run: impl FnOnce(&optimizer::RuleInput<'_>) -> T) -> T {
+        with_rule_input_bindings(context::ParamBindings::default(), BTreeSet::new(), run)
     }
 
     fn plans(result: optimizer::RuleResult) -> Vec<exec::ExecCountPlan> {
@@ -1718,11 +1903,58 @@ mod tests {
             plans(apply(
                 source(),
                 context::ParamBindings::default(),
-                BTreeSet::from([parameter]),
+                BTreeSet::from([parameter.clone()]),
             ))
             .as_slice(),
             [exec::ExecCountPlan::NodeDynamicEquality(_)]
         ));
+
+        let edge_source = || {
+            access(edge_path(edge_equality(
+                "likes_status",
+                "status",
+                ir::IndexValue::Param(parameter.clone()),
+            )))
+        };
+        assert!(matches!(
+            plans(apply(
+                edge_source(),
+                context::ParamBindings::default(),
+                BTreeSet::from([parameter]),
+            ))
+            .as_slice(),
+            [exec::ExecCountPlan::EdgeDynamicEquality(_)]
+        ));
+    }
+
+    #[test]
+    fn every_scalar_query_parameter_is_inlined_before_algorithm_selection() {
+        let parameter = name("value");
+        let source = || {
+            access(node_path(node_equality(
+                "user_value",
+                "value",
+                ir::IndexValue::Param(parameter.clone()),
+                catalog::IndexUniqueness::NonUnique,
+            )))
+        };
+        for value in [
+            QueryValue::Bool(true),
+            QueryValue::I64(7),
+            QueryValue::F64(7.5),
+            QueryValue::F32(3.5),
+            QueryValue::String("value".to_string()),
+        ] {
+            assert!(matches!(
+                plans(apply(
+                    source(),
+                    context::ParamBindings::default().with_query_value(parameter.clone(), value),
+                    BTreeSet::new(),
+                ))
+                .as_slice(),
+                [exec::ExecCountPlan::NodeBitmap(_)]
+            ));
+        }
     }
 
     #[test]
@@ -1742,6 +1974,27 @@ mod tests {
                     ir::IndexValue::Param(parameter.clone()),
                 ))),
                 context::ParamBindings::default().with_query_value(parameter.clone(), nested),
+                BTreeSet::new(),
+            );
+            assert!(matches!(
+                result,
+                optimizer::RuleResult::Rejected(RuleRejection { reason })
+                    if reason.as_ref() == "unsupported_planning_equality_parameter"
+            ));
+        }
+
+        for nested in [
+            PropertyValue::array([PropertyValue::I64(1)]),
+            PropertyValue::object([("key", PropertyValue::Bool(true))]),
+        ] {
+            let result = apply(
+                access(node_path(node_equality(
+                    "user_value",
+                    "value",
+                    ir::IndexValue::Param(parameter.clone()),
+                    catalog::IndexUniqueness::NonUnique,
+                ))),
+                context::ParamBindings::default().with_value(parameter.clone(), nested),
                 BTreeSet::new(),
             );
             assert!(matches!(
@@ -1818,6 +2071,120 @@ mod tests {
             Some(exec::ExecNodeBitmapExpr::PointRead { key, .. })
                 if key.property.as_ref() == "score"
         ));
+    }
+
+    #[test]
+    fn edge_batches_bitmap_sets_and_range_drivers_are_all_explicit() {
+        let edge_source = |index_id: &str, property: &str, value: i64| {
+            ir::EdgeAccessSourcePlan::new(edge_equality(
+                index_id,
+                property,
+                literal(PropertyValue::I64(value)),
+            ))
+            .unwrap()
+        };
+        let [batched] = plans(apply(
+            access(edge_path(ir::EdgeAccessPlan::Union(
+                ir::AtLeast::from_pair(
+                    edge_source("likes_weight", "weight", 1),
+                    edge_source("likes_weight", "weight", 2),
+                ),
+            ))),
+            context::ParamBindings::default(),
+            BTreeSet::new(),
+        ))
+        .try_into()
+        .unwrap();
+        assert!(matches!(
+            batched,
+            exec::ExecCountPlan::EdgeBitmap(exec::ExecEdgeBitmapCountPlan {
+                bitmap: exec::ExecEdgeBitmapExpr::BatchedUnionRead { .. },
+                ..
+            })
+        ));
+
+        let [intersection] = plans(apply(
+            access(edge_path(ir::EdgeAccessPlan::Intersect(
+                ir::AtLeast::from_pair(
+                    edge_source("likes_weight", "weight", 1),
+                    edge_source("likes_score", "score", 2),
+                ),
+            ))),
+            context::ParamBindings::default(),
+            BTreeSet::new(),
+        ))
+        .try_into()
+        .unwrap();
+        assert!(matches!(
+            intersection,
+            exec::ExecCountPlan::EdgeBitmap(exec::ExecEdgeBitmapCountPlan {
+                bitmap: exec::ExecEdgeBitmapExpr::Intersect { .. },
+                ..
+            })
+        ));
+
+        let range = ir::EdgeAccessSourcePlan::new(edge_range_plan()).unwrap();
+        let [range_driven] = plans(apply(
+            access(edge_path(ir::EdgeAccessPlan::Intersect(
+                ir::AtLeast::from_pair(range.clone(), edge_source("likes_weight", "weight", 1)),
+            ))),
+            context::ParamBindings::default(),
+            BTreeSet::new(),
+        ))
+        .try_into()
+        .unwrap();
+        assert!(matches!(range_driven, exec::ExecCountPlan::EdgeRange(_)));
+
+        let [materialized] = plans(apply(
+            access(edge_path(ir::EdgeAccessPlan::Intersect(
+                ir::AtLeast::from_pair(
+                    range,
+                    ir::EdgeAccessSourcePlan::new(edge_range_plan()).unwrap(),
+                ),
+            ))),
+            context::ParamBindings::default(),
+            BTreeSet::new(),
+        ))
+        .try_into()
+        .unwrap();
+        assert!(matches!(materialized, exec::ExecCountPlan::Stream(_)));
+
+        let node_bitmap = |value: i64| {
+            ir::NodeAccessSourcePlan::new(node_equality(
+                "user_age",
+                "age",
+                literal(PropertyValue::I64(value)),
+                catalog::IndexUniqueness::NonUnique,
+            ))
+            .unwrap()
+        };
+        let [node_intersection] = plans(apply(
+            access(node_path(ir::NodeAccessPlan::Intersect(
+                ir::AtLeast::from_pair(node_bitmap(1), node_bitmap(2)),
+            ))),
+            context::ParamBindings::default(),
+            BTreeSet::new(),
+        ))
+        .try_into()
+        .unwrap();
+        assert!(matches!(
+            node_intersection,
+            exec::ExecCountPlan::NodeBitmap(_)
+        ));
+
+        let [node_materialized] = plans(apply(
+            access(node_path(ir::NodeAccessPlan::Intersect(
+                ir::AtLeast::from_pair(
+                    ir::NodeAccessSourcePlan::new(node_range_plan()).unwrap(),
+                    ir::NodeAccessSourcePlan::new(node_range_plan()).unwrap(),
+                ),
+            ))),
+            context::ParamBindings::default(),
+            BTreeSet::new(),
+        ))
+        .try_into()
+        .unwrap();
+        assert!(matches!(node_materialized, exec::ExecCountPlan::Stream(_)));
     }
 
     #[test]
@@ -1936,5 +2303,1251 @@ mod tests {
             .as_slice(),
             [exec::ExecCountPlan::InputRows { .. }]
         ));
+    }
+
+    #[test]
+    fn every_node_access_source_has_an_exact_count_family() {
+        let point_source = || {
+            ir::NodeAccessSourcePlan::new(ir::NodeAccessPlan::PointIds { ids: element_ids() })
+                .unwrap()
+        };
+        let cases = vec![
+            (
+                ir::NodeAccessPlan::Empty,
+                physical::PhysicalCardinality::Constant,
+            ),
+            (
+                ir::NodeAccessPlan::PointIds { ids: element_ids() },
+                physical::PhysicalCardinality::VerifiedPointReads,
+            ),
+            (
+                ir::NodeAccessPlan::FromParam {
+                    param: name("nodes"),
+                },
+                physical::PhysicalCardinality::RuntimeInput,
+            ),
+            (
+                ir::NodeAccessPlan::FromVar {
+                    variable: name("nodes"),
+                },
+                physical::PhysicalCardinality::RuntimeInput,
+            ),
+            (
+                ir::NodeAccessPlan::AllScan,
+                physical::PhysicalCardinality::FullScan,
+            ),
+            (
+                ir::NodeAccessPlan::LabelScan {
+                    label: name("User"),
+                },
+                physical::PhysicalCardinality::LabelBitmap,
+            ),
+            (
+                node_range_plan(),
+                physical::PhysicalCardinality::VerifiedRange,
+            ),
+            (
+                node_vector_search(),
+                physical::PhysicalCardinality::VectorSearch,
+            ),
+            (
+                node_text_search(),
+                physical::PhysicalCardinality::TextSearch,
+            ),
+            (
+                ir::NodeAccessPlan::Union(ir::AtLeast::from_pair(point_source(), point_source())),
+                physical::PhysicalCardinality::SetUnion,
+            ),
+            (
+                ir::NodeAccessPlan::Intersect(ir::AtLeast::from_pair(
+                    point_source(),
+                    point_source(),
+                )),
+                physical::PhysicalCardinality::SetIntersection,
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let alternatives = plans(apply(
+                access(node_path(source)),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ));
+            assert_eq!(alternatives.len(), 1);
+            assert_eq!(
+                physical::PhysicalCountPlan::new(alternatives.into_iter().next().unwrap()).family(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn every_edge_access_source_has_an_exact_count_family() {
+        let point_source = || {
+            ir::EdgeAccessSourcePlan::new(ir::EdgeAccessPlan::PointIds { ids: element_ids() })
+                .unwrap()
+        };
+        let cases = vec![
+            (
+                ir::EdgeAccessPlan::Empty,
+                physical::PhysicalCardinality::Constant,
+            ),
+            (
+                ir::EdgeAccessPlan::PointIds { ids: element_ids() },
+                physical::PhysicalCardinality::VerifiedPointReads,
+            ),
+            (
+                ir::EdgeAccessPlan::FromParam {
+                    param: name("edges"),
+                },
+                physical::PhysicalCardinality::RuntimeInput,
+            ),
+            (
+                ir::EdgeAccessPlan::FromVar {
+                    variable: name("edges"),
+                },
+                physical::PhysicalCardinality::RuntimeInput,
+            ),
+            (
+                ir::EdgeAccessPlan::AllScan,
+                physical::PhysicalCardinality::FullScan,
+            ),
+            (
+                ir::EdgeAccessPlan::LabelScan {
+                    label: name("LIKES"),
+                },
+                physical::PhysicalCardinality::LabelBitmap,
+            ),
+            (
+                edge_range_plan(),
+                physical::PhysicalCardinality::VerifiedRange,
+            ),
+            (
+                edge_vector_search(),
+                physical::PhysicalCardinality::VectorSearch,
+            ),
+            (
+                edge_text_search(),
+                physical::PhysicalCardinality::TextSearch,
+            ),
+            (
+                ir::EdgeAccessPlan::Union(ir::AtLeast::from_pair(point_source(), point_source())),
+                physical::PhysicalCardinality::SetUnion,
+            ),
+            (
+                ir::EdgeAccessPlan::Intersect(ir::AtLeast::from_pair(
+                    point_source(),
+                    point_source(),
+                )),
+                physical::PhysicalCardinality::SetIntersection,
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let alternatives = plans(apply(
+                access(edge_path(source)),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ));
+            assert_eq!(alternatives.len(), 1);
+            assert_eq!(
+                physical::PhysicalCountPlan::new(alternatives.into_iter().next().unwrap()).family(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn access_unary_shapes_preserve_only_semantically_safe_windows() {
+        let path = node_path(ir::NodeAccessPlan::AllScan);
+        let ordering = ir::OrderKeys::from(ir::OrderKey {
+            property: name("age"),
+            order: Order::Asc,
+        });
+        for access_stream in [
+            logical::AccessStream::Order(logical::AccessOrder::new(path.clone(), ordering.clone())),
+            logical::AccessStream::Window(logical::AccessWindow::new(
+                path.clone(),
+                logical::AccessWindowRange::new(2, None).unwrap(),
+            )),
+            logical::AccessStream::Window(logical::AccessWindow::new(
+                path.clone(),
+                logical::AccessWindowRange::new(2, Some(5)).unwrap(),
+            )),
+            logical::AccessStream::Filter(logical::AccessFilter::new(path.clone(), predicate())),
+        ] {
+            assert_eq!(
+                plans(apply(
+                    logical::RootStream::Access(access_stream),
+                    context::ParamBindings::default(),
+                    BTreeSet::new(),
+                ))
+                .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_access_cursors_cover_every_unary_shape_and_residual_source() {
+        with_rule_input(|rule| {
+            let node_residual = ir::NodeAccessPlan::ScanThenFilter {
+                source: ir::NodeAccessSourcePlan::from_unfiltered(ir::NodeAccessPlan::AllScan),
+                residual: predicate(),
+            };
+            assert!(matches!(
+                node_count_plans(&node_residual, exec::ExecCountWindowPlan::identity(), rule,)
+                    .unwrap()
+                    .as_slice(),
+                [exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                    cursor: exec::ExecCountCursorPlan::Filter { .. },
+                    ..
+                })]
+            ));
+            let edge_residual = ir::EdgeAccessPlan::ScanThenFilter {
+                source: ir::EdgeAccessSourcePlan::from_unfiltered(ir::EdgeAccessPlan::AllScan),
+                residual: predicate(),
+            };
+            assert!(matches!(
+                edge_count_plans(&edge_residual, exec::ExecCountWindowPlan::identity(), rule,)
+                    .unwrap()
+                    .as_slice(),
+                [exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                    cursor: exec::ExecCountCursorPlan::Filter { .. },
+                    ..
+                })]
+            ));
+
+            let node = node_path(ir::NodeAccessPlan::AllScan);
+            let edge = edge_path(ir::EdgeAccessPlan::AllScan);
+            let streams = [
+                logical::AccessStream::Path(edge),
+                logical::AccessStream::Order(logical::AccessOrder::new(node.clone(), ordering())),
+                logical::AccessStream::Distinct(logical::AccessDistinct::new(node.clone())),
+                logical::AccessStream::Window(logical::AccessWindow::new(
+                    node.clone(),
+                    logical::AccessWindowRange::new(1, Some(3)).unwrap(),
+                )),
+                logical::AccessStream::Filter(logical::AccessFilter::new(
+                    node.clone(),
+                    predicate(),
+                )),
+                logical::AccessStream::Pipeline(
+                    logical::AccessPipeline::new(
+                        node,
+                        ir::AtLeast::from_one(logical::StreamPipelineOp::Distinct),
+                    )
+                    .unwrap(),
+                ),
+            ];
+            for stream in &streams {
+                assert!(access_stream_cursor(stream, rule).is_ok());
+            }
+            let write = logical::AccessStream::Pipeline(
+                logical::AccessPipeline::new(
+                    node_path(ir::NodeAccessPlan::AllScan),
+                    ir::AtLeast::from_one(logical::StreamPipelineOp::VariableWrite {
+                        op: logical::StreamVariableWriteOp::Store(name("saved")),
+                    }),
+                )
+                .unwrap(),
+            );
+            assert!(access_stream_cursor(&write, rule).is_err());
+            assert!(matches!(
+                access_count_plans(&write, rule).unwrap().as_slice(),
+                [exec::ExecCountPlan::InputRows { .. }]
+            ));
+        });
+    }
+
+    #[test]
+    fn bitmap_batch_detection_covers_empty_non_point_and_identity_mismatch_inputs() {
+        let node_other_key = exec::ExecNodeBitmapExpr::PointRead {
+            index: catalog::NodeEqualityIndexMeta::new(name("node_eq:User:status"))
+                .try_into()
+                .unwrap(),
+            key: catalog::ScopedPropertyKey::try_new("User", "role").unwrap(),
+            value: exec_indexed("admin"),
+        };
+        let node_non_point = exec::ExecNodeBitmapExpr::Union {
+            driver: Box::new(exec_node_point("active")),
+            rest: ir::AtLeast::from_one(exec_node_point("paused")),
+        };
+        assert!(node_bitmap_batch(&[]).is_none());
+        assert!(node_bitmap_batch(core::slice::from_ref(&node_non_point)).is_none());
+        assert!(node_bitmap_batch(&[exec_node_point("active"), node_non_point.clone()]).is_none());
+        assert!(node_bitmap_batch(&[exec_node_point("active"), node_other_key]).is_none());
+
+        let edge_other_key = exec::ExecEdgeBitmapExpr::PointRead {
+            index: exec::ExecEdgeNonUniqueEqualityIndex::new(catalog::EdgeEqualityIndexMeta::new(
+                name("edge_eq:LIKES:status"),
+            )),
+            key: catalog::ScopedPropertyKey::try_new("LIKES", "kind").unwrap(),
+            value: exec_indexed("friend"),
+        };
+        let edge_non_point = exec::ExecEdgeBitmapExpr::Intersect {
+            driver: Box::new(exec_edge_point("active")),
+            rest: ir::AtLeast::from_one(exec_edge_point("paused")),
+        };
+        assert!(edge_bitmap_batch(&[]).is_none());
+        assert!(edge_bitmap_batch(core::slice::from_ref(&edge_non_point)).is_none());
+        assert!(edge_bitmap_batch(&[exec_edge_point("active"), edge_non_point.clone()]).is_none());
+        assert!(edge_bitmap_batch(&[exec_edge_point("active"), edge_other_key]).is_none());
+    }
+
+    #[test]
+    fn bitmap_classification_declines_unique_null_nan_dynamic_and_non_equality_sources() {
+        let node_cases = [
+            node_equality(
+                "node_eq:User:email",
+                "email",
+                literal(PropertyValue::from("alice@example.test")),
+                catalog::IndexUniqueness::Unique,
+            ),
+            node_equality(
+                "node_eq:User:status",
+                "status",
+                literal(PropertyValue::Null),
+                catalog::IndexUniqueness::NonUnique,
+            ),
+            node_equality(
+                "node_eq:User:score",
+                "score",
+                literal(PropertyValue::F64(f64::NAN)),
+                catalog::IndexUniqueness::NonUnique,
+            ),
+            ir::NodeAccessPlan::AllScan,
+        ];
+        with_rule_input(|rule| {
+            for source in &node_cases {
+                assert!(node_bitmap_expr(source, rule).unwrap().is_none());
+            }
+            for source in [
+                edge_equality(
+                    "edge_eq:LIKES:status",
+                    "status",
+                    literal(PropertyValue::Null),
+                ),
+                edge_equality(
+                    "edge_eq:LIKES:score",
+                    "score",
+                    literal(PropertyValue::F32(f32::NAN)),
+                ),
+                ir::EdgeAccessPlan::AllScan,
+            ] {
+                assert!(edge_bitmap_expr(&source, rule).unwrap().is_none());
+            }
+
+            let node_children = ir::AtLeast::from_pair(
+                ir::NodeAccessSourcePlan::new(node_equality(
+                    "node_eq:User:status",
+                    "status",
+                    literal(PropertyValue::from("active")),
+                    catalog::IndexUniqueness::NonUnique,
+                ))
+                .unwrap(),
+                ir::NodeAccessSourcePlan::new(node_equality(
+                    "node_eq:User:role",
+                    "role",
+                    literal(PropertyValue::from("admin")),
+                    catalog::IndexUniqueness::NonUnique,
+                ))
+                .unwrap(),
+            );
+            assert!(
+                node_bitmap_expr(&ir::NodeAccessPlan::Union(node_children.clone()), rule)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                node_bitmap_expr(&ir::NodeAccessPlan::Intersect(node_children), rule)
+                    .unwrap()
+                    .is_some()
+            );
+
+            let edge_children = ir::AtLeast::from_pair(
+                ir::EdgeAccessSourcePlan::new(edge_equality(
+                    "edge_eq:LIKES:status",
+                    "status",
+                    literal(PropertyValue::from("active")),
+                ))
+                .unwrap(),
+                ir::EdgeAccessSourcePlan::new(edge_equality(
+                    "edge_eq:LIKES:kind",
+                    "kind",
+                    literal(PropertyValue::from("friend")),
+                ))
+                .unwrap(),
+            );
+            assert!(
+                edge_bitmap_expr(&ir::EdgeAccessPlan::Union(edge_children.clone()), rule)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                edge_bitmap_expr(&ir::EdgeAccessPlan::Intersect(edge_children), rule)
+                    .unwrap()
+                    .is_some()
+            );
+        });
+
+        let late = name("late");
+        with_rule_input_bindings(
+            context::ParamBindings::default(),
+            BTreeSet::from([late.clone()]),
+            |rule| {
+                assert!(node_bitmap_expr(
+                    &node_equality(
+                        "node_eq:User:status",
+                        "status",
+                        ir::IndexValue::Param(late.clone()),
+                        catalog::IndexUniqueness::NonUnique,
+                    ),
+                    rule,
+                )
+                .unwrap()
+                .is_none());
+                assert!(edge_bitmap_expr(
+                    &edge_equality(
+                        "edge_eq:LIKES:status",
+                        "status",
+                        ir::IndexValue::Param(late),
+                    ),
+                    rule,
+                )
+                .unwrap()
+                .is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn every_nested_planning_error_is_propagated_without_late_algorithm_selection() {
+        let invalid_bound =
+            || ir::StreamBoundPlan::Expr(ir::StreamBoundExprPlan::new(Expr::Id).unwrap());
+        let invalid_limit = || logical::StreamPipelineOp::Limit {
+            count: invalid_bound(),
+        };
+        let invalid_skip = logical::StreamPipelineOp::Skip {
+            count: invalid_bound(),
+        };
+        let invalid_range_start = ir::StreamRangePlan::Dynamic(
+            ir::StreamDynamicRange::new(
+                invalid_bound(),
+                ir::StreamBoundPlan::Expr(
+                    ir::StreamBoundExprPlan::new(Expr::param("end")).unwrap(),
+                ),
+            )
+            .unwrap(),
+        );
+        let invalid_range_end = ir::StreamRangePlan::Dynamic(
+            ir::StreamDynamicRange::new(
+                ir::StreamBoundPlan::Expr(
+                    ir::StreamBoundExprPlan::new(Expr::param("start")).unwrap(),
+                ),
+                invalid_bound(),
+            )
+            .unwrap(),
+        );
+        assert!(append_window(exec::ExecCountWindowPlan::identity(), &invalid_limit()).is_err());
+        assert!(append_window(exec::ExecCountWindowPlan::identity(), &invalid_skip).is_err());
+        assert!(range_exprs(&invalid_range_start).is_err());
+        assert!(range_exprs(&invalid_range_end).is_err());
+        assert!(append_window(
+            exec::ExecCountWindowPlan::identity(),
+            &logical::StreamPipelineOp::Range {
+                range: invalid_range_start.clone(),
+            },
+        )
+        .is_err());
+        assert!(trailing_count_window(&[invalid_limit()]).is_err());
+        assert!(fold_cursor(exec::ExecCountCursorPlan::NodeFullScan, &[invalid_limit()],).is_err());
+
+        let missing_node = || {
+            node_equality(
+                "node_eq:User:status",
+                "status",
+                ir::IndexValue::Param(name("missing")),
+                catalog::IndexUniqueness::NonUnique,
+            )
+        };
+        let missing_edge = || {
+            edge_equality(
+                "edge_eq:LIKES:status",
+                "status",
+                ir::IndexValue::Param(name("missing")),
+            )
+        };
+        let node_source = |plan| ir::NodeAccessSourcePlan::new(plan).unwrap();
+        let edge_source = |plan| ir::EdgeAccessSourcePlan::new(plan).unwrap();
+
+        with_rule_input(|rule| {
+            let missing_path = node_path(missing_node());
+            for stream in [
+                logical::AccessStream::Path(missing_path.clone()),
+                logical::AccessStream::Order(logical::AccessOrder::new(
+                    missing_path.clone(),
+                    ordering(),
+                )),
+                logical::AccessStream::Distinct(logical::AccessDistinct::new(missing_path.clone())),
+                logical::AccessStream::Window(logical::AccessWindow::new(
+                    missing_path.clone(),
+                    logical::AccessWindowRange::new(1, Some(2)).unwrap(),
+                )),
+                logical::AccessStream::Filter(logical::AccessFilter::new(
+                    missing_path.clone(),
+                    predicate(),
+                )),
+                logical::AccessStream::Pipeline(
+                    logical::AccessPipeline::new(
+                        missing_path,
+                        ir::AtLeast::from_one(logical::StreamPipelineOp::Distinct),
+                    )
+                    .unwrap(),
+                ),
+            ] {
+                assert!(access_stream_cursor(&stream, rule).is_err());
+                assert!(access_count_plans(&stream, rule).is_err());
+            }
+            assert!(access_stream_cursor(
+                &logical::AccessStream::Path(edge_path(missing_edge())),
+                rule,
+            )
+            .is_err());
+
+            let invalid_access_suffix = logical::AccessPipeline::new(
+                node_path(ir::NodeAccessPlan::AllScan),
+                ir::AtLeast::from_one(invalid_limit()),
+            )
+            .unwrap();
+            assert!(access_pipeline_count(&invalid_access_suffix, rule).is_err());
+            let invalid_access_cursor = logical::AccessPipeline::new(
+                node_path(missing_node()),
+                ir::AtLeast::from_one(logical::StreamPipelineOp::Distinct),
+            )
+            .unwrap();
+            assert!(access_pipeline_count(&invalid_access_cursor, rule).is_err());
+            let invalid_access_fold = logical::AccessPipeline::new(
+                node_path(ir::NodeAccessPlan::AllScan),
+                ir::AtLeast::from_one_and_rest(
+                    invalid_limit(),
+                    vec![logical::StreamPipelineOp::Distinct],
+                ),
+            )
+            .unwrap();
+            assert!(access_pipeline_count(&invalid_access_fold, rule).is_err());
+
+            let invalid_root_suffix = logical::RootPipeline::new(
+                access(node_path(ir::NodeAccessPlan::AllScan)),
+                ir::AtLeast::from_one(invalid_limit()),
+            )
+            .unwrap();
+            assert!(root_pipeline_count(&invalid_root_suffix, rule).is_err());
+            assert!(count_plans(
+                &logical::RootStream::Pipeline(Box::new(invalid_root_suffix)),
+                rule,
+            )
+            .is_err());
+            let invalid_root_cursor = logical::RootPipeline::new(
+                logical::RootStream::Access(logical::AccessStream::Path(node_path(missing_node()))),
+                ir::AtLeast::from_one(logical::StreamPipelineOp::Distinct),
+            )
+            .unwrap();
+            assert!(root_pipeline_count(&invalid_root_cursor, rule).is_err());
+            let invalid_root_fold = logical::RootPipeline::new(
+                access(node_path(ir::NodeAccessPlan::AllScan)),
+                ir::AtLeast::from_one_and_rest(
+                    invalid_limit(),
+                    vec![logical::StreamPipelineOp::Distinct],
+                ),
+            )
+            .unwrap();
+            assert!(root_pipeline_count(&invalid_root_fold, rule).is_err());
+
+            let node_bitmap_error = ir::NodeAccessPlan::Union(ir::AtLeast::from_pair(
+                node_source(missing_node()),
+                node_source(node_equality(
+                    "node_eq:User:role",
+                    "role",
+                    literal(PropertyValue::from("admin")),
+                    catalog::IndexUniqueness::NonUnique,
+                )),
+            ));
+            assert!(node_count_plans(
+                &node_bitmap_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let node_cursor_error = ir::NodeAccessPlan::Union(ir::AtLeast::from_pair(
+                node_source(ir::NodeAccessPlan::AllScan),
+                node_source(missing_node()),
+            ));
+            assert!(node_count_plans(
+                &node_cursor_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let node_residual_error = ir::NodeAccessPlan::ScanThenFilter {
+                source: node_source(missing_node()),
+                residual: predicate(),
+            };
+            assert!(node_count_plans(
+                &node_residual_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let node_intersection_error = ir::NodeAccessPlan::Intersect(ir::AtLeast::from_pair(
+                node_source(missing_node()),
+                node_source(node_range_plan()),
+            ));
+            assert!(node_count_plans(
+                &node_intersection_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let node_range_filter_error = ir::NodeAccessPlan::Intersect(ir::AtLeast::from_pair(
+                node_source(node_range_plan()),
+                node_source(missing_node()),
+            ));
+            assert!(node_count_plans(
+                &node_range_filter_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let node_fallback_error =
+                ir::NodeAccessPlan::Intersect(ir::AtLeast::from_pair_and_rest(
+                    node_source(node_range_plan()),
+                    node_source(node_range_plan()),
+                    vec![node_source(missing_node())],
+                ));
+            assert!(node_count_plans(
+                &node_fallback_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+
+            let edge_bitmap_error = ir::EdgeAccessPlan::Union(ir::AtLeast::from_pair(
+                edge_source(missing_edge()),
+                edge_source(edge_equality(
+                    "edge_eq:LIKES:kind",
+                    "kind",
+                    literal(PropertyValue::from("friend")),
+                )),
+            ));
+            assert!(edge_count_plans(
+                &edge_bitmap_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let edge_cursor_error = ir::EdgeAccessPlan::Union(ir::AtLeast::from_pair(
+                edge_source(ir::EdgeAccessPlan::AllScan),
+                edge_source(missing_edge()),
+            ));
+            assert!(edge_count_plans(
+                &edge_cursor_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let edge_residual_error = ir::EdgeAccessPlan::ScanThenFilter {
+                source: edge_source(missing_edge()),
+                residual: predicate(),
+            };
+            assert!(edge_count_plans(
+                &edge_residual_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let edge_intersection_error = ir::EdgeAccessPlan::Intersect(ir::AtLeast::from_pair(
+                edge_source(missing_edge()),
+                edge_source(edge_range_plan()),
+            ));
+            assert!(edge_count_plans(
+                &edge_intersection_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let edge_range_filter_error = ir::EdgeAccessPlan::Intersect(ir::AtLeast::from_pair(
+                edge_source(edge_range_plan()),
+                edge_source(missing_edge()),
+            ));
+            assert!(edge_count_plans(
+                &edge_range_filter_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+            let edge_fallback_error =
+                ir::EdgeAccessPlan::Intersect(ir::AtLeast::from_pair_and_rest(
+                    edge_source(edge_range_plan()),
+                    edge_source(edge_range_plan()),
+                    vec![edge_source(missing_edge())],
+                ));
+            assert!(edge_count_plans(
+                &edge_fallback_error,
+                exec::ExecCountWindowPlan::identity(),
+                rule,
+            )
+            .is_err());
+        });
+    }
+
+    #[test]
+    fn pipeline_operator_matrix_normalizes_only_the_trailing_safe_region() {
+        let dynamic = |param: &str| {
+            ir::StreamBoundPlan::Expr(
+                ir::StreamBoundExprPlan::new(helix_ast::expr::Expr::param(param)).unwrap(),
+            )
+        };
+        let window_ops = vec![
+            logical::StreamPipelineOp::Window {
+                window: logical::AccessWindowRange::new(2, None).unwrap(),
+            },
+            logical::StreamPipelineOp::Window {
+                window: logical::AccessWindowRange::new(1, Some(5)).unwrap(),
+            },
+            logical::StreamPipelineOp::Limit {
+                count: ir::StreamBoundPlan::Literal(8),
+            },
+            logical::StreamPipelineOp::Skip {
+                count: dynamic("skip"),
+            },
+            logical::StreamPipelineOp::Range {
+                range: ir::StreamRangePlan::Literal(ir::StreamLiteralRange::new(1, 4).unwrap()),
+            },
+            logical::StreamPipelineOp::Range {
+                range: ir::StreamRangePlan::Dynamic(
+                    ir::StreamDynamicRange::new(dynamic("start"), dynamic("end")).unwrap(),
+                ),
+            },
+            logical::StreamPipelineOp::Order {
+                ordering: ordering(),
+            },
+        ];
+        let (prefix, normalized) = trailing_count_window(&window_ops).unwrap();
+        assert!(prefix.is_empty());
+        assert_ne!(normalized, exec::ExecCountWindowPlan::identity());
+
+        let semantic_ops = vec![
+            logical::StreamPipelineOp::Filter {
+                predicate: predicate(),
+            },
+            logical::StreamPipelineOp::Expand { plan: expand() },
+            logical::StreamPipelineOp::VectorSearch {
+                plan: restricted_vector(),
+            },
+            logical::StreamPipelineOp::TextSearch {
+                plan: restricted_text(),
+            },
+            logical::StreamPipelineOp::Variable {
+                op: logical::PureStreamVariableOp::Select(name("saved")),
+            },
+            logical::StreamPipelineOp::Distinct,
+        ];
+        for op in &semantic_ops {
+            assert!(append_window(exec::ExecCountWindowPlan::identity(), op).is_err());
+            assert!(fold_cursor(exec::ExecCountCursorPlan::NodeFullScan, &[op.clone()]).is_ok());
+        }
+        assert!(matches!(
+            fold_cursor(
+                exec::ExecCountCursorPlan::NodeFullScan,
+                &[logical::StreamPipelineOp::Order {
+                    ordering: ordering(),
+                }],
+            )
+            .unwrap(),
+            exec::ExecCountCursorPlan::Order { .. }
+        ));
+        assert!(matches!(
+            fold_cursor(
+                exec::ExecCountCursorPlan::NodeFullScan,
+                &[logical::StreamPipelineOp::Limit {
+                    count: ir::StreamBoundPlan::Literal(2),
+                }],
+            )
+            .unwrap(),
+            exec::ExecCountCursorPlan::Window { .. }
+        ));
+
+        let mixed = vec![
+            logical::StreamPipelineOp::Limit {
+                count: ir::StreamBoundPlan::Literal(5),
+            },
+            logical::StreamPipelineOp::Filter {
+                predicate: predicate(),
+            },
+            logical::StreamPipelineOp::Skip {
+                count: ir::StreamBoundPlan::Literal(1),
+            },
+        ];
+        let (prefix, normalized) = trailing_count_window(&mixed).unwrap();
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(normalized.skip, exec::ExecUsizeExpr::Literal(1));
+        let cursor = fold_cursor(exec::ExecCountCursorPlan::NodeFullScan, prefix).unwrap();
+        assert!(matches!(
+            cursor,
+            exec::ExecCountCursorPlan::Filter { input, .. }
+                if matches!(input.as_ref(), exec::ExecCountCursorPlan::Window { .. })
+        ));
+
+        let write = logical::StreamPipelineOp::VariableWrite {
+            op: logical::StreamVariableWriteOp::Store(name("saved")),
+        };
+        assert!(append_window(exec::ExecCountWindowPlan::identity(), &write).is_err());
+        assert!(fold_cursor(exec::ExecCountCursorPlan::NodeFullScan, &[write]).is_err());
+    }
+
+    #[test]
+    fn window_expression_matrix_accepts_params_and_rejects_interpretive_expressions() {
+        let literal_bound = ir::StreamBoundPlan::Literal(3);
+        assert_eq!(
+            bound_expr(&literal_bound).unwrap(),
+            exec::ExecUsizeExpr::Literal(3)
+        );
+        let param_bound = ir::StreamBoundPlan::Expr(
+            ir::StreamBoundExprPlan::new(helix_ast::expr::Expr::param("limit")).unwrap(),
+        );
+        assert_eq!(
+            bound_expr(&param_bound).unwrap(),
+            exec::ExecUsizeExpr::Param(name("limit"))
+        );
+
+        for expression in [
+            helix_ast::expr::Expr::Id,
+            helix_ast::expr::Expr::Timestamp,
+            helix_ast::expr::Expr::DateTimeNow,
+            helix_ast::expr::Expr::Constant(PropertyValue::I64(3)),
+        ] {
+            let Ok(expression) = ir::StreamBoundExprPlan::new(expression) else {
+                continue;
+            };
+            assert!(bound_expr(&ir::StreamBoundPlan::Expr(expression)).is_err());
+        }
+    }
+
+    #[test]
+    fn access_pipeline_with_only_windows_becomes_a_direct_count() {
+        let pipeline = logical::AccessPipeline::new(
+            node_path(ir::NodeAccessPlan::AllScan),
+            ir::AtLeast::from_one_and_rest(
+                logical::StreamPipelineOp::Window {
+                    window: logical::AccessWindowRange::new(1, None).unwrap(),
+                },
+                vec![
+                    logical::StreamPipelineOp::Range {
+                        range: ir::StreamRangePlan::Literal(
+                            ir::StreamLiteralRange::new(2, 8).unwrap(),
+                        ),
+                    },
+                    logical::StreamPipelineOp::Order {
+                        ordering: ordering(),
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            plans(apply(
+                logical::RootStream::Access(logical::AccessStream::Pipeline(pipeline)),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ))
+            .as_slice(),
+            [exec::ExecCountPlan::NodeFullScan { .. }]
+        ));
+    }
+
+    #[test]
+    fn root_shape_matrix_uses_exact_scalar_row_and_runtime_dependencies() {
+        let access_root = || access(node_path(ir::NodeAccessPlan::AllScan));
+        let scalar_roots = [
+            logical::RootStream::Project(Box::new(logical::StreamProject::new(
+                access_root(),
+                ir::ProjectionPlan::Id,
+            ))),
+            logical::RootStream::Cardinality(Box::new(logical::StreamCardinality::new(
+                access_root(),
+            ))),
+            logical::RootStream::Aggregate(Box::new(logical::StreamAggregate::new(
+                access_root(),
+                ir::AggregatePlan::Group(name("status")),
+            ))),
+        ];
+        for root in scalar_roots {
+            assert!(matches!(
+                plans(apply(
+                    root,
+                    context::ParamBindings::default(),
+                    BTreeSet::new(),
+                ))
+                .as_slice(),
+                [exec::ExecCountPlan::InputScalars { .. }]
+            ));
+        }
+
+        assert!(matches!(
+            plans(apply(
+                logical::RootStream::VariableSource(logical::VariableSource::new(name("saved"))),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ))
+            .as_slice(),
+            [exec::ExecCountPlan::RuntimeInput { .. }]
+        ));
+        assert!(matches!(
+            plans(apply(
+                logical::RootStream::VariableWrite(Box::new(logical::StreamVariableWrite::new(
+                    access_root(),
+                    logical::StreamVariableWriteOp::Store(name("saved")),
+                ))),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ))
+            .as_slice(),
+            [exec::ExecCountPlan::InputRows { .. }]
+        ));
+    }
+
+    #[test]
+    fn root_pipelines_preserve_access_runtime_and_barrier_cursor_shapes() {
+        let pipeline = |input| {
+            logical::RootPipeline::new(
+                input,
+                ir::AtLeast::from_one(logical::StreamPipelineOp::Distinct),
+            )
+            .unwrap()
+        };
+        for (input, expected_dependency) in [
+            (
+                access(node_path(ir::NodeAccessPlan::AllScan)),
+                exec::ExecCountDependency::Direct,
+            ),
+            (
+                logical::RootStream::VariableSource(logical::VariableSource::new(name("saved"))),
+                exec::ExecCountDependency::Direct,
+            ),
+            (
+                logical::RootStream::Project(Box::new(logical::StreamProject::new(
+                    access(node_path(ir::NodeAccessPlan::AllScan)),
+                    ir::ProjectionPlan::Id,
+                ))),
+                exec::ExecCountDependency::Rows,
+            ),
+        ] {
+            let [plan] = plans(apply(
+                logical::RootStream::Pipeline(Box::new(pipeline(input))),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ))
+            .try_into()
+            .unwrap();
+            assert_eq!(plan.dependency().unwrap(), expected_dependency);
+        }
+
+        let write_pipeline = logical::RootPipeline::new(
+            access(node_path(ir::NodeAccessPlan::AllScan)),
+            ir::AtLeast::from_one(logical::StreamPipelineOp::VariableWrite {
+                op: logical::StreamVariableWriteOp::Store(name("saved")),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            plans(apply(
+                logical::RootStream::Pipeline(Box::new(write_pipeline)),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ))
+            .as_slice(),
+            [exec::ExecCountPlan::InputRows { .. }]
+        ));
+    }
+
+    #[test]
+    fn count_plan_cursor_and_cost_matrix_cover_every_physical_family() {
+        let mut direct = Vec::new();
+        for source in [
+            ir::NodeAccessPlan::Empty,
+            ir::NodeAccessPlan::PointIds { ids: element_ids() },
+            ir::NodeAccessPlan::FromParam {
+                param: name("nodes"),
+            },
+            ir::NodeAccessPlan::FromVar {
+                variable: name("nodes"),
+            },
+            ir::NodeAccessPlan::AllScan,
+            ir::NodeAccessPlan::LabelScan {
+                label: name("User"),
+            },
+            node_range_plan(),
+            node_vector_search(),
+            node_text_search(),
+        ] {
+            direct.extend(plans(apply(
+                access(node_path(source)),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            )));
+        }
+        for source in [
+            ir::EdgeAccessPlan::Empty,
+            ir::EdgeAccessPlan::PointIds { ids: element_ids() },
+            ir::EdgeAccessPlan::FromParam {
+                param: name("edges"),
+            },
+            ir::EdgeAccessPlan::FromVar {
+                variable: name("edges"),
+            },
+            ir::EdgeAccessPlan::AllScan,
+            ir::EdgeAccessPlan::LabelScan {
+                label: name("LIKES"),
+            },
+            edge_range_plan(),
+            edge_vector_search(),
+            edge_text_search(),
+        ] {
+            direct.extend(plans(apply(
+                access(edge_path(source)),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            )));
+        }
+        for (source, params, late) in [
+            (
+                access(node_path(node_equality(
+                    "node_eq:User:status",
+                    "status",
+                    literal(PropertyValue::from("active")),
+                    catalog::IndexUniqueness::NonUnique,
+                ))),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ),
+            (
+                access(node_path(node_equality(
+                    "node_eq:User:email",
+                    "email",
+                    literal(PropertyValue::from("alice@example.test")),
+                    catalog::IndexUniqueness::Unique,
+                ))),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ),
+            (
+                access(node_path(node_equality(
+                    "node_eq:User:status",
+                    "status",
+                    literal(PropertyValue::Null),
+                    catalog::IndexUniqueness::NonUnique,
+                ))),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ),
+            (
+                access(node_path(node_equality(
+                    "node_eq:User:status",
+                    "status",
+                    ir::IndexValue::Param(name("status")),
+                    catalog::IndexUniqueness::NonUnique,
+                ))),
+                context::ParamBindings::default(),
+                BTreeSet::from([name("status")]),
+            ),
+            (
+                access(edge_path(edge_equality(
+                    "edge_eq:LIKES:status",
+                    "status",
+                    literal(PropertyValue::from("active")),
+                ))),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ),
+            (
+                access(edge_path(edge_equality(
+                    "edge_eq:LIKES:status",
+                    "status",
+                    literal(PropertyValue::Null),
+                ))),
+                context::ParamBindings::default(),
+                BTreeSet::new(),
+            ),
+            (
+                access(edge_path(edge_equality(
+                    "edge_eq:LIKES:status",
+                    "status",
+                    ir::IndexValue::Param(name("status")),
+                ))),
+                context::ParamBindings::default(),
+                BTreeSet::from([name("status")]),
+            ),
+        ] {
+            direct.extend(plans(apply(source, params, late)));
+        }
+        direct.extend([
+            exec::ExecCountPlan::RuntimeInput {
+                input: exec::ExecRuntimeInputPlan::Variable(name("rows")),
+                window: exec::ExecCountWindowPlan::identity(),
+            },
+            exec::ExecCountPlan::InputRows {
+                window: exec::ExecCountWindowPlan::identity(),
+            },
+        ]);
+
+        let scalar_input = exec::ExecCountPlan::InputScalars {
+            window: exec::ExecCountWindowPlan::identity(),
+        };
+
+        let stats = context::StatsSnapshot::default()
+            .with_node_label_cardinality(name("User"), 17)
+            .with_edge_label_cardinality(name("LIKES"), 19)
+            .with_node_eq_cardinality(
+                catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                3,
+            )
+            .with_node_eq_cardinality(
+                catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
+                1,
+            )
+            .with_edge_eq_cardinality(
+                catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+                4,
+            )
+            .with_node_range_cardinality(
+                catalog::ScopedPropertyDirectionKey::try_new(
+                    "User",
+                    "age",
+                    RangeIndexDirection::Asc,
+                )
+                .unwrap(),
+                11,
+            )
+            .with_edge_range_cardinality(
+                catalog::ScopedPropertyDirectionKey::try_new(
+                    "LIKES",
+                    "age",
+                    RangeIndexDirection::Desc,
+                )
+                .unwrap(),
+                13,
+            );
+        let storage = cost::StorageCostProfile::default();
+        assert_eq!(
+            count_cost(&scalar_input, &stats, &storage),
+            count_cost(
+                &exec::ExecCountPlan::InputRows {
+                    window: exec::ExecCountWindowPlan::identity(),
+                },
+                &stats,
+                &storage,
+            )
+        );
+        let mut cursors = Vec::new();
+        let stream = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+            cursor: exec::ExecCountCursorPlan::NodeFullScan,
+            window: exec::ExecCountWindowPlan::identity(),
+        });
+        assert_eq!(
+            count_cost(&stream, &stats, &storage),
+            cursor_cost(&exec::ExecCountCursorPlan::NodeFullScan, &stats, &storage,)
+        );
+        cursors.push(count_plan_cursor(stream).unwrap());
+        for plan in direct {
+            let cost = count_cost(&plan, &stats, &storage);
+            assert_eq!(cost, count_cost(&plan, &stats, &storage));
+            cursors.push(count_plan_cursor(plan).unwrap());
+        }
+
+        let node_batch = exec::ExecNodeBitmapExpr::BatchedUnionRead {
+            index: catalog::NodeEqualityIndexMeta::new(name("node_eq:User:status"))
+                .try_into()
+                .unwrap(),
+            key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+            values: ir::AtLeast::from_pair(exec_indexed("active"), exec_indexed("inactive")),
+        };
+        let edge_batch = exec::ExecEdgeBitmapExpr::BatchedUnionRead {
+            index: exec::ExecEdgeNonUniqueEqualityIndex::new(catalog::EdgeEqualityIndexMeta::new(
+                name("edge_eq:LIKES:status"),
+            )),
+            key: catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+            values: ir::AtLeast::from_pair(exec_indexed("active"), exec_indexed("inactive")),
+        };
+        cursors.extend([
+            exec::ExecCountCursorPlan::NodeBitmap(exec::ExecNodeBitmapExpr::Union {
+                driver: Box::new(node_batch),
+                rest: ir::AtLeast::from_one(exec_node_point("pending")),
+            }),
+            exec::ExecCountCursorPlan::EdgeBitmap(exec::ExecEdgeBitmapExpr::Intersect {
+                driver: Box::new(edge_batch),
+                rest: ir::AtLeast::from_one(exec_edge_point("pending")),
+            }),
+            exec::ExecCountCursorPlan::EdgeBitmap(exec::ExecEdgeBitmapExpr::Union {
+                driver: Box::new(exec_edge_point("active")),
+                rest: ir::AtLeast::from_one(exec_edge_point("paused")),
+            }),
+            exec::ExecCountCursorPlan::Union {
+                driver: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::EdgeFullScan),
+            },
+            exec::ExecCountCursorPlan::Intersect {
+                driver: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::EdgeFullScan),
+            },
+            exec::ExecCountCursorPlan::Filter {
+                input: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                predicate: predicate(),
+            },
+            exec::ExecCountCursorPlan::Window {
+                input: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                window: exec::ExecCountWindowPlan::identity(),
+            },
+            exec::ExecCountCursorPlan::Order {
+                input: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                plan: ir::OrderPlan::ExplicitSort(ordering()),
+            },
+            exec::ExecCountCursorPlan::Expand {
+                input: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                plan: expand(),
+            },
+            exec::ExecCountCursorPlan::VectorSearch {
+                input: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                plan: restricted_vector(),
+            },
+            exec::ExecCountCursorPlan::TextSearch {
+                input: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                plan: restricted_text(),
+            },
+            exec::ExecCountCursorPlan::Variable {
+                input: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                op: logical::PureStreamVariableOp::Select(name("saved")),
+            },
+            exec::ExecCountCursorPlan::Distinct {
+                input: Box::new(exec::ExecCountCursorPlan::NodeFullScan),
+                plan: exec::ExecCountDistinctPlan::HashRows,
+            },
+            exec::ExecCountCursorPlan::NodeAuthoritativeScan(
+                exec::ExecNodeAuthoritativeScanPredicate::Predicate(predicate()),
+            ),
+            exec::ExecCountCursorPlan::EdgeAuthoritativeScan(
+                exec::ExecEdgeAuthoritativeScanPredicate::Predicate(predicate()),
+            ),
+        ]);
+        for cursor in cursors {
+            let cost = cursor_cost(&cursor, &stats, &storage);
+            assert_eq!(cost, cursor_cost(&cursor, &stats, &storage));
+        }
+
+        assert!(count_plan_cursor(exec::ExecCountPlan::Constant(1)).is_err());
+        assert!(count_plan_cursor(exec::ExecCountPlan::InputScalars {
+            window: exec::ExecCountWindowPlan::identity(),
+        })
+        .is_err());
     }
 }

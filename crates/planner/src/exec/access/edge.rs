@@ -80,25 +80,62 @@ impl ExecEdgeAccessPlan {
         key: catalog::ScopedPropertyKey,
         value: ir::IndexValue,
     ) -> Self {
-        match value {
-            ir::IndexValue::Literal(value) => match value.semantics() {
-                ir::EqualityIndexValueSemantics::Indexed => Self::Bitmap {
-                    bitmap: exec::ExecEdgeBitmapExpr::PointRead {
-                        index: exec::ExecEdgeNonUniqueEqualityIndex::new(index),
-                        key,
-                        value: exec::ExecIndexedEqualityValue::try_from(value)
-                            .expect("indexed equality semantics produce an executable value"),
-                    },
-                },
-                ir::EqualityIndexValueSemantics::AuthoritativeNull => Self::AuthoritativeScan {
-                    predicate: exec::ExecEdgeAuthoritativeScanPredicate::NullEquality { key },
-                },
-                ir::EqualityIndexValueSemantics::NonReflexive => Self::Empty,
-                ir::EqualityIndexValueSemantics::RuntimeDependent => {
-                    unreachable!("literal equality semantics are never runtime-dependent")
-                }
-            },
-            ir::IndexValue::Param(param) => Self::DynamicEquality { index, key, param },
+        exact_edge_equality(index, key, value).into()
+    }
+}
+
+pub(in crate::exec) enum ExecEdgeEqualityAccessPlan {
+    Empty,
+    Bitmap(exec::ExecEdgeBitmapExpr),
+    AuthoritativeScan(exec::ExecEdgeAuthoritativeScanPredicate),
+    DynamicEquality {
+        index: catalog::EdgeEqualityIndexMeta,
+        key: catalog::ScopedPropertyKey,
+        param: ir::NonEmptyString,
+    },
+}
+
+pub(in crate::exec) fn exact_edge_equality(
+    index: catalog::EdgeEqualityIndexMeta,
+    key: catalog::ScopedPropertyKey,
+    value: ir::IndexValue,
+) -> ExecEdgeEqualityAccessPlan {
+    match value {
+        ir::IndexValue::Literal(value) => match value.semantics() {
+            ir::LiteralEqualityIndexValueSemantics::Indexed => {
+                ExecEdgeEqualityAccessPlan::Bitmap(exec::ExecEdgeBitmapExpr::PointRead {
+                    index: exec::ExecEdgeNonUniqueEqualityIndex::new(index),
+                    key,
+                    value: exec::ExecIndexedEqualityValue::try_from(value)
+                        .expect("indexed equality semantics produce an executable value"),
+                })
+            }
+            ir::LiteralEqualityIndexValueSemantics::AuthoritativeNull => {
+                ExecEdgeEqualityAccessPlan::AuthoritativeScan(
+                    exec::ExecEdgeAuthoritativeScanPredicate::NullEquality { key },
+                )
+            }
+            ir::LiteralEqualityIndexValueSemantics::NonReflexive => {
+                ExecEdgeEqualityAccessPlan::Empty
+            }
+        },
+        ir::IndexValue::Param(param) => {
+            ExecEdgeEqualityAccessPlan::DynamicEquality { index, key, param }
+        }
+    }
+}
+
+impl From<ExecEdgeEqualityAccessPlan> for ExecEdgeAccessPlan {
+    fn from(plan: ExecEdgeEqualityAccessPlan) -> Self {
+        match plan {
+            ExecEdgeEqualityAccessPlan::Empty => Self::Empty,
+            ExecEdgeEqualityAccessPlan::Bitmap(bitmap) => Self::Bitmap { bitmap },
+            ExecEdgeEqualityAccessPlan::AuthoritativeScan(predicate) => {
+                Self::AuthoritativeScan { predicate }
+            }
+            ExecEdgeEqualityAccessPlan::DynamicEquality { index, key, param } => {
+                Self::DynamicEquality { index, key, param }
+            }
         }
     }
 }
@@ -170,68 +207,40 @@ impl ExecEdgeSecondarySetPlan {
     ) -> Self {
         let mut children = values
             .into_iter()
-            .map(|value| {
-                match ExecEdgeAccessPlan::exact_equality(index.clone(), key.clone(), value) {
-                    ExecEdgeAccessPlan::Empty => Self::Empty,
-                    ExecEdgeAccessPlan::Bitmap { bitmap } => Self::Bitmap(bitmap),
-                    ExecEdgeAccessPlan::AuthoritativeScan { predicate } => {
+            .map(
+                |value| match exact_edge_equality(index.clone(), key.clone(), value) {
+                    ExecEdgeEqualityAccessPlan::Empty => Self::Empty,
+                    ExecEdgeEqualityAccessPlan::Bitmap(bitmap) => Self::Bitmap(bitmap),
+                    ExecEdgeEqualityAccessPlan::AuthoritativeScan(predicate) => {
                         Self::AuthoritativeScan(predicate)
                     }
-                    ExecEdgeAccessPlan::DynamicEquality { index, key, param } => {
+                    ExecEdgeEqualityAccessPlan::DynamicEquality { index, key, param } => {
                         Self::DynamicEquality { index, key, param }
                     }
-                    ExecEdgeAccessPlan::FromParam { .. }
-                    | ExecEdgeAccessPlan::FromVar { .. }
-                    | ExecEdgeAccessPlan::AllScan
-                    | ExecEdgeAccessPlan::LabelScan { .. }
-                    | ExecEdgeAccessPlan::RangeIndex { .. }
-                    | ExecEdgeAccessPlan::SecondarySet { .. }
-                    | ExecEdgeAccessPlan::VectorSearch { .. }
-                    | ExecEdgeAccessPlan::TextSearch { .. } => {
-                        unreachable!("equality classification returns an equality variant")
-                    }
-                }
-            })
+                },
+            )
             .collect::<Vec<_>>();
-        if children.len() >= 2
-            && children.iter().all(|child| {
-                matches!(
-                    child,
-                    Self::Bitmap(exec::ExecEdgeBitmapExpr::PointRead {
-                        index: child_index,
-                        key: child_key,
-                        ..
-                    }) if matches!(
-                        &children[0],
-                        Self::Bitmap(exec::ExecEdgeBitmapExpr::PointRead {
-                            index: first_index,
-                            key: first_key,
-                            ..
-                        }) if child_index == first_index && child_key == first_key
-                    )
-                )
+        let batch = children
+            .iter()
+            .map(|child| match child {
+                Self::Bitmap(exec::ExecEdgeBitmapExpr::PointRead { index, key, value }) => {
+                    Some((index.clone(), key.clone(), value.clone()))
+                }
+                _ => None,
             })
-        {
-            let Self::Bitmap(exec::ExecEdgeBitmapExpr::PointRead { index, key, value }) =
-                children.remove(0)
-            else {
-                unreachable!("same-index batch starts with a point read")
-            };
-            let values = core::iter::once(value)
-                .chain(children.into_iter().map(|child| {
-                    let Self::Bitmap(exec::ExecEdgeBitmapExpr::PointRead { value, .. }) = child
-                    else {
-                        unreachable!("same-index batch contains only point reads")
-                    };
-                    value
-                }))
-                .collect::<Vec<_>>();
-            return Self::Bitmap(exec::ExecEdgeBitmapExpr::BatchedUnionRead {
-                index,
-                key,
-                values: ir::AtLeast::try_from_vec(values)
-                    .expect("same-index batch has at least two values"),
-            });
+            .collect::<Option<Vec<_>>>();
+        match batch {
+            Some(batch) if batch.len() >= 2 => {
+                let (index, key, _) = batch[0].clone();
+                let values = batch.into_iter().map(|(_, _, value)| value).collect();
+                return Self::Bitmap(exec::ExecEdgeBitmapExpr::BatchedUnionRead {
+                    index,
+                    key,
+                    values: ir::AtLeast::try_from_vec(values)
+                        .expect("same-index batch has at least two values"),
+                });
+            }
+            Some(_) | None => {}
         }
         let driver = children.remove(0);
         let Some(rest) = ir::AtLeast::try_from_vec(children) else {
