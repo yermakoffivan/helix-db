@@ -241,3 +241,43 @@ impl RangeIndexLiteral {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_cross_numeric_comparison_preserves_integer_boundaries() {
+        let exact_integer = RangeIndexLiteral::I64(9_007_199_254_740_992);
+        let next_integer = RangeIndexLiteral::I64(9_007_199_254_740_993);
+        let rounded_float = RangeIndexLiteral::F64(
+            RangeIndexF64::new(9_007_199_254_740_992.0).expect("finite test value"),
+        );
+
+        assert_eq!(
+            exact_integer.partial_cmp_same_type(&rounded_float),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            next_integer.partial_cmp_same_type(&rounded_float),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn signed_zero_is_equal_across_float_widths_but_datetime_is_not_numeric() {
+        let negative_zero =
+            RangeIndexLiteral::F32(RangeIndexF32::new(-0.0).expect("zero is not NaN"));
+        let positive_zero =
+            RangeIndexLiteral::F64(RangeIndexF64::new(0.0).expect("zero is not NaN"));
+
+        assert_eq!(
+            negative_zero.partial_cmp_same_type(&positive_zero),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            RangeIndexLiteral::DateTime(0).partial_cmp_same_type(&RangeIndexLiteral::I64(0)),
+            None
+        );
+    }
+}

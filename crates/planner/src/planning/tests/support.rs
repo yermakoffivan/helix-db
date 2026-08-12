@@ -214,6 +214,54 @@ pub(crate) fn unwrapped_first_exec_access(plan: &ExecutablePlan) -> &ExecAccessP
     }
 }
 
+pub(crate) fn assert_batched_node_equality_set(
+    plan: &ExecutablePlan,
+    label: &str,
+    property: &str,
+    value_count: usize,
+) {
+    assert!(matches!(
+        unwrapped_first_exec_access(plan),
+        ExecAccessPlan::Node(ExecNodeAccessPlan::SecondarySet {
+            set: crate::exec::ExecNodeSecondarySetPlan::Equality { key, values, .. }
+        }) if key.label == label && key.property == property && values.len() == value_count
+    ));
+}
+
+pub(crate) fn assert_batched_edge_equality_set(
+    plan: &ExecutablePlan,
+    label: &str,
+    property: &str,
+    value_count: usize,
+) {
+    assert!(matches!(
+        unwrapped_first_exec_access(plan),
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::SecondarySet {
+            set: crate::exec::ExecEdgeSecondarySetPlan::Equality { key, values, .. }
+        }) if key.label == label && key.property == property && values.len() == value_count
+    ));
+}
+
+pub(crate) fn assert_ordered_edge_secondary_intersection(
+    plan: &ExecutablePlan,
+    label: &str,
+    range_property: &str,
+    equality_property: &str,
+) {
+    assert!(matches!(
+        unwrapped_first_exec_access(plan),
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::SecondarySet {
+            set: crate::exec::ExecEdgeSecondarySetPlan::OrderedIntersect { driver, filters }
+        }) if driver.key.label == label
+            && driver.key.property == range_property
+            && filters.iter().any(|filter| matches!(
+                filter,
+                crate::exec::ExecEdgeSecondarySetPlan::Equality { key, .. }
+                    if key.label == label && key.property == equality_property
+            ))
+    ));
+}
+
 pub(crate) fn literal_exec_search_k(plan: &ExecutablePlan) -> usize {
     let SearchLimitPlan::Literal(k) = exec_search_k(plan) else {
         panic!(

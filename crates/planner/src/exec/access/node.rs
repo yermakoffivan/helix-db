@@ -34,6 +34,11 @@ pub enum ExecNodeAccessPlan {
         /// Range bounds.
         range: ir::IndexRange,
     },
+    /// V2-aware secondary-ID set evaluated before row materialization.
+    SecondarySet {
+        /// Logical secondary-index set contract.
+        set: ExecNodeSecondarySetPlan,
+    },
     /// Node vector search.
     VectorSearch {
         /// Search key.
@@ -55,5 +60,52 @@ pub enum ExecNodeAccessPlan {
         query_text: ir::TextQueryInputPlan,
         /// Result count.
         k: ir::SearchLimitPlan,
+    },
+}
+
+/// Executable node range leaf used directly or as an ordered intersection driver.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecNodeSecondaryRangePlan {
+    /// Logical index metadata.
+    pub index: catalog::NodeRangeIndexMeta,
+    /// Indexed property and physical direction capability.
+    pub key: catalog::ScopedPropertyDirectionKey,
+    /// Logical range bounds.
+    pub range: ir::IndexRange,
+}
+
+/// V2-aware node secondary-ID set.
+///
+/// Raw physical keys, index IDs, generations, and tenant scope are deliberately
+/// absent. The database resolves those details from the request-authorized
+/// Active index catalog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecNodeSecondarySetPlan {
+    /// Statically empty set, including non-reflexive NaN equality.
+    Empty,
+    /// One or more values for the same equality index. Multiple values are a
+    /// union and may be served as one close-key batch.
+    Equality {
+        /// Logical index metadata.
+        index: catalog::NodeEqualityIndexMeta,
+        /// Indexed property.
+        key: catalog::ScopedPropertyKey,
+        /// Non-empty lookup values.
+        values: ir::AtLeast<ir::IndexValue, 1>,
+    },
+    /// Generation-qualified range scan resolved by the database.
+    Range(ExecNodeSecondaryRangePlan),
+    /// Unordered set intersection.
+    Intersect(ir::AtLeast<ExecNodeSecondarySetPlan, 2>),
+    /// Set union.
+    Union(ir::AtLeast<ExecNodeSecondarySetPlan, 2>),
+    /// Range-ordered intersection. Filters are fully applied before a limit may
+    /// consume the ordered result.
+    OrderedIntersect {
+        /// Range scan that defines result order.
+        driver: ExecNodeSecondaryRangePlan,
+        /// Non-empty secondary filters applied to driver IDs.
+        filters: ir::AtLeast<ExecNodeSecondarySetPlan, 1>,
     },
 }

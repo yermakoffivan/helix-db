@@ -268,6 +268,9 @@ impl<'a> Analyzer<'a> {
                             .range_index_scans
                             .saturating_add(1);
                     }
+                    exec::ExecNodeAccessPlan::SecondarySet { set } => {
+                        self.analyze_node_secondary_set(set);
+                    }
                     exec::ExecNodeAccessPlan::VectorSearch { .. } => {
                         self.statistics.node_accesses.vector_searches = self
                             .statistics
@@ -318,6 +321,9 @@ impl<'a> Analyzer<'a> {
                             .range_index_scans
                             .saturating_add(1);
                     }
+                    exec::ExecEdgeAccessPlan::SecondarySet { set } => {
+                        self.analyze_edge_secondary_set(set);
+                    }
                     exec::ExecEdgeAccessPlan::VectorSearch { .. } => {
                         self.statistics.edge_accesses.vector_searches = self
                             .statistics
@@ -339,6 +345,92 @@ impl<'a> Analyzer<'a> {
             }
             exec::ExecAccessPlan::Limited(limited) => {
                 self.analyze_access_leaf(limited.source(), true);
+            }
+        }
+    }
+
+    fn analyze_node_secondary_set(&mut self, set: &exec::ExecNodeSecondarySetPlan) {
+        match set {
+            exec::ExecNodeSecondarySetPlan::Empty => {}
+            exec::ExecNodeSecondarySetPlan::Equality { values, .. } => {
+                self.statistics.node_accesses.equality_index_lookups = self
+                    .statistics
+                    .node_accesses
+                    .equality_index_lookups
+                    .saturating_add(values.len());
+            }
+            exec::ExecNodeSecondarySetPlan::Range(_) => {
+                self.statistics.node_accesses.range_index_scans = self
+                    .statistics
+                    .node_accesses
+                    .range_index_scans
+                    .saturating_add(1);
+            }
+            exec::ExecNodeSecondarySetPlan::Intersect(children) => {
+                self.statistics.intersections = self.statistics.intersections.saturating_add(1);
+                children
+                    .iter()
+                    .for_each(|child| self.analyze_node_secondary_set(child));
+            }
+            exec::ExecNodeSecondarySetPlan::Union(children) => {
+                self.statistics.unions = self.statistics.unions.saturating_add(1);
+                children
+                    .iter()
+                    .for_each(|child| self.analyze_node_secondary_set(child));
+            }
+            exec::ExecNodeSecondarySetPlan::OrderedIntersect { filters, .. } => {
+                self.statistics.intersections = self.statistics.intersections.saturating_add(1);
+                self.statistics.node_accesses.range_index_scans = self
+                    .statistics
+                    .node_accesses
+                    .range_index_scans
+                    .saturating_add(1);
+                filters
+                    .iter()
+                    .for_each(|filter| self.analyze_node_secondary_set(filter));
+            }
+        }
+    }
+
+    fn analyze_edge_secondary_set(&mut self, set: &exec::ExecEdgeSecondarySetPlan) {
+        match set {
+            exec::ExecEdgeSecondarySetPlan::Empty => {}
+            exec::ExecEdgeSecondarySetPlan::Equality { values, .. } => {
+                self.statistics.edge_accesses.equality_index_lookups = self
+                    .statistics
+                    .edge_accesses
+                    .equality_index_lookups
+                    .saturating_add(values.len());
+            }
+            exec::ExecEdgeSecondarySetPlan::Range(_) => {
+                self.statistics.edge_accesses.range_index_scans = self
+                    .statistics
+                    .edge_accesses
+                    .range_index_scans
+                    .saturating_add(1);
+            }
+            exec::ExecEdgeSecondarySetPlan::Intersect(children) => {
+                self.statistics.intersections = self.statistics.intersections.saturating_add(1);
+                children
+                    .iter()
+                    .for_each(|child| self.analyze_edge_secondary_set(child));
+            }
+            exec::ExecEdgeSecondarySetPlan::Union(children) => {
+                self.statistics.unions = self.statistics.unions.saturating_add(1);
+                children
+                    .iter()
+                    .for_each(|child| self.analyze_edge_secondary_set(child));
+            }
+            exec::ExecEdgeSecondarySetPlan::OrderedIntersect { filters, .. } => {
+                self.statistics.intersections = self.statistics.intersections.saturating_add(1);
+                self.statistics.edge_accesses.range_index_scans = self
+                    .statistics
+                    .edge_accesses
+                    .range_index_scans
+                    .saturating_add(1);
+                filters
+                    .iter()
+                    .for_each(|filter| self.analyze_edge_secondary_set(filter));
             }
         }
     }
@@ -736,6 +828,7 @@ fn unbounded_access_scope(access: &exec::ExecAccessPlan) -> Option<AccessScope> 
             | exec::ExecNodeAccessPlan::FromVar { .. }
             | exec::ExecNodeAccessPlan::EqualityIndex { .. }
             | exec::ExecNodeAccessPlan::RangeIndex { .. }
+            | exec::ExecNodeAccessPlan::SecondarySet { .. }
             | exec::ExecNodeAccessPlan::VectorSearch { .. }
             | exec::ExecNodeAccessPlan::TextSearch { .. },
         )
@@ -745,6 +838,7 @@ fn unbounded_access_scope(access: &exec::ExecAccessPlan) -> Option<AccessScope> 
             | exec::ExecEdgeAccessPlan::FromVar { .. }
             | exec::ExecEdgeAccessPlan::EqualityIndex { .. }
             | exec::ExecEdgeAccessPlan::RangeIndex { .. }
+            | exec::ExecEdgeAccessPlan::SecondarySet { .. }
             | exec::ExecEdgeAccessPlan::VectorSearch { .. }
             | exec::ExecEdgeAccessPlan::TextSearch { .. },
         )
@@ -777,7 +871,8 @@ fn scope_for_access(access: &exec::ExecAccessPlan) -> Option<AccessScope> {
             exec::ExecNodeAccessPlan::AllScan
             | exec::ExecNodeAccessPlan::LabelScan { .. }
             | exec::ExecNodeAccessPlan::EqualityIndex { .. }
-            | exec::ExecNodeAccessPlan::RangeIndex { .. },
+            | exec::ExecNodeAccessPlan::RangeIndex { .. }
+            | exec::ExecNodeAccessPlan::SecondarySet { .. },
         ) => Some(AccessScope {
             element: catalog::ElementKind::Node,
             label: node_access_label(access).cloned(),
@@ -786,7 +881,8 @@ fn scope_for_access(access: &exec::ExecAccessPlan) -> Option<AccessScope> {
             exec::ExecEdgeAccessPlan::AllScan
             | exec::ExecEdgeAccessPlan::LabelScan { .. }
             | exec::ExecEdgeAccessPlan::EqualityIndex { .. }
-            | exec::ExecEdgeAccessPlan::RangeIndex { .. },
+            | exec::ExecEdgeAccessPlan::RangeIndex { .. }
+            | exec::ExecEdgeAccessPlan::SecondarySet { .. },
         ) => Some(AccessScope {
             element: catalog::ElementKind::Edge,
             label: edge_access_label(access).cloned(),
@@ -816,6 +912,7 @@ fn node_access_label(access: &exec::ExecAccessPlan) -> Option<&ir::NonEmptyStrin
         exec::ExecNodeAccessPlan::LabelScan { label } => Some(label),
         exec::ExecNodeAccessPlan::EqualityIndex { key, .. } => Some(&key.label),
         exec::ExecNodeAccessPlan::RangeIndex { key, .. } => Some(&key.label),
+        exec::ExecNodeAccessPlan::SecondarySet { set } => node_secondary_set_label(set),
         exec::ExecNodeAccessPlan::Empty
         | exec::ExecNodeAccessPlan::FromParam { .. }
         | exec::ExecNodeAccessPlan::FromVar { .. }
@@ -833,12 +930,47 @@ fn edge_access_label(access: &exec::ExecAccessPlan) -> Option<&ir::NonEmptyStrin
         exec::ExecEdgeAccessPlan::LabelScan { label } => Some(label),
         exec::ExecEdgeAccessPlan::EqualityIndex { key, .. } => Some(&key.label),
         exec::ExecEdgeAccessPlan::RangeIndex { key, .. } => Some(&key.label),
+        exec::ExecEdgeAccessPlan::SecondarySet { set } => edge_secondary_set_label(set),
         exec::ExecEdgeAccessPlan::Empty
         | exec::ExecEdgeAccessPlan::FromParam { .. }
         | exec::ExecEdgeAccessPlan::FromVar { .. }
         | exec::ExecEdgeAccessPlan::AllScan
         | exec::ExecEdgeAccessPlan::VectorSearch { .. }
         | exec::ExecEdgeAccessPlan::TextSearch { .. } => None,
+    }
+}
+
+fn node_secondary_set_label(set: &exec::ExecNodeSecondarySetPlan) -> Option<&ir::NonEmptyString> {
+    match set {
+        exec::ExecNodeSecondarySetPlan::Empty => None,
+        exec::ExecNodeSecondarySetPlan::Equality { key, .. } => Some(&key.label),
+        exec::ExecNodeSecondarySetPlan::Range(range)
+        | exec::ExecNodeSecondarySetPlan::OrderedIntersect { driver: range, .. } => {
+            Some(&range.key.label)
+        }
+        exec::ExecNodeSecondarySetPlan::Intersect(children)
+        | exec::ExecNodeSecondarySetPlan::Union(children) => {
+            let mut labels = children.iter().filter_map(node_secondary_set_label);
+            let first = labels.next()?;
+            labels.all(|label| label == first).then_some(first)
+        }
+    }
+}
+
+fn edge_secondary_set_label(set: &exec::ExecEdgeSecondarySetPlan) -> Option<&ir::NonEmptyString> {
+    match set {
+        exec::ExecEdgeSecondarySetPlan::Empty => None,
+        exec::ExecEdgeSecondarySetPlan::Equality { key, .. } => Some(&key.label),
+        exec::ExecEdgeSecondarySetPlan::Range(range)
+        | exec::ExecEdgeSecondarySetPlan::OrderedIntersect { driver: range, .. } => {
+            Some(&range.key.label)
+        }
+        exec::ExecEdgeSecondarySetPlan::Intersect(children)
+        | exec::ExecEdgeSecondarySetPlan::Union(children) => {
+            let mut labels = children.iter().filter_map(edge_secondary_set_label);
+            let first = labels.next()?;
+            labels.all(|label| label == first).then_some(first)
+        }
     }
 }
 

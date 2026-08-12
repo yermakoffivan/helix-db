@@ -23,14 +23,15 @@ pub(in crate::exec) use self::lowering::{
 };
 pub(in crate::exec) use self::lowering::{
     edge_access_cost, edge_access_delivered_properties, edge_access_hard_upper_bound,
-    edge_exec_access, element_point_delivered_properties, expand_delivered_properties,
-    filtered_delivered_properties, followup_exec_condition, foreach_subplan_cost,
-    initial_exec_condition, limit_delivered_properties, materialized_delivered_properties,
-    node_access_cost, node_access_delivered_properties, node_access_hard_upper_bound,
-    node_exec_access, ordered_delivered_properties, predicate_cost_for_rows,
-    preserve_barrier_effect, project_schedule, range_delivered_properties, reserved_schedule,
-    skip_delivered_properties, stream_bound_literal, stream_range_literal_bounds,
-    ExecutableDagBuilder, SimpleEdgeAccessLeaf, SimpleNodeAccessLeaf, StepDraft,
+    edge_exec_access, edge_secondary_set, element_point_delivered_properties,
+    expand_delivered_properties, filtered_delivered_properties, followup_exec_condition,
+    foreach_subplan_cost, initial_exec_condition, limit_delivered_properties,
+    materialized_delivered_properties, node_access_cost, node_access_delivered_properties,
+    node_access_hard_upper_bound, node_exec_access, node_secondary_set,
+    ordered_delivered_properties, predicate_cost_for_rows, preserve_barrier_effect,
+    project_schedule, range_delivered_properties, reserved_schedule, skip_delivered_properties,
+    stream_bound_literal, stream_range_literal_bounds, ExecutableDagBuilder, SimpleEdgeAccessLeaf,
+    SimpleNodeAccessLeaf, StepDraft,
 };
 pub use self::metrics::PlannerMetrics;
 pub use self::op::*;

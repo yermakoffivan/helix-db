@@ -728,21 +728,7 @@ fn cascades_chosen_access_matrix_proves_index_set_families() {
     );
     assert_selected_root_family(&node_union, "alternative");
     assert_selected_rule(&node_union, KnownRuleId::SeedAccessPath);
-    assert!(
-        node_union.steps().iter().any(
-            |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Union)
-        ),
-        "missing union merge in plan: {:?}",
-        node_union.steps()
-    );
-    assert_eq!(
-        access_steps_matching(&node_union, |access| matches!(
-            access,
-            ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
-                if key.label == "User" && key.property == "username"
-        )),
-        2
-    );
+    assert_batched_node_equality_set(&node_union, "User", "username", 2);
     assert_no_exec_op_family(&node_union, ExecOpFamily::Filter);
     assert_no_exec_op_family(&node_union, ExecOpFamily::Order);
     assert_no_exec_window(&node_union);
@@ -759,36 +745,7 @@ fn cascades_chosen_access_matrix_proves_index_set_families() {
     );
     assert_selected_root_family(&edge_intersection, "alternative");
     assert_selected_rule(&edge_intersection, KnownRuleId::SeedAccessPath);
-    assert!(
-        edge_intersection.steps().iter().any(
-            |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Intersect)
-        ),
-        "missing intersect merge in plan: {:?}",
-        edge_intersection.steps()
-    );
-    assert_eq!(
-        access_steps_matching(&edge_intersection, |access| matches!(
-            access,
-            ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
-                if key.label == "FOLLOWS" && key.property == "status"
-        )),
-        1
-    );
-    assert_eq!(
-        access_steps_matching(&edge_intersection, |access| matches!(
-            access,
-            ExecAccessPlan::Edge(ExecEdgeAccessPlan::RangeIndex { key, range, .. })
-                if key.label == "FOLLOWS"
-                    && key.property == "weight"
-                    && matches!(
-                        range,
-                        IndexRange::Upper {
-                            upper: IndexBound::Exclusive(_)
-                        }
-                    )
-        )),
-        1
-    );
+    assert_ordered_edge_secondary_intersection(&edge_intersection, "FOLLOWS", "weight", "status");
     assert_no_exec_op_family(&edge_intersection, ExecOpFamily::Filter);
     assert_no_exec_op_family(&edge_intersection, ExecOpFamily::Order);
     assert_no_exec_window(&edge_intersection);
@@ -810,24 +767,11 @@ fn cascades_index_set_limits_remain_semantic_after_set_merges() {
         ctx(indexes.clone()),
     );
     assert_access_window_selected(&limited_node_union);
-    assert!(
-        limited_node_union.steps().iter().any(
-            |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Union)
-        ),
-        "missing union merge in plan: {:?}",
-        limited_node_union.steps()
-    );
-    assert_eq!(
-        access_steps_matching(&limited_node_union, |access| matches!(
-            access,
-            ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
-                if key.label == "User" && key.property == "username"
-        )),
-        2
-    );
+    assert_batched_node_equality_set(&limited_node_union, "User", "username", 2);
     assert_no_exec_op_family(&limited_node_union, ExecOpFamily::Filter);
     assert_no_exec_op_family(&limited_node_union, ExecOpFamily::Order);
-    assert_retained_static_prefix_window(&limited_node_union, 1);
+    assert_eq!(first_limited_access_limit(&limited_node_union), Some(1));
+    assert_no_exec_op_family(&limited_node_union, ExecOpFamily::Limit);
 
     let limited_edge_intersection = executable_traversal(
         g().e_with_label_where(
@@ -841,32 +785,19 @@ fn cascades_index_set_limits_remain_semantic_after_set_merges() {
         ctx(indexes),
     );
     assert_access_window_selected(&limited_edge_intersection);
-    assert!(
-        limited_edge_intersection.steps().iter().any(
-            |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Intersect)
-        ),
-        "missing intersect merge in plan: {:?}",
-        limited_edge_intersection.steps()
-    );
-    assert_eq!(
-        access_steps_matching(&limited_edge_intersection, |access| matches!(
-            access,
-            ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
-                if key.label == "FOLLOWS" && key.property == "status"
-        )),
-        1
-    );
-    assert_eq!(
-        access_steps_matching(&limited_edge_intersection, |access| matches!(
-            access,
-            ExecAccessPlan::Edge(ExecEdgeAccessPlan::RangeIndex { key, .. })
-                if key.label == "FOLLOWS" && key.property == "weight"
-        )),
-        1
+    assert_ordered_edge_secondary_intersection(
+        &limited_edge_intersection,
+        "FOLLOWS",
+        "weight",
+        "status",
     );
     assert_no_exec_op_family(&limited_edge_intersection, ExecOpFamily::Filter);
     assert_no_exec_op_family(&limited_edge_intersection, ExecOpFamily::Order);
-    assert_retained_static_prefix_window(&limited_edge_intersection, 1);
+    assert_eq!(
+        first_limited_access_limit(&limited_edge_intersection),
+        Some(1)
+    );
+    assert_no_exec_op_family(&limited_edge_intersection, ExecOpFamily::Limit);
 }
 
 #[test]
@@ -885,19 +816,9 @@ fn cascades_index_set_ranges_push_end_caps_and_keep_range_suffixes() {
         ctx(indexes.clone()),
     );
     assert_access_window_selected(&ranged_node_union);
-    assert!(
-        ranged_node_union.steps().iter().any(
-            |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Union)
-        ),
-        "missing union merge in plan: {:?}",
-        ranged_node_union.steps()
-    );
-    assert!(matches!(
-        first_exec_op(&ranged_node_union, |op| matches!(op, ExecOp::Limit { .. })),
-        ExecOp::Limit {
-            count: StreamBoundPlan::Literal(2),
-        }
-    ));
+    assert_batched_node_equality_set(&ranged_node_union, "User", "username", 2);
+    assert_eq!(first_limited_access_limit(&ranged_node_union), Some(2));
+    assert_no_exec_op_family(&ranged_node_union, ExecOpFamily::Limit);
     assert_exec_range(&ranged_node_union, 1, 2);
     assert_no_exec_op_family(&ranged_node_union, ExecOpFamily::Filter);
     assert_no_exec_op_family(&ranged_node_union, ExecOpFamily::Order);
@@ -914,22 +835,17 @@ fn cascades_index_set_ranges_push_end_caps_and_keep_range_suffixes() {
         ctx(indexes),
     );
     assert_access_window_selected(&ranged_edge_intersection);
-    assert!(
-        ranged_edge_intersection.steps().iter().any(
-            |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Intersect)
-        ),
-        "missing intersect merge in plan: {:?}",
-        ranged_edge_intersection.steps()
+    assert_ordered_edge_secondary_intersection(
+        &ranged_edge_intersection,
+        "FOLLOWS",
+        "weight",
+        "status",
     );
-    assert!(matches!(
-        first_exec_op(&ranged_edge_intersection, |op| matches!(
-            op,
-            ExecOp::Limit { .. }
-        )),
-        ExecOp::Limit {
-            count: StreamBoundPlan::Literal(2),
-        }
-    ));
+    assert_eq!(
+        first_limited_access_limit(&ranged_edge_intersection),
+        Some(2)
+    );
+    assert_no_exec_op_family(&ranged_edge_intersection, ExecOpFamily::Limit);
     assert_exec_range(&ranged_edge_intersection, 1, 2);
     assert_no_exec_op_family(&ranged_edge_intersection, ExecOpFamily::Filter);
     assert_no_exec_op_family(&ranged_edge_intersection, ExecOpFamily::Order);
@@ -954,13 +870,7 @@ fn cascades_index_set_dynamic_ranges_remain_downstream_runtime_bounds() {
         ctx(indexes.clone()),
     );
     assert_selected_root_family(&dynamic_node_union, "alternative");
-    assert!(
-        dynamic_node_union.steps().iter().any(
-            |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Union)
-        ),
-        "missing union merge in plan: {:?}",
-        dynamic_node_union.steps()
-    );
+    assert_batched_node_equality_set(&dynamic_node_union, "User", "username", 2);
     assert!(matches!(
         first_exec_op(&dynamic_node_union, |op| matches!(op, ExecOp::Range { .. })),
         ExecOp::Range {
@@ -986,12 +896,11 @@ fn cascades_index_set_dynamic_ranges_remain_downstream_runtime_bounds() {
         ctx(indexes),
     );
     assert_selected_root_family(&dynamic_edge_intersection, "alternative");
-    assert!(
-        dynamic_edge_intersection.steps().iter().any(
-            |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Intersect)
-        ),
-        "missing intersect merge in plan: {:?}",
-        dynamic_edge_intersection.steps()
+    assert_ordered_edge_secondary_intersection(
+        &dynamic_edge_intersection,
+        "FOLLOWS",
+        "weight",
+        "status",
     );
     assert!(matches!(
         first_exec_op(&dynamic_edge_intersection, |op| matches!(

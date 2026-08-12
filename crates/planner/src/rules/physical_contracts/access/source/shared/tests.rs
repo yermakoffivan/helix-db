@@ -37,10 +37,12 @@ impl AccessSourceFamily for TestFamily {
             TestPlan::UniqueEquality(key) => AccessSourceParts::EqualityIndex {
                 key,
                 kind: EqualityIndexKind::Unique,
+                semantics: ir::EqualityIndexValueSemantics::Indexed,
             },
             TestPlan::NonUniqueEquality(key) => AccessSourceParts::EqualityIndex {
                 key,
                 kind: EqualityIndexKind::NonUnique,
+                semantics: ir::EqualityIndexValueSemantics::Indexed,
             },
             TestPlan::Range(key) => AccessSourceParts::RangeIndex { key },
             TestPlan::Search(k) => AccessSourceParts::VectorSearch { k },
@@ -136,7 +138,8 @@ fn set_and_filter_contracts_reuse_shared_child_costs() {
     assert_eq!(
         filtered.cost,
         storage
-            .range_scan(range_rows)
+            .secondary_range_lookup(range_rows)
+            .serial(storage.secondary_row_materialization(range_rows))
             .serial(storage.predicate_eval(range_rows))
     );
     assert_eq!(

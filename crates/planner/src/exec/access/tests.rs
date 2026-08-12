@@ -57,3 +57,52 @@ fn access_read_limit_elides_when_access_hard_upper_is_tighter() {
         ExecAccessReadLimit::Unbounded
     );
 }
+
+#[test]
+fn secondary_set_wire_contract_round_trips_logical_identity_only() {
+    let key = crate::catalog::ScopedPropertyKey::try_new("User", "name").unwrap();
+    let values = crate::ir::AtLeast::<_, 1>::try_from_vec(vec![
+        crate::ir::IndexValue::Literal(
+            crate::ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::from("alice"))
+                .unwrap(),
+        ),
+        crate::ir::IndexValue::Literal(
+            crate::ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::from("bob"))
+                .unwrap(),
+        ),
+    ])
+    .unwrap();
+    let access = ExecAccessPlan::Node(ExecNodeAccessPlan::SecondarySet {
+        set: ExecNodeSecondarySetPlan::Equality {
+            index: crate::catalog::NodeEqualityIndexMeta::try_new("user_name").unwrap(),
+            key,
+            values,
+        },
+    });
+
+    let json = serde_json::to_string(&access).unwrap();
+    assert!(!json.contains("generation"));
+    assert!(!json.contains("physical"));
+    assert_eq!(
+        serde_json::from_str::<ExecAccessPlan>(&json).unwrap(),
+        access
+    );
+}
+
+#[test]
+fn legacy_equality_access_remains_deserializable() {
+    let access = ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex {
+        index: crate::catalog::EdgeEqualityIndexMeta::try_new("follows_status").unwrap(),
+        key: crate::catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+        value: crate::ir::IndexValue::Literal(
+            crate::ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::from("active"))
+                .unwrap(),
+        ),
+    });
+
+    let json = serde_json::to_string(&access).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ExecAccessPlan>(&json).unwrap(),
+        access
+    );
+}

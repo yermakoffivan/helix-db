@@ -10,26 +10,7 @@ fn cascades_index_union_branch_limit_selects_union_at_limit() {
     );
     assert_selected_root_family(&node_union, "alternative");
     assert_selected_rule(&node_union, KnownRuleId::SeedAccessPath);
-    assert_eq!(
-        node_union
-            .steps()
-            .iter()
-            .filter(
-                |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Union)
-            )
-            .count(),
-        1,
-        "expected one union merge in plan: {:?}",
-        node_union.steps()
-    );
-    assert_eq!(
-        access_steps_matching(&node_union, |access| matches!(
-            access,
-            ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
-                if key.label == "User" && key.property == "username"
-        )),
-        2
-    );
+    assert_batched_node_equality_set(&node_union, "User", "username", 2);
     assert_no_exec_op_family(&node_union, ExecOpFamily::Filter);
     assert_no_exec_op_family(&node_union, ExecOpFamily::Order);
     assert_no_exec_window(&node_union);
@@ -43,26 +24,7 @@ fn cascades_index_union_branch_limit_selects_union_at_limit() {
     );
     assert_selected_root_family(&edge_union, "alternative");
     assert_selected_rule(&edge_union, KnownRuleId::SeedAccessPath);
-    assert_eq!(
-        edge_union
-            .steps()
-            .iter()
-            .filter(
-                |step| matches!(&step.op, ExecOp::Merge { mode } if *mode == ExecMergeMode::Union)
-            )
-            .count(),
-        1,
-        "expected one union merge in plan: {:?}",
-        edge_union.steps()
-    );
-    assert_eq!(
-        access_steps_matching(&edge_union, |access| matches!(
-            access,
-            ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
-                if key.label == "FOLLOWS" && key.property == "status"
-        )),
-        2
-    );
+    assert_batched_edge_equality_set(&edge_union, "FOLLOWS", "status", 2);
     assert_no_exec_op_family(&edge_union, ExecOpFamily::Filter);
     assert_no_exec_op_family(&edge_union, ExecOpFamily::Order);
     assert_no_exec_window(&edge_union);

@@ -13,6 +13,7 @@ pub(in crate::rules) enum AccessSourceParts<'a, Plan> {
     EqualityIndex {
         key: &'a catalog::ScopedPropertyKey,
         kind: EqualityIndexKind,
+        semantics: ir::EqualityIndexValueSemantics,
     },
     RangeIndex {
         key: &'a catalog::ScopedPropertyDirectionKey,

@@ -8,9 +8,9 @@ mod edge;
 mod limited;
 mod node;
 
-pub use edge::ExecEdgeAccessPlan;
+pub use edge::{ExecEdgeAccessPlan, ExecEdgeSecondaryRangePlan, ExecEdgeSecondarySetPlan};
 pub use limited::{ExecAccessPlan, ExecAccessReadLimit, ExecLimitedAccessPlan};
-pub use node::ExecNodeAccessPlan;
+pub use node::{ExecNodeAccessPlan, ExecNodeSecondaryRangePlan, ExecNodeSecondarySetPlan};
 
 #[cfg(test)]
 mod tests;

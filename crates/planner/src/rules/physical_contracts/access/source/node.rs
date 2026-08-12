@@ -41,13 +41,14 @@ impl shared::AccessSourceFamily for NodeAccessFamily {
             ir::NodeAccessPlan::LabelScan { label } => {
                 shared::AccessSourceParts::LabelScan { label }
             }
-            ir::NodeAccessPlan::EqualityIndex { index, key, .. } => {
+            ir::NodeAccessPlan::EqualityIndex { index, key, value } => {
                 shared::AccessSourceParts::EqualityIndex {
                     key,
                     kind: match index.uniqueness {
                         catalog::IndexUniqueness::Unique => shared::EqualityIndexKind::Unique,
                         catalog::IndexUniqueness::NonUnique => shared::EqualityIndexKind::NonUnique,
                     },
+                    semantics: value.semantics(),
                 }
             }
             ir::NodeAccessPlan::RangeIndex { key, .. } => {
