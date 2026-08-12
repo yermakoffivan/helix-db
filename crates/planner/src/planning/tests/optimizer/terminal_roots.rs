@@ -235,7 +235,7 @@ fn assert_indexed_user_access(plan: &ExecutablePlan) {
     assert!(
         matches!(
             unwrapped_first_exec_access(plan),
-            ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+            ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
                 if key.label == "User" && key.property == "username"
         ),
         "expected User.username equality access, got {:?}",

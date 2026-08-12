@@ -5180,15 +5180,19 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
         )
         .expect("secondary-set execution plan validates")
     };
-    let node_equality =
-        |property: &str, values: &[&str]| exec::ExecNodeSecondarySetPlan::Equality {
-            index: catalog::NodeEqualityIndexMeta::try_new(format!(
-                "production_node_equality_{property}"
-            ))
-            .expect("logical node equality index name is non-empty"),
-            key: catalog::ScopedPropertyKey::try_new("Document", property)
+    let node_equality = |property: &str, values: &[&str]| {
+        let index = catalog::NodeEqualityIndexMeta::try_new(format!("node_eq:Document:{property}"))
+            .expect("logical node equality index name is non-empty")
+            .with_uniqueness(if property == "code" {
+                catalog::IndexUniqueness::Unique
+            } else {
+                catalog::IndexUniqueness::NonUnique
+            });
+        exec::ExecNodeSecondarySetPlan::exact_equalities(
+            index,
+            catalog::ScopedPropertyKey::try_new("Document", property)
                 .expect("logical node equality key validates"),
-            values: ir::AtLeast::try_from_vec(
+            ir::AtLeast::try_from_vec(
                 values
                     .iter()
                     .map(|value| {
@@ -5200,16 +5204,15 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
                     .collect(),
             )
             .expect("node equality set has at least one value"),
-        };
-    let edge_equality =
-        |property: &str, values: &[&str]| exec::ExecEdgeSecondarySetPlan::Equality {
-            index: catalog::EdgeEqualityIndexMeta::try_new(format!(
-                "production_edge_equality_{property}"
-            ))
-            .expect("logical edge equality index name is non-empty"),
-            key: catalog::ScopedPropertyKey::try_new("LINK", property)
+        )
+    };
+    let edge_equality = |property: &str, values: &[&str]| {
+        exec::ExecEdgeSecondarySetPlan::exact_equalities(
+            catalog::EdgeEqualityIndexMeta::try_new(format!("edge_eq:LINK:{property}"))
+                .expect("logical edge equality index name is non-empty"),
+            catalog::ScopedPropertyKey::try_new("LINK", property)
                 .expect("logical edge equality key validates"),
-            values: ir::AtLeast::try_from_vec(
+            ir::AtLeast::try_from_vec(
                 values
                     .iter()
                     .map(|value| {
@@ -5221,9 +5224,10 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
                     .collect(),
             )
             .expect("edge equality set has at least one value"),
-        };
+        )
+    };
     let node_range = || exec::ExecNodeSecondaryRangePlan {
-        index: catalog::NodeRangeIndexMeta::try_new("production_node_range_rank")
+        index: catalog::NodeRangeIndexMeta::try_new("node_range:Document:rank:asc")
             .expect("logical node range index name is non-empty"),
         key: catalog::ScopedPropertyDirectionKey::try_new(
             "Document",
@@ -5234,7 +5238,7 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
         range: ir::IndexRange::All,
     };
     let edge_range = || exec::ExecEdgeSecondaryRangePlan {
-        index: catalog::EdgeRangeIndexMeta::try_new("production_edge_range_weight")
+        index: catalog::EdgeRangeIndexMeta::try_new("edge_range:LINK:weight:desc")
             .expect("logical edge range index name is non-empty"),
         key: catalog::ScopedPropertyDirectionKey::try_new(
             "LINK",
@@ -5257,17 +5261,17 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
             node_ids(&[0, 1, 2]),
         ),
         (
-            exec::ExecNodeSecondarySetPlan::Union(ir::AtLeast::from_pair(
-                node_equality("category", &["other"]),
-                node_equality("code", &["B"]),
-            )),
+            exec::ExecNodeSecondarySetPlan::Union {
+                driver: Box::new(node_equality("category", &["other"])),
+                rest: ir::AtLeast::from_one(node_equality("code", &["B"])),
+            },
             node_ids(&[1, 2]),
         ),
         (
-            exec::ExecNodeSecondarySetPlan::Intersect(ir::AtLeast::from_pair(
-                node_equality("category", &["group"]),
-                node_equality("code", &["B"]),
-            )),
+            exec::ExecNodeSecondarySetPlan::Intersect {
+                driver: Box::new(node_equality("category", &["group"])),
+                rest: ir::AtLeast::from_one(node_equality("code", &["B"])),
+            },
             node_ids(&[1]),
         ),
         (
@@ -5311,17 +5315,17 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
             edge_ids(&[0, 1, 2]),
         ),
         (
-            exec::ExecEdgeSecondarySetPlan::Union(ir::AtLeast::from_pair(
-                edge_equality("kind", &["primary"]),
-                edge_equality("status", &["active"]),
-            )),
+            exec::ExecEdgeSecondarySetPlan::Union {
+                driver: Box::new(edge_equality("kind", &["primary"])),
+                rest: ir::AtLeast::from_one(edge_equality("status", &["active"])),
+            },
             edge_ids(&[0, 1, 2]),
         ),
         (
-            exec::ExecEdgeSecondarySetPlan::Intersect(ir::AtLeast::from_pair(
-                edge_equality("kind", &["primary"]),
-                edge_equality("status", &["active"]),
-            )),
+            exec::ExecEdgeSecondarySetPlan::Intersect {
+                driver: Box::new(edge_equality("kind", &["primary"])),
+                rest: ir::AtLeast::from_one(edge_equality("status", &["active"])),
+            },
             edge_ids(&[0]),
         ),
         (

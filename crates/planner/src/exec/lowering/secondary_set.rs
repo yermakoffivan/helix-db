@@ -10,15 +10,37 @@ pub(in crate::exec) fn node_secondary_set(
 ) -> Option<exec::ExecNodeSecondarySetPlan> {
     match plan {
         ir::NodeAccessPlan::Empty => Some(exec::ExecNodeSecondarySetPlan::Empty),
-        ir::NodeAccessPlan::EqualityIndex { index, key, value } => {
-            if value.semantics() == ir::EqualityIndexValueSemantics::NonReflexive {
-                return Some(exec::ExecNodeSecondarySetPlan::Empty);
+        ir::NodeAccessPlan::EqualityIndex { .. } => {
+            let leaf = exec::node_exec_access(exec::SimpleNodeAccessLeaf::try_from(plan).ok()?);
+            match leaf {
+                exec::ExecNodeAccessPlan::Empty => Some(exec::ExecNodeSecondarySetPlan::Empty),
+                exec::ExecNodeAccessPlan::Bitmap { bitmap } => {
+                    Some(exec::ExecNodeSecondarySetPlan::Bitmap(bitmap))
+                }
+                exec::ExecNodeAccessPlan::Unique {
+                    lookup,
+                    verification,
+                } => Some(exec::ExecNodeSecondarySetPlan::Unique {
+                    lookup,
+                    verification,
+                }),
+                exec::ExecNodeAccessPlan::AuthoritativeScan { predicate } => {
+                    Some(exec::ExecNodeSecondarySetPlan::AuthoritativeScan(predicate))
+                }
+                exec::ExecNodeAccessPlan::DynamicEquality { index, key, param } => {
+                    Some(exec::ExecNodeSecondarySetPlan::DynamicEquality { index, key, param })
+                }
+                exec::ExecNodeAccessPlan::FromParam { .. }
+                | exec::ExecNodeAccessPlan::FromVar { .. }
+                | exec::ExecNodeAccessPlan::AllScan
+                | exec::ExecNodeAccessPlan::LabelScan { .. }
+                | exec::ExecNodeAccessPlan::RangeIndex { .. }
+                | exec::ExecNodeAccessPlan::SecondarySet { .. }
+                | exec::ExecNodeAccessPlan::VectorSearch { .. }
+                | exec::ExecNodeAccessPlan::TextSearch { .. } => {
+                    unreachable!("equality leaf lowering returns an equality executable variant")
+                }
             }
-            Some(exec::ExecNodeSecondarySetPlan::Equality {
-                index: index.clone(),
-                key: key.clone(),
-                values: ir::AtLeast::from_one(value.clone()),
-            })
         }
         ir::NodeAccessPlan::RangeIndex { index, key, range } => Some(
             exec::ExecNodeSecondarySetPlan::Range(exec::ExecNodeSecondaryRangePlan {
@@ -57,15 +79,30 @@ pub(in crate::exec) fn edge_secondary_set(
 ) -> Option<exec::ExecEdgeSecondarySetPlan> {
     match plan {
         ir::EdgeAccessPlan::Empty => Some(exec::ExecEdgeSecondarySetPlan::Empty),
-        ir::EdgeAccessPlan::EqualityIndex { index, key, value } => {
-            if value.semantics() == ir::EqualityIndexValueSemantics::NonReflexive {
-                return Some(exec::ExecEdgeSecondarySetPlan::Empty);
+        ir::EdgeAccessPlan::EqualityIndex { .. } => {
+            let leaf = exec::edge_exec_access(exec::SimpleEdgeAccessLeaf::try_from(plan).ok()?);
+            match leaf {
+                exec::ExecEdgeAccessPlan::Empty => Some(exec::ExecEdgeSecondarySetPlan::Empty),
+                exec::ExecEdgeAccessPlan::Bitmap { bitmap } => {
+                    Some(exec::ExecEdgeSecondarySetPlan::Bitmap(bitmap))
+                }
+                exec::ExecEdgeAccessPlan::AuthoritativeScan { predicate } => {
+                    Some(exec::ExecEdgeSecondarySetPlan::AuthoritativeScan(predicate))
+                }
+                exec::ExecEdgeAccessPlan::DynamicEquality { index, key, param } => {
+                    Some(exec::ExecEdgeSecondarySetPlan::DynamicEquality { index, key, param })
+                }
+                exec::ExecEdgeAccessPlan::FromParam { .. }
+                | exec::ExecEdgeAccessPlan::FromVar { .. }
+                | exec::ExecEdgeAccessPlan::AllScan
+                | exec::ExecEdgeAccessPlan::LabelScan { .. }
+                | exec::ExecEdgeAccessPlan::RangeIndex { .. }
+                | exec::ExecEdgeAccessPlan::SecondarySet { .. }
+                | exec::ExecEdgeAccessPlan::VectorSearch { .. }
+                | exec::ExecEdgeAccessPlan::TextSearch { .. } => {
+                    unreachable!("equality leaf lowering returns an equality executable variant")
+                }
             }
-            Some(exec::ExecEdgeSecondarySetPlan::Equality {
-                index: index.clone(),
-                key: key.clone(),
-                values: ir::AtLeast::from_one(value.clone()),
-            })
         }
         ir::EdgeAccessPlan::RangeIndex { index, key, range } => Some(
             exec::ExecEdgeSecondarySetPlan::Range(exec::ExecEdgeSecondaryRangePlan {
@@ -105,7 +142,9 @@ fn node_union(
     let mut flattened = children
         .into_iter()
         .flat_map(|child| match child {
-            exec::ExecNodeSecondarySetPlan::Union(children) => children.into_iter().collect(),
+            exec::ExecNodeSecondarySetPlan::Union { driver, rest } => {
+                core::iter::once(*driver).chain(rest).collect()
+            }
             child => vec![child],
         })
         .filter(|child| !matches!(child, exec::ExecNodeSecondarySetPlan::Empty))
@@ -117,40 +156,49 @@ fn node_union(
             let batch = flattened.iter().all(|child| {
                 matches!(
                     child,
-                    exec::ExecNodeSecondarySetPlan::Equality { index, key, .. }
-                        if matches!(&flattened[0], exec::ExecNodeSecondarySetPlan::Equality {
+                    exec::ExecNodeSecondarySetPlan::Bitmap(exec::ExecNodeBitmapExpr::PointRead { index, key, .. })
+                        if matches!(&flattened[0], exec::ExecNodeSecondarySetPlan::Bitmap(exec::ExecNodeBitmapExpr::PointRead {
                             index: first_index,
                             key: first_key,
                             ..
-                        } if index == first_index && key == first_key)
+                        }) if index == first_index && key == first_key)
                 )
             });
             if batch {
-                let exec::ExecNodeSecondarySetPlan::Equality { index, key, values } =
-                    flattened.remove(0)
+                let exec::ExecNodeSecondarySetPlan::Bitmap(exec::ExecNodeBitmapExpr::PointRead {
+                    index,
+                    key,
+                    value,
+                }) = flattened.remove(0)
                 else {
                     unreachable!("batched node union contains equality leaves")
                 };
-                let values = values
-                    .into_iter()
-                    .chain(flattened.into_iter().flat_map(|child| {
-                        let exec::ExecNodeSecondarySetPlan::Equality { values, .. } = child else {
+                let values = core::iter::once(value)
+                    .chain(flattened.into_iter().map(|child| {
+                        let exec::ExecNodeSecondarySetPlan::Bitmap(
+                            exec::ExecNodeBitmapExpr::PointRead { value, .. },
+                        ) = child
+                        else {
                             unreachable!("batched node union contains equality leaves")
                         };
-                        values
+                        value
                     }))
                     .collect::<Vec<_>>();
-                return Some(exec::ExecNodeSecondarySetPlan::Equality {
-                    index,
-                    key,
-                    values: ir::AtLeast::try_from_vec(values)
-                        .expect("batched equality union remains non-empty"),
-                });
+                return Some(exec::ExecNodeSecondarySetPlan::Bitmap(
+                    exec::ExecNodeBitmapExpr::BatchedUnionRead {
+                        index,
+                        key,
+                        values: ir::AtLeast::try_from_vec(values)
+                            .expect("batched equality union has at least two values"),
+                    },
+                ));
             }
-            Some(exec::ExecNodeSecondarySetPlan::Union(
-                ir::AtLeast::try_from_vec(flattened)
-                    .expect("multi-child node union has at least two children"),
-            ))
+            let driver = flattened.remove(0);
+            Some(exec::ExecNodeSecondarySetPlan::Union {
+                driver: Box::new(driver),
+                rest: ir::AtLeast::try_from_vec(flattened)
+                    .expect("multi-child node union leaves at least one child"),
+            })
         }
     }
 }
@@ -161,7 +209,9 @@ fn edge_union(
     let mut flattened = children
         .into_iter()
         .flat_map(|child| match child {
-            exec::ExecEdgeSecondarySetPlan::Union(children) => children.into_iter().collect(),
+            exec::ExecEdgeSecondarySetPlan::Union { driver, rest } => {
+                core::iter::once(*driver).chain(rest).collect()
+            }
             child => vec![child],
         })
         .filter(|child| !matches!(child, exec::ExecEdgeSecondarySetPlan::Empty))
@@ -173,40 +223,49 @@ fn edge_union(
             let batch = flattened.iter().all(|child| {
                 matches!(
                     child,
-                    exec::ExecEdgeSecondarySetPlan::Equality { index, key, .. }
-                        if matches!(&flattened[0], exec::ExecEdgeSecondarySetPlan::Equality {
+                    exec::ExecEdgeSecondarySetPlan::Bitmap(exec::ExecEdgeBitmapExpr::PointRead { index, key, .. })
+                        if matches!(&flattened[0], exec::ExecEdgeSecondarySetPlan::Bitmap(exec::ExecEdgeBitmapExpr::PointRead {
                             index: first_index,
                             key: first_key,
                             ..
-                        } if index == first_index && key == first_key)
+                        }) if index == first_index && key == first_key)
                 )
             });
             if batch {
-                let exec::ExecEdgeSecondarySetPlan::Equality { index, key, values } =
-                    flattened.remove(0)
+                let exec::ExecEdgeSecondarySetPlan::Bitmap(exec::ExecEdgeBitmapExpr::PointRead {
+                    index,
+                    key,
+                    value,
+                }) = flattened.remove(0)
                 else {
                     unreachable!("batched edge union contains equality leaves")
                 };
-                let values = values
-                    .into_iter()
-                    .chain(flattened.into_iter().flat_map(|child| {
-                        let exec::ExecEdgeSecondarySetPlan::Equality { values, .. } = child else {
+                let values = core::iter::once(value)
+                    .chain(flattened.into_iter().map(|child| {
+                        let exec::ExecEdgeSecondarySetPlan::Bitmap(
+                            exec::ExecEdgeBitmapExpr::PointRead { value, .. },
+                        ) = child
+                        else {
                             unreachable!("batched edge union contains equality leaves")
                         };
-                        values
+                        value
                     }))
                     .collect::<Vec<_>>();
-                return Some(exec::ExecEdgeSecondarySetPlan::Equality {
-                    index,
-                    key,
-                    values: ir::AtLeast::try_from_vec(values)
-                        .expect("batched equality union remains non-empty"),
-                });
+                return Some(exec::ExecEdgeSecondarySetPlan::Bitmap(
+                    exec::ExecEdgeBitmapExpr::BatchedUnionRead {
+                        index,
+                        key,
+                        values: ir::AtLeast::try_from_vec(values)
+                            .expect("batched equality union has at least two values"),
+                    },
+                ));
             }
-            Some(exec::ExecEdgeSecondarySetPlan::Union(
-                ir::AtLeast::try_from_vec(flattened)
-                    .expect("multi-child edge union has at least two children"),
-            ))
+            let driver = flattened.remove(0);
+            Some(exec::ExecEdgeSecondarySetPlan::Union {
+                driver: Box::new(driver),
+                rest: ir::AtLeast::try_from_vec(flattened)
+                    .expect("multi-child edge union leaves at least one child"),
+            })
         }
     }
 }
@@ -233,10 +292,12 @@ fn node_intersection(
                 .expect("logical intersection leaves at least one filter"),
         });
     }
-    Some(exec::ExecNodeSecondarySetPlan::Intersect(
-        ir::AtLeast::try_from_vec(children)
-            .expect("logical node intersection has at least two children"),
-    ))
+    let driver = children.remove(0);
+    Some(exec::ExecNodeSecondarySetPlan::Intersect {
+        driver: Box::new(driver),
+        rest: ir::AtLeast::try_from_vec(children)
+            .expect("logical node intersection leaves at least one child"),
+    })
 }
 
 fn edge_intersection(
@@ -261,10 +322,12 @@ fn edge_intersection(
                 .expect("logical intersection leaves at least one filter"),
         });
     }
-    Some(exec::ExecEdgeSecondarySetPlan::Intersect(
-        ir::AtLeast::try_from_vec(children)
-            .expect("logical edge intersection has at least two children"),
-    ))
+    let driver = children.remove(0);
+    Some(exec::ExecEdgeSecondarySetPlan::Intersect {
+        driver: Box::new(driver),
+        rest: ir::AtLeast::try_from_vec(children)
+            .expect("logical edge intersection leaves at least one child"),
+    })
 }
 
 #[cfg(test)]
@@ -303,7 +366,9 @@ mod tests {
 
         assert!(matches!(
             node_secondary_set(&plan),
-            Some(exec::ExecNodeSecondarySetPlan::Equality { key, values, .. })
+            Some(exec::ExecNodeSecondarySetPlan::Bitmap(
+                exec::ExecNodeBitmapExpr::BatchedUnionRead { key, values, .. }
+            ))
                 if key.property == "name" && values.len() == 2
         ));
     }

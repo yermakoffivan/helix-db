@@ -100,6 +100,21 @@ pub(super) fn equality_index_contract(
     input: EqualityIndexContractInput<'_>,
     storage: &cost::StorageCostProfile,
 ) -> AccessPhysicalContract {
+    let access = match (input.semantics, input.kind) {
+        (ir::EqualityIndexValueSemantics::NonReflexive, _) => physical::PhysicalAccess::Empty,
+        (ir::EqualityIndexValueSemantics::Indexed, EqualityIndexKind::Unique) => {
+            physical::PhysicalAccess::EqualityUniqueVerified
+        }
+        (ir::EqualityIndexValueSemantics::Indexed, EqualityIndexKind::NonUnique) => {
+            physical::PhysicalAccess::EqualityBitmapPoint
+        }
+        (ir::EqualityIndexValueSemantics::AuthoritativeNull, _) => {
+            physical::PhysicalAccess::EqualityAuthoritativeScan
+        }
+        (ir::EqualityIndexValueSemantics::RuntimeDependent, _) => {
+            physical::PhysicalAccess::EqualityDynamic
+        }
+    };
     let rows = match input.semantics {
         ir::EqualityIndexValueSemantics::NonReflexive => cost::EstimatedRows::ZERO,
         ir::EqualityIndexValueSemantics::Indexed
@@ -121,15 +136,23 @@ pub(super) fn equality_index_contract(
             EqualityIndexKind::NonUnique => storage.bitmap_equality_lookup(rows),
         },
     };
+    let cardinality = match input.semantics {
+        ir::EqualityIndexValueSemantics::NonReflexive => properties::CardinalityBounds::exact(0),
+        ir::EqualityIndexValueSemantics::Indexed => equality_cardinality(input.kind),
+        ir::EqualityIndexValueSemantics::AuthoritativeNull
+        | ir::EqualityIndexValueSemantics::RuntimeDependent => {
+            properties::CardinalityBounds::unknown()
+        }
+    };
     let delivered = with_key_locality(
-        access_delivered_with(input.element, equality_cardinality(input.kind)),
+        access_delivered_with(input.element, cardinality),
         properties::KeyLocality::Close,
     );
     if input.kind == EqualityIndexKind::NonUnique
         && input.semantics == ir::EqualityIndexValueSemantics::Indexed
     {
         AccessPhysicalContract::new_batchable_equality(
-            physical::PhysicalAccess::EqualityIndex,
+            access,
             delivered,
             id_cost,
             storage.secondary_row_materialization(rows),
@@ -139,7 +162,7 @@ pub(super) fn equality_index_contract(
         )
     } else {
         AccessPhysicalContract::new_secondary(
-            physical::PhysicalAccess::EqualityIndex,
+            access,
             delivered,
             id_cost,
             storage.secondary_row_materialization(rows),

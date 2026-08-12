@@ -649,20 +649,20 @@ fn equality_search_plan(ordinal: usize) -> exec::ExecutablePlan {
                 Vec::new(),
                 exec::ExecOp::Access {
                     plan: Box::new(exec::ExecAccessPlan::Node(
-                        exec::ExecNodeAccessPlan::EqualityIndex {
-                            index: catalog::NodeEqualityIndexMeta::new(name(&format!(
+                        exec::ExecNodeAccessPlan::exact_equality(
+                            catalog::NodeEqualityIndexMeta::new(name(&format!(
                                 "node_eq:{LABEL}:{}",
                                 property_name(ordinal)
                             ))),
-                            key: catalog::ScopedPropertyKey::try_new(LABEL, property_name(ordinal))
+                            catalog::ScopedPropertyKey::try_new(LABEL, property_name(ordinal))
                                 .expect("hot-path equality key is valid"),
-                            value: ir::IndexValue::Literal(
+                            ir::IndexValue::Literal(
                                 ir::SecondaryIndexLiteral::new(PlannerPropertyValue::String(
                                     SHARED_VALUE.to_string(),
                                 ))
                                 .expect("hot-path equality value is indexable"),
                             ),
-                        },
+                        ),
                     )),
                 },
             ),

@@ -53,7 +53,7 @@ fn access_path_rule_delivers_index_ordering_cardinality_and_locality() {
     assert!(matches!(
         equality.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::EqualityIndex,
+            access: physical::PhysicalAccess::EqualityUniqueVerified,
             ..
         }
     ));
@@ -71,4 +71,73 @@ fn access_path_rule_delivers_index_ordering_cardinality_and_locality() {
             ..
         }
     ));
+}
+
+#[test]
+fn access_path_rule_selects_every_exact_equality_physical_family() {
+    let rule = AccessPathImplementationRule::default();
+    let storage = cost::StorageCostProfile::default();
+    let key = catalog::ScopedPropertyKey::try_new("User", "status").unwrap();
+    let index = catalog::NodeEqualityIndexMeta::try_new("node_eq:User:status").unwrap();
+    let physical = |value: ir::IndexValue, index: catalog::NodeEqualityIndexMeta| {
+        let expr = node_access_expr(ir::NodeAccessPlan::EqualityIndex {
+            index,
+            key: key.clone(),
+            value,
+        });
+        let alternative = physical_alternative(rule.apply(optimizer::RuleInput {
+            expr: &expr,
+            storage: &storage,
+            indexes: empty_indexes(),
+            planner_limits: default_planner_limits(),
+            stats: default_stats(),
+        }));
+        let physical::PhysicalExpr::Access { access, .. } = alternative.expr else {
+            panic!("equality implementation must be an access alternative")
+        };
+        (access, alternative.delivered.cardinality)
+    };
+
+    let indexed = ir::IndexValue::Literal(
+        ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::from("active")).unwrap(),
+    );
+    assert_eq!(
+        physical(indexed.clone(), index.clone()).0,
+        physical::PhysicalAccess::EqualityBitmapPoint
+    );
+    assert_eq!(
+        physical(
+            indexed,
+            index
+                .clone()
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+        )
+        .0,
+        physical::PhysicalAccess::EqualityUniqueVerified
+    );
+    let (null, null_cardinality) = physical(
+        ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::Null).unwrap(),
+        ),
+        index.clone(),
+    );
+    assert_eq!(null, physical::PhysicalAccess::EqualityAuthoritativeScan);
+    assert_eq!(null_cardinality, properties::CardinalityBounds::unknown());
+    let (nan, nan_cardinality) = physical(
+        ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::F64(f64::NAN)).unwrap(),
+        ),
+        index.clone(),
+    );
+    assert_eq!(nan, physical::PhysicalAccess::Empty);
+    assert_eq!(nan_cardinality, properties::CardinalityBounds::exact(0));
+    let (dynamic, dynamic_cardinality) = physical(
+        ir::IndexValue::Param(name("late_status")),
+        index.with_uniqueness(catalog::IndexUniqueness::Unique),
+    );
+    assert_eq!(dynamic, physical::PhysicalAccess::EqualityDynamic);
+    assert_eq!(
+        dynamic_cardinality,
+        properties::CardinalityBounds::unknown()
+    );
 }

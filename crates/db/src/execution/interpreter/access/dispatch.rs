@@ -5,10 +5,10 @@
 //! extraction, index lookups, range scans, and search reads stay in sibling
 //! access modules so the planner-facing dispatch remains small.
 
-use helix_planner::{exec, properties};
+use helix_planner::{exec, ir, properties};
 
 use super::super::{ExecutionContext, ExecutionValue};
-use super::indexes::{limited_index_ids, scoped_property_key};
+use super::indexes::limited_index_ids;
 use super::search::SearchReadLimit;
 use crate::config::{TextElementType, VectorElementType};
 use crate::error::Result;
@@ -70,11 +70,56 @@ impl<'db> ExecutionContext<'db> {
                 .await?,
                 limit,
             ),
-            exec::ExecNodeAccessPlan::EqualityIndex { key, value, .. } => {
-                let value = self.index_value(value)?;
+            exec::ExecNodeAccessPlan::Bitmap { bitmap } => {
+                let ids = limited_index_ids(self.node_bitmap(bitmap).await?, limit);
+                return self.verified_node_rows(ids);
+            }
+            exec::ExecNodeAccessPlan::Unique {
+                lookup,
+                verification,
+            } => {
+                let ids = self
+                    .verified_node_unique_owner(lookup, verification)
+                    .await?
+                    .into_iter()
+                    .collect();
+                return self.verified_node_rows(ids);
+            }
+            exec::ExecNodeAccessPlan::AuthoritativeScan { predicate } => {
+                let ids = self
+                    .scan_element_ids(exec::ElementKeyspace::NodeProperty, None)
+                    .await?;
+                let mut rows = Vec::new();
+                for id in ids {
+                    let row =
+                        super::super::ExecutionRow::current(super::super::ElementRef::Node(id));
+                    let matches = match predicate {
+                        exec::ExecNodeAuthoritativeScanPredicate::NullEquality { key } => {
+                            self.scoped_null_matches(&row, key).await?
+                        }
+                        exec::ExecNodeAuthoritativeScanPredicate::Predicate(predicate) => {
+                            self.eval_predicate(&row, predicate.predicate()).await?
+                        }
+                    };
+                    if matches {
+                        rows.push(row);
+                        if limit.is_some_and(|limit| rows.len() >= limit.get()) {
+                            break;
+                        }
+                    }
+                }
+                return Ok(ExecutionValue::Stream(rows));
+            }
+            exec::ExecNodeAccessPlan::DynamicEquality { index, key, param } => {
+                super::super::count::validate_node_equality_index(&index.index_id, key)?;
+                let value = self.index_value(&ir::IndexValue::Param(param.clone()))?;
                 let ids = limited_index_ids(
-                    self.lookup_equality_index_set(&scoped_property_key(key), &value)
-                        .await?,
+                    self.lookup_managed_equality_union(
+                        crate::index_lifecycle::IndexElementKind::Node,
+                        key,
+                        core::slice::from_ref(&value),
+                    )
+                    .await?,
                     limit,
                 );
                 return self.verified_node_rows(ids);
@@ -148,11 +193,45 @@ impl<'db> ExecutionContext<'db> {
                 self.lookup_global_edge_label_index(label.as_ref()).await?,
                 limit,
             ),
-            exec::ExecEdgeAccessPlan::EqualityIndex { key, value, .. } => {
-                let value = self.index_value(value)?;
+            exec::ExecEdgeAccessPlan::Bitmap { bitmap } => {
+                let ids = limited_index_ids(self.edge_bitmap(bitmap).await?, limit);
+                return self.verified_edge_rows(ids);
+            }
+            exec::ExecEdgeAccessPlan::AuthoritativeScan { predicate } => {
+                let ids = self
+                    .scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None)
+                    .await?;
+                let mut rows = Vec::new();
+                for id in ids {
+                    let row =
+                        super::super::ExecutionRow::current(super::super::ElementRef::Edge(id));
+                    let matches = match predicate {
+                        exec::ExecEdgeAuthoritativeScanPredicate::NullEquality { key } => {
+                            self.scoped_null_matches(&row, key).await?
+                        }
+                        exec::ExecEdgeAuthoritativeScanPredicate::Predicate(predicate) => {
+                            self.eval_predicate(&row, predicate.predicate()).await?
+                        }
+                    };
+                    if matches {
+                        rows.push(row);
+                        if limit.is_some_and(|limit| rows.len() >= limit.get()) {
+                            break;
+                        }
+                    }
+                }
+                return Ok(ExecutionValue::Stream(rows));
+            }
+            exec::ExecEdgeAccessPlan::DynamicEquality { index, key, param } => {
+                super::super::count::validate_edge_equality_index(&index.index_id, key)?;
+                let value = self.index_value(&ir::IndexValue::Param(param.clone()))?;
                 let ids = limited_index_ids(
-                    self.lookup_global_edge_equality_index(&scoped_property_key(key), &value)
-                        .await?,
+                    self.lookup_managed_equality_union(
+                        crate::index_lifecycle::IndexElementKind::Edge,
+                        key,
+                        core::slice::from_ref(&value),
+                    )
+                    .await?,
                     limit,
                 );
                 return self.verified_edge_rows(ids);
@@ -311,19 +390,20 @@ mod tests {
         let other = test_support::add_node_with_properties(&db, "User", Vec::new()).await;
         let edge = test_support::add_edge(&db, user, other, "KNOWS").await;
         let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        execution.enable_request_read_view().await.unwrap();
         let edge_variable = test_support::name("edge");
         execution.variables.insert(
             edge_variable.clone(),
             ExecutionValue::Stream(vec![ExecutionRow::current(ElementRef::Edge(edge))]),
         );
 
-        let node_equality = exec::ExecAccessPlan::Node(exec::ExecNodeAccessPlan::EqualityIndex {
-            index: catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq")),
-            key: catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
-            value: ir::IndexValue::Literal(
+        let node_equality = exec::ExecAccessPlan::Node(exec::ExecNodeAccessPlan::exact_equality(
+            catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:User:email")),
+            catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
+            ir::IndexValue::Literal(
                 ir::SecondaryIndexLiteral::new(PropertyValue::from("alice@example.com")).unwrap(),
             ),
-        });
+        ));
         assert_eq!(
             execution.execute_access(&node_equality).await.unwrap(),
             ExecutionValue::Stream(vec![ExecutionRow::current(ElementRef::Node(user))])
@@ -356,5 +436,6 @@ mod tests {
                 ExecutionValue::Stream(expected)
             );
         }
+        execution.close_request_read_view().unwrap();
     }
 }

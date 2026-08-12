@@ -54,7 +54,7 @@ fn cascades_index_union_branch_limit_keeps_residual_filter_above_limit() {
     assert_eq!(
         access_steps_matching(&plan, |access| matches!(
             access,
-            ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+            ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
                 if key.label == "User" && key.property == "username"
         )),
         0,
@@ -104,7 +104,7 @@ fn cascades_index_union_branch_limit_disabled_keeps_residual_filter() {
     assert_eq!(
         access_steps_matching(&plan, |access| matches!(
             access,
-            ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
+            ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap { bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. } })
                 if key.label == "FOLLOWS" && key.property == "status"
         )),
         0,

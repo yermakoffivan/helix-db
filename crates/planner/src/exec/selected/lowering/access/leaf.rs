@@ -55,12 +55,16 @@ impl ExecutableDagBuilder<'_> {
             physical::PhysicalAccess::Empty
             | physical::PhysicalAccess::RuntimeInput
             | physical::PhysicalAccess::LabelScan
-            | physical::PhysicalAccess::EqualityIndex
+            | physical::PhysicalAccess::EqualityBitmapPoint
+            | physical::PhysicalAccess::EqualityUniqueVerified
+            | physical::PhysicalAccess::EqualityAuthoritativeScan
+            | physical::PhysicalAccess::EqualityDynamic
             | physical::PhysicalAccess::RangeIndex
             | physical::PhysicalAccess::VectorSearch
             | physical::PhysicalAccess::TextSearch
             | physical::PhysicalAccess::SetIntersection
             | physical::PhysicalAccess::SetUnion
+            | physical::PhysicalAccess::BitmapBatchUnion
             | physical::PhysicalAccess::Expand => self
                 .push_selected_node_access_plan_with_read_limit(
                     plan,
@@ -125,12 +129,16 @@ impl ExecutableDagBuilder<'_> {
             physical::PhysicalAccess::Empty
             | physical::PhysicalAccess::RuntimeInput
             | physical::PhysicalAccess::LabelScan
-            | physical::PhysicalAccess::EqualityIndex
+            | physical::PhysicalAccess::EqualityBitmapPoint
+            | physical::PhysicalAccess::EqualityUniqueVerified
+            | physical::PhysicalAccess::EqualityAuthoritativeScan
+            | physical::PhysicalAccess::EqualityDynamic
             | physical::PhysicalAccess::RangeIndex
             | physical::PhysicalAccess::VectorSearch
             | physical::PhysicalAccess::TextSearch
             | physical::PhysicalAccess::SetIntersection
             | physical::PhysicalAccess::SetUnion
+            | physical::PhysicalAccess::BitmapBatchUnion
             | physical::PhysicalAccess::Expand => self
                 .push_selected_edge_access_plan_with_read_limit(
                     plan,

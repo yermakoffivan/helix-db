@@ -125,6 +125,13 @@ pub(crate) fn record_equality_point_read() {
     BENCHMARK_POINT_READS.fetch_add(1, AtomicOrdering::Relaxed);
 }
 
+/// Records one authoritative graph read requested by an exact equality plan.
+#[inline]
+pub(crate) fn record_equality_graph_read() {
+    #[cfg(any(test, feature = "production-coverage"))]
+    BENCHMARK_GRAPH_READS.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
 /// Family driver sharing the lifecycle scope gate.
 pub(crate) struct SecondaryIndexDriver {
     scope_gates: Arc<IndexScopeGates>,
@@ -2896,6 +2903,59 @@ pub(crate) async fn lookup_active_equality_generation(
         })
         .transpose()
         .map(Option::unwrap_or_default)
+}
+
+/// Executes one planner-selected indexed equality point read without choosing
+/// or performing authoritative verification.
+///
+/// The caller has already selected the unique or bitmap lane. This primitive
+/// validates that the literal is physically indexable, performs exactly one
+/// storage point read, and parses only the selected lane's value format.
+pub(crate) async fn lookup_active_equality_point_literal(
+    reader: &(impl DbReadOps + Sync),
+    handle: &ActiveIndexHandle,
+    value: &PropertyValue,
+) -> Result<roaring::RoaringTreemap> {
+    let Some(definition) = handle.secondary_definition() else {
+        return Err(corruption(
+            "literal equality point read received a non-secondary Active handle",
+        ));
+    };
+    if !matches!(
+        definition,
+        ValidatedSecondaryIndexDefinition::NodeEquality { .. }
+            | ValidatedSecondaryIndexDefinition::EdgeEquality { .. }
+    ) {
+        return Err(corruption(
+            "literal equality point read received a range definition",
+        ));
+    }
+    let EqualityValueProjection::Indexed(value) = project_equality_value(value) else {
+        return Err(corruption(
+            "literal equality point read received a non-indexed value",
+        ));
+    };
+    let lane = definition_lane(definition);
+    let key = secondary_entry_key(
+        handle.scope(),
+        handle.index_id(),
+        handle.generation(),
+        definition,
+        CanonicalSecondaryValue::equality(value),
+        IndexEntityId::initial(),
+    )?;
+    record_equality_point_read();
+    let Some(bytes) = reader.get(key).await? else {
+        return Ok(roaring::RoaringTreemap::new());
+    };
+    if lane.is_unique() {
+        let owner =
+            decode_secondary_entry_value(handle.index_id(), handle.generation(), lane, &bytes)?;
+        return Ok(roaring::RoaringTreemap::from_iter([owner.get()]));
+    }
+    SecondaryEqualityBitmapValue::decode(&bytes)
+        .map(SecondaryEqualityBitmapValue::into_ids)
+        .map_err(HelixDbError::from)
 }
 
 /// Reads and unions equality values from one exact Active generation.

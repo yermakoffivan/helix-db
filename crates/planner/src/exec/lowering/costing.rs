@@ -106,48 +106,99 @@ fn point_get_cost(profile: &cost::StorageCostProfile, count: usize) -> cost::Cos
         .map_or(cost::CostVector::ZERO, |count| profile.point_gets(count))
 }
 
-fn equality_set_id_cost(
+fn bitmap_expr_cost(
+    values: usize,
+    children: impl IntoIterator<Item = (cost::CostVector, cost::EstimatedRows)>,
+    intersect: bool,
     profile: &cost::StorageCostProfile,
-    uniqueness: catalog::IndexUniqueness,
-    values: &ir::AtLeast<ir::IndexValue, 1>,
 ) -> (cost::CostVector, cost::EstimatedRows) {
-    let per_value_rows = match uniqueness {
-        catalog::IndexUniqueness::Unique => profile.unique_equality_rows(None),
-        catalog::IndexUniqueness::NonUnique => profile.equality_index_rows(None),
-    };
-    let rows =
-        cost::EstimatedRows::rows(per_value_rows.as_rows().saturating_mul(values.len() as u64));
-    if uniqueness == catalog::IndexUniqueness::NonUnique
-        && values
-            .iter()
-            .all(|value| value.semantics() == ir::EqualityIndexValueSemantics::Indexed)
-    {
-        let cost = if values.len() == 1 {
+    if values != 0 {
+        let per_value = profile.equality_index_rows(None);
+        let rows = cost::EstimatedRows::rows(per_value.as_rows().saturating_mul(values as u64));
+        let cost = if values == 1 {
             profile.bitmap_equality_lookup(rows)
         } else {
-            profile
-                .bitmap_equality_batch(properties::PositiveUsize::at_least_one(values.len()), rows)
+            profile.bitmap_equality_batch(properties::PositiveUsize::at_least_one(values), rows)
         };
         return (cost, rows);
     }
+    let children = children.into_iter().collect::<Vec<_>>();
+    let rows = if intersect {
+        children
+            .iter()
+            .map(|(_, rows)| *rows)
+            .min()
+            .expect("bitmap set operation has children")
+    } else {
+        cost::EstimatedRows::rows(
+            children
+                .iter()
+                .map(|(_, rows)| rows.as_rows())
+                .fold(0_u64, u64::saturating_add),
+        )
+    };
+    let cost = children
+        .into_iter()
+        .map(|(cost, _)| cost)
+        .fold(cost::CostVector::ZERO, cost::CostVector::serial)
+        .serial(profile.secondary_set_operation(rows));
+    (cost, rows)
+}
 
-    let id_cost = values
-        .iter()
-        .map(|value| match value.semantics() {
-            ir::EqualityIndexValueSemantics::NonReflexive => cost::CostVector::ZERO,
-            ir::EqualityIndexValueSemantics::AuthoritativeNull => {
-                profile.null_equality_scan(profile.default_unknown_scan_rows)
-            }
-            ir::EqualityIndexValueSemantics::Indexed
-            | ir::EqualityIndexValueSemantics::RuntimeDependent => match uniqueness {
-                catalog::IndexUniqueness::Unique => profile.unique_equality_lookup(per_value_rows),
-                catalog::IndexUniqueness::NonUnique => {
-                    profile.bitmap_equality_lookup(per_value_rows)
-                }
-            },
-        })
-        .fold(cost::CostVector::ZERO, cost::CostVector::serial);
-    (id_cost, rows)
+fn node_bitmap_cost(
+    bitmap: &exec::ExecNodeBitmapExpr,
+    profile: &cost::StorageCostProfile,
+) -> (cost::CostVector, cost::EstimatedRows) {
+    match bitmap {
+        exec::ExecNodeBitmapExpr::PointRead { .. } => {
+            bitmap_expr_cost(1, core::iter::empty(), false, profile)
+        }
+        exec::ExecNodeBitmapExpr::BatchedUnionRead { values, .. } => {
+            bitmap_expr_cost(values.len(), core::iter::empty(), false, profile)
+        }
+        exec::ExecNodeBitmapExpr::Union { driver, rest } => bitmap_expr_cost(
+            0,
+            core::iter::once(node_bitmap_cost(driver, profile))
+                .chain(rest.iter().map(|child| node_bitmap_cost(child, profile))),
+            false,
+            profile,
+        ),
+        exec::ExecNodeBitmapExpr::Intersect { driver, rest } => bitmap_expr_cost(
+            0,
+            core::iter::once(node_bitmap_cost(driver, profile))
+                .chain(rest.iter().map(|child| node_bitmap_cost(child, profile))),
+            true,
+            profile,
+        ),
+    }
+}
+
+fn edge_bitmap_cost(
+    bitmap: &exec::ExecEdgeBitmapExpr,
+    profile: &cost::StorageCostProfile,
+) -> (cost::CostVector, cost::EstimatedRows) {
+    match bitmap {
+        exec::ExecEdgeBitmapExpr::PointRead { .. } => {
+            bitmap_expr_cost(1, core::iter::empty(), false, profile)
+        }
+        exec::ExecEdgeBitmapExpr::BatchedUnionRead { values, .. } => {
+            bitmap_expr_cost(values.len(), core::iter::empty(), false, profile)
+        }
+        exec::ExecEdgeBitmapExpr::Union { driver, rest } => bitmap_expr_cost(
+            0,
+            core::iter::once(edge_bitmap_cost(driver, profile))
+                .chain(rest.iter().map(|child| edge_bitmap_cost(child, profile))),
+            false,
+            profile,
+        ),
+        exec::ExecEdgeBitmapExpr::Intersect { driver, rest } => bitmap_expr_cost(
+            0,
+            core::iter::once(edge_bitmap_cost(driver, profile))
+                .chain(rest.iter().map(|child| edge_bitmap_cost(child, profile))),
+            true,
+            profile,
+        ),
+    }
 }
 
 fn node_secondary_set_cost(
@@ -158,16 +209,33 @@ fn node_secondary_set_cost(
         exec::ExecNodeSecondarySetPlan::Empty => {
             (cost::CostVector::ZERO, cost::EstimatedRows::ZERO)
         }
-        exec::ExecNodeSecondarySetPlan::Equality { index, values, .. } => {
-            equality_set_id_cost(profile, index.uniqueness, values)
+        exec::ExecNodeSecondarySetPlan::Bitmap(bitmap) => node_bitmap_cost(bitmap, profile),
+        exec::ExecNodeSecondarySetPlan::Unique { .. } => {
+            let rows = profile.unique_equality_rows(None);
+            (profile.unique_equality_lookup(rows), rows)
+        }
+        exec::ExecNodeSecondarySetPlan::AuthoritativeScan(_) => {
+            let rows = profile.default_unknown_scan_rows;
+            (profile.null_equality_scan(rows), rows)
+        }
+        exec::ExecNodeSecondarySetPlan::DynamicEquality { index, .. } => {
+            let rows = match index.uniqueness {
+                catalog::IndexUniqueness::Unique => profile.unique_equality_rows(None),
+                catalog::IndexUniqueness::NonUnique => profile.equality_index_rows(None),
+            };
+            let cost = match index.uniqueness {
+                catalog::IndexUniqueness::Unique => profile.unique_equality_lookup(rows),
+                catalog::IndexUniqueness::NonUnique => profile.bitmap_equality_lookup(rows),
+            };
+            (cost, rows)
         }
         exec::ExecNodeSecondarySetPlan::Range(_) => {
             let rows = profile.default_range_index_rows;
             (profile.secondary_range_lookup(rows), rows)
         }
-        exec::ExecNodeSecondarySetPlan::Intersect(children) => {
-            let children = children
-                .iter()
+        exec::ExecNodeSecondarySetPlan::Intersect { driver, rest } => {
+            let children = core::iter::once(driver.as_ref())
+                .chain(rest.iter())
                 .map(|child| node_secondary_set_cost(child, profile))
                 .collect::<Vec<_>>();
             let rows = children
@@ -182,9 +250,9 @@ fn node_secondary_set_cost(
                 .serial(profile.secondary_set_operation(rows));
             (cost, rows)
         }
-        exec::ExecNodeSecondarySetPlan::Union(children) => {
-            let children = children
-                .iter()
+        exec::ExecNodeSecondarySetPlan::Union { driver, rest } => {
+            let children = core::iter::once(driver.as_ref())
+                .chain(rest.iter())
                 .map(|child| node_secondary_set_cost(child, profile))
                 .collect::<Vec<_>>();
             let rows = cost::EstimatedRows::rows(
@@ -222,16 +290,22 @@ fn edge_secondary_set_cost(
         exec::ExecEdgeSecondarySetPlan::Empty => {
             (cost::CostVector::ZERO, cost::EstimatedRows::ZERO)
         }
-        exec::ExecEdgeSecondarySetPlan::Equality { values, .. } => {
-            equality_set_id_cost(profile, catalog::IndexUniqueness::NonUnique, values)
+        exec::ExecEdgeSecondarySetPlan::Bitmap(bitmap) => edge_bitmap_cost(bitmap, profile),
+        exec::ExecEdgeSecondarySetPlan::AuthoritativeScan(_) => {
+            let rows = profile.default_unknown_scan_rows;
+            (profile.null_equality_scan(rows), rows)
+        }
+        exec::ExecEdgeSecondarySetPlan::DynamicEquality { .. } => {
+            let rows = profile.equality_index_rows(None);
+            (profile.bitmap_equality_lookup(rows), rows)
         }
         exec::ExecEdgeSecondarySetPlan::Range(_) => {
             let rows = profile.default_range_index_rows;
             (profile.secondary_range_lookup(rows), rows)
         }
-        exec::ExecEdgeSecondarySetPlan::Intersect(children) => {
-            let children = children
-                .iter()
+        exec::ExecEdgeSecondarySetPlan::Intersect { driver, rest } => {
+            let children = core::iter::once(driver.as_ref())
+                .chain(rest.iter())
                 .map(|child| edge_secondary_set_cost(child, profile))
                 .collect::<Vec<_>>();
             let rows = children
@@ -246,9 +320,9 @@ fn edge_secondary_set_cost(
                 .serial(profile.secondary_set_operation(rows));
             (cost, rows)
         }
-        exec::ExecEdgeSecondarySetPlan::Union(children) => {
-            let children = children
-                .iter()
+        exec::ExecEdgeSecondarySetPlan::Union { driver, rest } => {
+            let children = core::iter::once(driver.as_ref())
+                .chain(rest.iter())
                 .map(|child| edge_secondary_set_cost(child, profile))
                 .collect::<Vec<_>>();
             let rows = cost::EstimatedRows::rows(

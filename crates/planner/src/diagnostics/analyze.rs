@@ -255,7 +255,16 @@ impl<'a> Analyzer<'a> {
                         self.statistics.node_accesses.label_scans =
                             self.statistics.node_accesses.label_scans.saturating_add(1);
                     }
-                    exec::ExecNodeAccessPlan::EqualityIndex { .. } => {
+                    exec::ExecNodeAccessPlan::Bitmap { bitmap } => {
+                        self.statistics.node_accesses.equality_index_lookups = self
+                            .statistics
+                            .node_accesses
+                            .equality_index_lookups
+                            .saturating_add(node_bitmap_lookup_count(bitmap));
+                    }
+                    exec::ExecNodeAccessPlan::Unique { .. }
+                    | exec::ExecNodeAccessPlan::AuthoritativeScan { .. }
+                    | exec::ExecNodeAccessPlan::DynamicEquality { .. } => {
                         self.statistics.node_accesses.equality_index_lookups = self
                             .statistics
                             .node_accesses
@@ -308,7 +317,15 @@ impl<'a> Analyzer<'a> {
                         self.statistics.edge_accesses.label_scans =
                             self.statistics.edge_accesses.label_scans.saturating_add(1);
                     }
-                    exec::ExecEdgeAccessPlan::EqualityIndex { .. } => {
+                    exec::ExecEdgeAccessPlan::Bitmap { bitmap } => {
+                        self.statistics.edge_accesses.equality_index_lookups = self
+                            .statistics
+                            .edge_accesses
+                            .equality_index_lookups
+                            .saturating_add(edge_bitmap_lookup_count(bitmap));
+                    }
+                    exec::ExecEdgeAccessPlan::AuthoritativeScan { .. }
+                    | exec::ExecEdgeAccessPlan::DynamicEquality { .. } => {
                         self.statistics.edge_accesses.equality_index_lookups = self
                             .statistics
                             .edge_accesses
@@ -353,12 +370,21 @@ impl<'a> Analyzer<'a> {
     fn analyze_node_secondary_set(&mut self, set: &exec::ExecNodeSecondarySetPlan) {
         match set {
             exec::ExecNodeSecondarySetPlan::Empty => {}
-            exec::ExecNodeSecondarySetPlan::Equality { values, .. } => {
+            exec::ExecNodeSecondarySetPlan::Bitmap(bitmap) => {
                 self.statistics.node_accesses.equality_index_lookups = self
                     .statistics
                     .node_accesses
                     .equality_index_lookups
-                    .saturating_add(values.len());
+                    .saturating_add(node_bitmap_lookup_count(bitmap));
+            }
+            exec::ExecNodeSecondarySetPlan::Unique { .. }
+            | exec::ExecNodeSecondarySetPlan::AuthoritativeScan(_)
+            | exec::ExecNodeSecondarySetPlan::DynamicEquality { .. } => {
+                self.statistics.node_accesses.equality_index_lookups = self
+                    .statistics
+                    .node_accesses
+                    .equality_index_lookups
+                    .saturating_add(1);
             }
             exec::ExecNodeSecondarySetPlan::Range(_) => {
                 self.statistics.node_accesses.range_index_scans = self
@@ -367,16 +393,16 @@ impl<'a> Analyzer<'a> {
                     .range_index_scans
                     .saturating_add(1);
             }
-            exec::ExecNodeSecondarySetPlan::Intersect(children) => {
+            exec::ExecNodeSecondarySetPlan::Intersect { driver, rest } => {
                 self.statistics.intersections = self.statistics.intersections.saturating_add(1);
-                children
-                    .iter()
+                core::iter::once(driver.as_ref())
+                    .chain(rest.iter())
                     .for_each(|child| self.analyze_node_secondary_set(child));
             }
-            exec::ExecNodeSecondarySetPlan::Union(children) => {
+            exec::ExecNodeSecondarySetPlan::Union { driver, rest } => {
                 self.statistics.unions = self.statistics.unions.saturating_add(1);
-                children
-                    .iter()
+                core::iter::once(driver.as_ref())
+                    .chain(rest.iter())
                     .for_each(|child| self.analyze_node_secondary_set(child));
             }
             exec::ExecNodeSecondarySetPlan::OrderedIntersect { filters, .. } => {
@@ -396,12 +422,20 @@ impl<'a> Analyzer<'a> {
     fn analyze_edge_secondary_set(&mut self, set: &exec::ExecEdgeSecondarySetPlan) {
         match set {
             exec::ExecEdgeSecondarySetPlan::Empty => {}
-            exec::ExecEdgeSecondarySetPlan::Equality { values, .. } => {
+            exec::ExecEdgeSecondarySetPlan::Bitmap(bitmap) => {
                 self.statistics.edge_accesses.equality_index_lookups = self
                     .statistics
                     .edge_accesses
                     .equality_index_lookups
-                    .saturating_add(values.len());
+                    .saturating_add(edge_bitmap_lookup_count(bitmap));
+            }
+            exec::ExecEdgeSecondarySetPlan::AuthoritativeScan(_)
+            | exec::ExecEdgeSecondarySetPlan::DynamicEquality { .. } => {
+                self.statistics.edge_accesses.equality_index_lookups = self
+                    .statistics
+                    .edge_accesses
+                    .equality_index_lookups
+                    .saturating_add(1);
             }
             exec::ExecEdgeSecondarySetPlan::Range(_) => {
                 self.statistics.edge_accesses.range_index_scans = self
@@ -410,16 +444,16 @@ impl<'a> Analyzer<'a> {
                     .range_index_scans
                     .saturating_add(1);
             }
-            exec::ExecEdgeSecondarySetPlan::Intersect(children) => {
+            exec::ExecEdgeSecondarySetPlan::Intersect { driver, rest } => {
                 self.statistics.intersections = self.statistics.intersections.saturating_add(1);
-                children
-                    .iter()
+                core::iter::once(driver.as_ref())
+                    .chain(rest.iter())
                     .for_each(|child| self.analyze_edge_secondary_set(child));
             }
-            exec::ExecEdgeSecondarySetPlan::Union(children) => {
+            exec::ExecEdgeSecondarySetPlan::Union { driver, rest } => {
                 self.statistics.unions = self.statistics.unions.saturating_add(1);
-                children
-                    .iter()
+                core::iter::once(driver.as_ref())
+                    .chain(rest.iter())
                     .for_each(|child| self.analyze_edge_secondary_set(child));
             }
             exec::ExecEdgeSecondarySetPlan::OrderedIntersect { filters, .. } => {
@@ -830,7 +864,10 @@ fn unbounded_access_scope(access: &exec::ExecAccessPlan) -> Option<AccessScope> 
             exec::ExecNodeAccessPlan::Empty
             | exec::ExecNodeAccessPlan::FromParam { .. }
             | exec::ExecNodeAccessPlan::FromVar { .. }
-            | exec::ExecNodeAccessPlan::EqualityIndex { .. }
+            | exec::ExecNodeAccessPlan::Bitmap { .. }
+            | exec::ExecNodeAccessPlan::Unique { .. }
+            | exec::ExecNodeAccessPlan::AuthoritativeScan { .. }
+            | exec::ExecNodeAccessPlan::DynamicEquality { .. }
             | exec::ExecNodeAccessPlan::RangeIndex { .. }
             | exec::ExecNodeAccessPlan::SecondarySet { .. }
             | exec::ExecNodeAccessPlan::VectorSearch { .. }
@@ -840,7 +877,9 @@ fn unbounded_access_scope(access: &exec::ExecAccessPlan) -> Option<AccessScope> 
             exec::ExecEdgeAccessPlan::Empty
             | exec::ExecEdgeAccessPlan::FromParam { .. }
             | exec::ExecEdgeAccessPlan::FromVar { .. }
-            | exec::ExecEdgeAccessPlan::EqualityIndex { .. }
+            | exec::ExecEdgeAccessPlan::Bitmap { .. }
+            | exec::ExecEdgeAccessPlan::AuthoritativeScan { .. }
+            | exec::ExecEdgeAccessPlan::DynamicEquality { .. }
             | exec::ExecEdgeAccessPlan::RangeIndex { .. }
             | exec::ExecEdgeAccessPlan::SecondarySet { .. }
             | exec::ExecEdgeAccessPlan::VectorSearch { .. }
@@ -874,7 +913,10 @@ fn scope_for_access(access: &exec::ExecAccessPlan) -> Option<AccessScope> {
         exec::ExecAccessPlan::Node(
             exec::ExecNodeAccessPlan::AllScan
             | exec::ExecNodeAccessPlan::LabelScan { .. }
-            | exec::ExecNodeAccessPlan::EqualityIndex { .. }
+            | exec::ExecNodeAccessPlan::Bitmap { .. }
+            | exec::ExecNodeAccessPlan::Unique { .. }
+            | exec::ExecNodeAccessPlan::AuthoritativeScan { .. }
+            | exec::ExecNodeAccessPlan::DynamicEquality { .. }
             | exec::ExecNodeAccessPlan::RangeIndex { .. }
             | exec::ExecNodeAccessPlan::SecondarySet { .. },
         ) => Some(AccessScope {
@@ -884,7 +926,9 @@ fn scope_for_access(access: &exec::ExecAccessPlan) -> Option<AccessScope> {
         exec::ExecAccessPlan::Edge(
             exec::ExecEdgeAccessPlan::AllScan
             | exec::ExecEdgeAccessPlan::LabelScan { .. }
-            | exec::ExecEdgeAccessPlan::EqualityIndex { .. }
+            | exec::ExecEdgeAccessPlan::Bitmap { .. }
+            | exec::ExecEdgeAccessPlan::AuthoritativeScan { .. }
+            | exec::ExecEdgeAccessPlan::DynamicEquality { .. }
             | exec::ExecEdgeAccessPlan::RangeIndex { .. }
             | exec::ExecEdgeAccessPlan::SecondarySet { .. },
         ) => Some(AccessScope {
@@ -914,7 +958,13 @@ fn node_access_label(access: &exec::ExecAccessPlan) -> Option<&ir::NonEmptyStrin
     };
     match plan {
         exec::ExecNodeAccessPlan::LabelScan { label } => Some(label),
-        exec::ExecNodeAccessPlan::EqualityIndex { key, .. } => Some(&key.label),
+        exec::ExecNodeAccessPlan::Bitmap { bitmap } => node_bitmap_label(bitmap),
+        exec::ExecNodeAccessPlan::Unique { lookup, .. } => Some(&lookup.key.label),
+        exec::ExecNodeAccessPlan::AuthoritativeScan { predicate } => match predicate {
+            exec::ExecNodeAuthoritativeScanPredicate::NullEquality { key } => Some(&key.label),
+            exec::ExecNodeAuthoritativeScanPredicate::Predicate(_) => None,
+        },
+        exec::ExecNodeAccessPlan::DynamicEquality { key, .. } => Some(&key.label),
         exec::ExecNodeAccessPlan::RangeIndex { key, .. } => Some(&key.label),
         exec::ExecNodeAccessPlan::SecondarySet { set } => node_secondary_set_label(set),
         exec::ExecNodeAccessPlan::Empty
@@ -932,7 +982,12 @@ fn edge_access_label(access: &exec::ExecAccessPlan) -> Option<&ir::NonEmptyStrin
     };
     match plan {
         exec::ExecEdgeAccessPlan::LabelScan { label } => Some(label),
-        exec::ExecEdgeAccessPlan::EqualityIndex { key, .. } => Some(&key.label),
+        exec::ExecEdgeAccessPlan::Bitmap { bitmap } => edge_bitmap_label(bitmap),
+        exec::ExecEdgeAccessPlan::AuthoritativeScan { predicate } => match predicate {
+            exec::ExecEdgeAuthoritativeScanPredicate::NullEquality { key } => Some(&key.label),
+            exec::ExecEdgeAuthoritativeScanPredicate::Predicate(_) => None,
+        },
+        exec::ExecEdgeAccessPlan::DynamicEquality { key, .. } => Some(&key.label),
         exec::ExecEdgeAccessPlan::RangeIndex { key, .. } => Some(&key.label),
         exec::ExecEdgeAccessPlan::SecondarySet { set } => edge_secondary_set_label(set),
         exec::ExecEdgeAccessPlan::Empty
@@ -947,14 +1002,22 @@ fn edge_access_label(access: &exec::ExecAccessPlan) -> Option<&ir::NonEmptyStrin
 fn node_secondary_set_label(set: &exec::ExecNodeSecondarySetPlan) -> Option<&ir::NonEmptyString> {
     match set {
         exec::ExecNodeSecondarySetPlan::Empty => None,
-        exec::ExecNodeSecondarySetPlan::Equality { key, .. } => Some(&key.label),
+        exec::ExecNodeSecondarySetPlan::Bitmap(bitmap) => node_bitmap_label(bitmap),
+        exec::ExecNodeSecondarySetPlan::Unique { lookup, .. } => Some(&lookup.key.label),
+        exec::ExecNodeSecondarySetPlan::AuthoritativeScan(predicate) => match predicate {
+            exec::ExecNodeAuthoritativeScanPredicate::NullEquality { key } => Some(&key.label),
+            exec::ExecNodeAuthoritativeScanPredicate::Predicate(_) => None,
+        },
+        exec::ExecNodeSecondarySetPlan::DynamicEquality { key, .. } => Some(&key.label),
         exec::ExecNodeSecondarySetPlan::Range(range)
         | exec::ExecNodeSecondarySetPlan::OrderedIntersect { driver: range, .. } => {
             Some(&range.key.label)
         }
-        exec::ExecNodeSecondarySetPlan::Intersect(children)
-        | exec::ExecNodeSecondarySetPlan::Union(children) => {
-            let mut labels = children.iter().filter_map(node_secondary_set_label);
+        exec::ExecNodeSecondarySetPlan::Intersect { driver, rest }
+        | exec::ExecNodeSecondarySetPlan::Union { driver, rest } => {
+            let mut labels = core::iter::once(driver.as_ref())
+                .chain(rest.iter())
+                .filter_map(node_secondary_set_label);
             let first = labels.next()?;
             labels.all(|label| label == first).then_some(first)
         }
@@ -964,16 +1027,77 @@ fn node_secondary_set_label(set: &exec::ExecNodeSecondarySetPlan) -> Option<&ir:
 fn edge_secondary_set_label(set: &exec::ExecEdgeSecondarySetPlan) -> Option<&ir::NonEmptyString> {
     match set {
         exec::ExecEdgeSecondarySetPlan::Empty => None,
-        exec::ExecEdgeSecondarySetPlan::Equality { key, .. } => Some(&key.label),
+        exec::ExecEdgeSecondarySetPlan::Bitmap(bitmap) => edge_bitmap_label(bitmap),
+        exec::ExecEdgeSecondarySetPlan::AuthoritativeScan(predicate) => match predicate {
+            exec::ExecEdgeAuthoritativeScanPredicate::NullEquality { key } => Some(&key.label),
+            exec::ExecEdgeAuthoritativeScanPredicate::Predicate(_) => None,
+        },
+        exec::ExecEdgeSecondarySetPlan::DynamicEquality { key, .. } => Some(&key.label),
         exec::ExecEdgeSecondarySetPlan::Range(range)
         | exec::ExecEdgeSecondarySetPlan::OrderedIntersect { driver: range, .. } => {
             Some(&range.key.label)
         }
-        exec::ExecEdgeSecondarySetPlan::Intersect(children)
-        | exec::ExecEdgeSecondarySetPlan::Union(children) => {
-            let mut labels = children.iter().filter_map(edge_secondary_set_label);
+        exec::ExecEdgeSecondarySetPlan::Intersect { driver, rest }
+        | exec::ExecEdgeSecondarySetPlan::Union { driver, rest } => {
+            let mut labels = core::iter::once(driver.as_ref())
+                .chain(rest.iter())
+                .filter_map(edge_secondary_set_label);
             let first = labels.next()?;
             labels.all(|label| label == first).then_some(first)
+        }
+    }
+}
+
+fn node_bitmap_lookup_count(bitmap: &exec::ExecNodeBitmapExpr) -> usize {
+    match bitmap {
+        exec::ExecNodeBitmapExpr::PointRead { .. } => 1,
+        exec::ExecNodeBitmapExpr::BatchedUnionRead { values, .. } => values.len(),
+        exec::ExecNodeBitmapExpr::Union { driver, rest }
+        | exec::ExecNodeBitmapExpr::Intersect { driver, rest } => rest
+            .iter()
+            .fold(node_bitmap_lookup_count(driver), |count, child| {
+                count.saturating_add(node_bitmap_lookup_count(child))
+            }),
+    }
+}
+
+fn edge_bitmap_lookup_count(bitmap: &exec::ExecEdgeBitmapExpr) -> usize {
+    match bitmap {
+        exec::ExecEdgeBitmapExpr::PointRead { .. } => 1,
+        exec::ExecEdgeBitmapExpr::BatchedUnionRead { values, .. } => values.len(),
+        exec::ExecEdgeBitmapExpr::Union { driver, rest }
+        | exec::ExecEdgeBitmapExpr::Intersect { driver, rest } => rest
+            .iter()
+            .fold(edge_bitmap_lookup_count(driver), |count, child| {
+                count.saturating_add(edge_bitmap_lookup_count(child))
+            }),
+    }
+}
+
+fn node_bitmap_label(bitmap: &exec::ExecNodeBitmapExpr) -> Option<&ir::NonEmptyString> {
+    match bitmap {
+        exec::ExecNodeBitmapExpr::PointRead { key, .. }
+        | exec::ExecNodeBitmapExpr::BatchedUnionRead { key, .. } => Some(&key.label),
+        exec::ExecNodeBitmapExpr::Union { driver, rest }
+        | exec::ExecNodeBitmapExpr::Intersect { driver, rest } => {
+            let first = node_bitmap_label(driver)?;
+            rest.iter()
+                .all(|child| node_bitmap_label(child) == Some(first))
+                .then_some(first)
+        }
+    }
+}
+
+fn edge_bitmap_label(bitmap: &exec::ExecEdgeBitmapExpr) -> Option<&ir::NonEmptyString> {
+    match bitmap {
+        exec::ExecEdgeBitmapExpr::PointRead { key, .. }
+        | exec::ExecEdgeBitmapExpr::BatchedUnionRead { key, .. } => Some(&key.label),
+        exec::ExecEdgeBitmapExpr::Union { driver, rest }
+        | exec::ExecEdgeBitmapExpr::Intersect { driver, rest } => {
+            let first = edge_bitmap_label(driver)?;
+            rest.iter()
+                .all(|child| edge_bitmap_label(child) == Some(first))
+                .then_some(first)
         }
     }
 }

@@ -19,8 +19,14 @@ pub enum PhysicalAccess {
     },
     /// Label scan.
     LabelScan,
-    /// Equality-index lookup.
-    EqualityIndex,
+    /// One exact non-unique equality bitmap point read.
+    EqualityBitmapPoint,
+    /// One exact unique-owner read plus authoritative verification.
+    EqualityUniqueVerified,
+    /// Exact authoritative equality scan, including null.
+    EqualityAuthoritativeScan,
+    /// Explicit late-bound equality classifier.
+    EqualityDynamic,
     /// Range-index scan.
     RangeIndex,
     /// Vector search.
@@ -31,6 +37,8 @@ pub enum PhysicalAccess {
     SetIntersection,
     /// Set union of access paths.
     SetUnion,
+    /// Same-index equality union executed as one literal multi-get.
+    BitmapBatchUnion,
     /// Graph expansion.
     Expand,
 }

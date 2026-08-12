@@ -65,7 +65,11 @@ pub(super) fn access_set_contract(
             .serial(storage.secondary_set_operation(rows))
     };
     AccessPhysicalContract::new_secondary(
-        access,
+        if batchable_equality {
+            physical::PhysicalAccess::BitmapBatchUnion
+        } else {
+            access
+        },
         delivered,
         id_cost,
         storage.secondary_row_materialization(rows),

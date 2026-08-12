@@ -137,6 +137,7 @@ impl<'db> ExecutionContext<'db> {
                 };
                 return lookup_managed_active_literal_batch(view, handle, values).await;
             }
+            crate::index_lifecycle::secondary::record_equality_point_read();
             let Some(record) = crate::index_lifecycle::repository::load_index_record(
                 view,
                 self.tenant_scope,
@@ -186,6 +187,7 @@ impl<'db> ExecutionContext<'db> {
                 };
                 return lookup_managed_active_point_exact(view, handle, value, unique).await;
             }
+            crate::index_lifecycle::secondary::record_equality_point_read();
             let Some(record) = crate::index_lifecycle::repository::load_index_record(
                 view,
                 self.tenant_scope,
@@ -255,6 +257,7 @@ impl<'db> ExecutionContext<'db> {
         ))
     }
 
+    #[cfg(test)]
     pub(super) async fn lookup_global_edge_equality_index(
         &self,
         property: &str,
@@ -652,7 +655,7 @@ async fn lookup_managed_active_point_exact(
                 .to_string(),
         ));
     }
-    crate::index_lifecycle::secondary::lookup_active_equality_generation(reader, active, value)
+    crate::index_lifecycle::secondary::lookup_active_equality_point_literal(reader, active, value)
         .await
 }
 
@@ -673,6 +676,7 @@ pub(super) fn limited_index_ids(
     }
 }
 
+#[cfg(test)]
 pub(super) fn scoped_property_key(key: &catalog::ScopedPropertyKey) -> String {
     crate::config::scoped_secondary_index_property(key.label.as_ref(), key.property.as_ref())
 }

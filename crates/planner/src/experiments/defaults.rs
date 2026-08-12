@@ -282,7 +282,12 @@ mod tests {
                     ExecOp::Access { plan }
                         if matches!(
                             plan.as_ref(),
-                            ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+                            ExecAccessPlan::Node(
+                                ExecNodeAccessPlan::Bitmap {
+                                    bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. },
+                                }
+                                | ExecNodeAccessPlan::DynamicEquality { key, .. },
+                            )
                                 if (key.label == "Audit" && key.property == "event_id")
                                     || (key.label == "User" && key.property == "username")
                         )
@@ -298,7 +303,12 @@ mod tests {
                     ExecOp::Access { plan }
                         if matches!(
                             plan.as_ref(),
-                            ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
+                            ExecAccessPlan::Edge(
+                                ExecEdgeAccessPlan::Bitmap {
+                                    bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. },
+                                }
+                                | ExecEdgeAccessPlan::DynamicEquality { key, .. },
+                            )
                                 if key.label == "MENTIONS" && key.property == "event_id"
                         )
                 )
@@ -425,7 +435,12 @@ mod tests {
                     ExecOp::Access { plan }
                         if matches!(
                             plan.as_ref(),
-                            ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+                            ExecAccessPlan::Node(
+                                ExecNodeAccessPlan::Bitmap {
+                                    bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. },
+                                }
+                                | ExecNodeAccessPlan::DynamicEquality { key, .. },
+                            )
                                 if (key.label == "User" && key.property == "username")
                                     || (key.label == "Audit" && key.property == "event_id")
                         )

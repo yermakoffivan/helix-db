@@ -79,7 +79,7 @@ fn seed_rule_set_explores_catalog_indexed_access_filters_before_implementation()
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::EqualityIndex,
+            access: physical::PhysicalAccess::EqualityBitmapPoint,
             ..
         }
     ));
@@ -162,7 +162,7 @@ fn seed_rule_set_explores_catalog_indexed_access_filter_unions() {
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::SetUnion,
+            access: physical::PhysicalAccess::BitmapBatchUnion,
             ..
         }
     ));

@@ -12,10 +12,10 @@ fn cascades_chosen_access_matrix_proves_index_family_and_trace() {
     assert_selected_rule(&node_equality, KnownRuleId::SeedAccessPath);
     assert!(matches!(
         unwrapped_first_exec_access(&node_equality),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, value, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, value, .. } })
             if key.label == "User"
                 && key.property == "username"
-                && matches!(value, IndexValue::Literal(_))
+                && value.literal().as_property_value().as_str() == Some("alice")
     ));
     assert_no_exec_op_family(&node_equality, ExecOpFamily::Filter);
     assert_no_exec_op_family(&node_equality, ExecOpFamily::Order);
@@ -29,10 +29,9 @@ fn cascades_chosen_access_matrix_proves_index_family_and_trace() {
     assert_selected_rule(&node_unique, KnownRuleId::SeedAccessPath);
     assert!(matches!(
         unwrapped_first_exec_access(&node_unique),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, index, .. })
-            if key.label == "User"
-                && key.property == "email"
-                && index.uniqueness == IndexUniqueness::Unique
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Unique { lookup, .. })
+            if lookup.key.label == "User"
+                && lookup.key.property == "email"
     ));
     assert_no_exec_op_family(&node_unique, ExecOpFamily::Filter);
     assert_no_exec_op_family(&node_unique, ExecOpFamily::Order);
@@ -70,10 +69,10 @@ fn cascades_chosen_access_matrix_proves_index_family_and_trace() {
     assert_selected_rule(&edge_equality, KnownRuleId::SeedAccessPath);
     assert!(matches!(
         unwrapped_first_exec_access(&edge_equality),
-        ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, value, .. })
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap { bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, value, .. } })
             if key.label == "FOLLOWS"
                 && key.property == "status"
-                && matches!(value, IndexValue::Literal(_))
+                && value.literal().as_property_value().as_str() == Some("active")
     ));
     assert_no_exec_op_family(&edge_equality, ExecOpFamily::Filter);
     assert_no_exec_op_family(&edge_equality, ExecOpFamily::Order);
@@ -238,7 +237,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&node_filter, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&node_filter),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(
@@ -258,7 +257,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&edge_filter, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&edge_filter),
-        ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap { bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. } })
             if key.label == "FOLLOWS" && key.property == "status"
     ));
     assert!(matches!(
@@ -278,7 +277,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&node_label_filter, KnownRuleId::SeedAccessPath);
     assert!(matches!(
         unwrapped_first_exec_access(&node_label_filter),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert_no_exec_op_family(&node_label_filter, ExecOpFamily::Filter);
@@ -294,7 +293,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&edge_label_filter, KnownRuleId::SeedAccessPath);
     assert!(matches!(
         unwrapped_first_exec_access(&edge_label_filter),
-        ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap { bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. } })
             if key.label == "FOLLOWS" && key.property == "status"
     ));
     assert_no_exec_op_family(&edge_label_filter, ExecOpFamily::Filter);
@@ -310,7 +309,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&generic_where, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&generic_where),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(
@@ -330,7 +329,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&explicit_order, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&explicit_order),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(
@@ -355,7 +354,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_eq!(first_limited_access_limit(&indexed_skip), None);
     assert!(matches!(
         unwrapped_first_exec_access(&indexed_skip),
-        ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap { bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. } })
             if key.label == "FOLLOWS" && key.property == "status"
     ));
     assert!(matches!(
@@ -381,7 +380,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&variables, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&variables),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     let variable_ops = variables
@@ -419,7 +418,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&store, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&store),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(
@@ -448,7 +447,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&stream_inject, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&stream_inject),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(
@@ -473,7 +472,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&dedup, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&dedup),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(
@@ -493,7 +492,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&node_expand, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&node_expand),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(
@@ -519,7 +518,7 @@ fn cascades_stream_wrapper_matrix_preserves_indexed_access_and_wrapper_ops() {
     assert_selected_rule(&edge_expand, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&edge_expand),
-        ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap { bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. } })
             if key.label == "FOLLOWS" && key.property == "status"
     ));
     assert!(matches!(
@@ -1005,7 +1004,7 @@ fn cascades_chosen_predicate_matrix_proves_static_and_residual_filters() {
     assert_selected_rule(&node_residual, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&node_residual),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert_eq!(
@@ -1044,7 +1043,7 @@ fn cascades_chosen_predicate_matrix_proves_static_and_residual_filters() {
     assert_selected_rule(&edge_residual, KnownRuleId::SeedAccessPipeline);
     assert!(matches!(
         unwrapped_first_exec_access(&edge_residual),
-        ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap { bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. } })
             if key.label == "FOLLOWS" && key.property == "status"
     ));
     assert_eq!(
@@ -1090,7 +1089,7 @@ fn cascades_partial_index_residuals_keep_limits_after_filters() {
     assert_eq!(first_limited_access_limit(&limited_node), None);
     assert!(matches!(
         unwrapped_first_exec_access(&limited_node),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(
@@ -1116,7 +1115,7 @@ fn cascades_partial_index_residuals_keep_limits_after_filters() {
     assert_eq!(first_limited_access_limit(&limited_edge), None);
     assert!(matches!(
         unwrapped_first_exec_access(&limited_edge),
-        ExecAccessPlan::Edge(ExecEdgeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap { bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. } })
             if key.label == "FOLLOWS" && key.property == "status"
     ));
     assert!(matches!(
@@ -1255,7 +1254,7 @@ fn cascades_limit_pushdown_matrix_proves_tight_caps_and_barriers() {
     assert_eq!(first_limited_access_limit(&equality_limit), Some(2));
     assert!(matches!(
         unwrapped_first_exec_access(&equality_limit),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert_no_exec_window(&equality_limit);
@@ -1270,7 +1269,7 @@ fn cascades_limit_pushdown_matrix_proves_tight_caps_and_barriers() {
     assert_eq!(first_limited_access_limit(&equality_skip_limit), Some(5));
     assert!(matches!(
         unwrapped_first_exec_access(&equality_skip_limit),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert_exec_range(&equality_skip_limit, 2, 5);
@@ -1287,10 +1286,9 @@ fn cascades_limit_pushdown_matrix_proves_tight_caps_and_barriers() {
     assert_eq!(first_limited_access_limit(&unique_covering_limit), None);
     assert!(matches!(
         unwrapped_first_exec_access(&unique_covering_limit),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, index, .. })
-            if key.label == "User"
-                && key.property == "email"
-                && index.uniqueness == IndexUniqueness::Unique
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Unique { lookup, .. })
+            if lookup.key.label == "User"
+                && lookup.key.property == "email"
     ));
     assert_no_exec_op_family(&unique_covering_limit, ExecOpFamily::Distinct);
     assert_no_exec_window(&unique_covering_limit);
@@ -1312,10 +1310,9 @@ fn cascades_limit_pushdown_matrix_proves_tight_caps_and_barriers() {
     );
     assert!(matches!(
         unwrapped_first_exec_access(&unique_distinct_covering_limit),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, index, .. })
-            if key.label == "User"
-                && key.property == "email"
-                && index.uniqueness == IndexUniqueness::Unique
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Unique { lookup, .. })
+            if lookup.key.label == "User"
+                && lookup.key.property == "email"
     ));
     assert_no_exec_op_family(&unique_distinct_covering_limit, ExecOpFamily::Distinct);
     assert_no_exec_window(&unique_distinct_covering_limit);
@@ -1342,7 +1339,7 @@ fn cascades_limit_pushdown_matrix_proves_tight_caps_and_barriers() {
     assert_eq!(first_limited_access_limit(&dynamic_equality_limit), None);
     assert!(matches!(
         unwrapped_first_exec_access(&dynamic_equality_limit),
-        ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+        ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
             if key.label == "User" && key.property == "username"
     ));
     assert!(matches!(

@@ -104,7 +104,7 @@ fn seed_rule_set_explores_equality_range_intersection_before_access_implementati
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::EqualityIndex,
+            access: physical::PhysicalAccess::EqualityBitmapPoint,
             ..
         }
     ));
@@ -212,7 +212,7 @@ fn seed_rule_set_explores_access_subsumption_before_access_implementation() {
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::EqualityIndex,
+            access: physical::PhysicalAccess::EqualityBitmapPoint,
             ..
         }
     ));

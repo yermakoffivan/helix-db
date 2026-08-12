@@ -65,15 +65,48 @@ impl<'db> ExecutionContext<'db> {
                 exec::ExecNodeSecondarySetPlan::Empty => {
                     Ok(SecondaryIds::Unordered(roaring::RoaringTreemap::new()))
                 }
-                exec::ExecNodeSecondarySetPlan::Equality { key, values, .. } => {
-                    let values = values
-                        .iter()
-                        .map(|value| self.index_value(value))
-                        .collect::<Result<Vec<_>>>()?;
+                exec::ExecNodeSecondarySetPlan::Bitmap(bitmap) => {
+                    self.node_bitmap(bitmap).await.map(SecondaryIds::Unordered)
+                }
+                exec::ExecNodeSecondarySetPlan::Unique {
+                    lookup,
+                    verification,
+                } => Ok(SecondaryIds::Unordered(
+                    self.verified_node_unique_owner(lookup, verification)
+                        .await?
+                        .into_iter()
+                        .collect(),
+                )),
+                exec::ExecNodeSecondarySetPlan::AuthoritativeScan(predicate) => {
+                    let ids = self
+                        .scan_element_ids(exec::ElementKeyspace::NodeProperty, None)
+                        .await?;
+                    let mut matches = roaring::RoaringTreemap::new();
+                    for id in ids {
+                        let row =
+                            super::super::ExecutionRow::current(super::super::ElementRef::Node(id));
+                        let accepted = match predicate {
+                            exec::ExecNodeAuthoritativeScanPredicate::NullEquality { key } => {
+                                self.scoped_null_matches(&row, key).await?
+                            }
+                            exec::ExecNodeAuthoritativeScanPredicate::Predicate(predicate) => {
+                                self.eval_predicate(&row, predicate.predicate()).await?
+                            }
+                        };
+                        if accepted {
+                            matches.insert(id);
+                        }
+                    }
+                    Ok(SecondaryIds::Unordered(matches))
+                }
+                exec::ExecNodeSecondarySetPlan::DynamicEquality { index, key, param } => {
+                    super::super::count::validate_node_equality_index(&index.index_id, key)?;
+                    let value =
+                        self.index_value(&helix_planner::ir::IndexValue::Param(param.clone()))?;
                     self.lookup_managed_equality_union(
                         crate::index_lifecycle::IndexElementKind::Node,
                         key,
-                        &values,
+                        core::slice::from_ref(&value),
                     )
                     .await
                     .map(SecondaryIds::Unordered)
@@ -82,25 +115,16 @@ impl<'db> ExecutionContext<'db> {
                     .node_range_index_ids(&range.key, &range.range, range_limit)
                     .await
                     .map(SecondaryIds::Ordered),
-                exec::ExecNodeSecondarySetPlan::Intersect(children) => {
-                    let mut children = children.iter();
-                    let mut ids = self
-                        .node_secondary_ids(
-                            children
-                                .next()
-                                .expect("secondary intersection is statically non-empty"),
-                            None,
-                        )
-                        .await?
-                        .into_bitmap();
-                    for child in children {
+                exec::ExecNodeSecondarySetPlan::Intersect { driver, rest } => {
+                    let mut ids = self.node_secondary_ids(driver, None).await?.into_bitmap();
+                    for child in rest {
                         ids &= self.node_secondary_ids(child, None).await?.into_bitmap();
                     }
                     Ok(SecondaryIds::Unordered(ids))
                 }
-                exec::ExecNodeSecondarySetPlan::Union(children) => {
-                    let mut ids = roaring::RoaringTreemap::new();
-                    for child in children {
+                exec::ExecNodeSecondarySetPlan::Union { driver, rest } => {
+                    let mut ids = self.node_secondary_ids(driver, None).await?.into_bitmap();
+                    for child in rest {
                         ids |= self.node_secondary_ids(child, None).await?.into_bitmap();
                     }
                     Ok(SecondaryIds::Unordered(ids))
@@ -143,15 +167,39 @@ impl<'db> ExecutionContext<'db> {
                 exec::ExecEdgeSecondarySetPlan::Empty => {
                     Ok(SecondaryIds::Unordered(roaring::RoaringTreemap::new()))
                 }
-                exec::ExecEdgeSecondarySetPlan::Equality { key, values, .. } => {
-                    let values = values
-                        .iter()
-                        .map(|value| self.index_value(value))
-                        .collect::<Result<Vec<_>>>()?;
+                exec::ExecEdgeSecondarySetPlan::Bitmap(bitmap) => {
+                    self.edge_bitmap(bitmap).await.map(SecondaryIds::Unordered)
+                }
+                exec::ExecEdgeSecondarySetPlan::AuthoritativeScan(predicate) => {
+                    let ids = self
+                        .scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None)
+                        .await?;
+                    let mut matches = roaring::RoaringTreemap::new();
+                    for id in ids {
+                        let row =
+                            super::super::ExecutionRow::current(super::super::ElementRef::Edge(id));
+                        let accepted = match predicate {
+                            exec::ExecEdgeAuthoritativeScanPredicate::NullEquality { key } => {
+                                self.scoped_null_matches(&row, key).await?
+                            }
+                            exec::ExecEdgeAuthoritativeScanPredicate::Predicate(predicate) => {
+                                self.eval_predicate(&row, predicate.predicate()).await?
+                            }
+                        };
+                        if accepted {
+                            matches.insert(id);
+                        }
+                    }
+                    Ok(SecondaryIds::Unordered(matches))
+                }
+                exec::ExecEdgeSecondarySetPlan::DynamicEquality { index, key, param } => {
+                    super::super::count::validate_edge_equality_index(&index.index_id, key)?;
+                    let value =
+                        self.index_value(&helix_planner::ir::IndexValue::Param(param.clone()))?;
                     self.lookup_managed_equality_union(
                         crate::index_lifecycle::IndexElementKind::Edge,
                         key,
-                        &values,
+                        core::slice::from_ref(&value),
                     )
                     .await
                     .map(SecondaryIds::Unordered)
@@ -160,25 +208,16 @@ impl<'db> ExecutionContext<'db> {
                     .edge_range_index_ids(&range.key, &range.range, range_limit)
                     .await
                     .map(SecondaryIds::Ordered),
-                exec::ExecEdgeSecondarySetPlan::Intersect(children) => {
-                    let mut children = children.iter();
-                    let mut ids = self
-                        .edge_secondary_ids(
-                            children
-                                .next()
-                                .expect("secondary intersection is statically non-empty"),
-                            None,
-                        )
-                        .await?
-                        .into_bitmap();
-                    for child in children {
+                exec::ExecEdgeSecondarySetPlan::Intersect { driver, rest } => {
+                    let mut ids = self.edge_secondary_ids(driver, None).await?.into_bitmap();
+                    for child in rest {
                         ids &= self.edge_secondary_ids(child, None).await?.into_bitmap();
                     }
                     Ok(SecondaryIds::Unordered(ids))
                 }
-                exec::ExecEdgeSecondarySetPlan::Union(children) => {
-                    let mut ids = roaring::RoaringTreemap::new();
-                    for child in children {
+                exec::ExecEdgeSecondarySetPlan::Union { driver, rest } => {
+                    let mut ids = self.edge_secondary_ids(driver, None).await?.into_bitmap();
+                    for child in rest {
                         ids |= self.edge_secondary_ids(child, None).await?.into_bitmap();
                     }
                     Ok(SecondaryIds::Unordered(ids))

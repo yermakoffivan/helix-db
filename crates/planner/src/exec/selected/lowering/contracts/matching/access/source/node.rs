@@ -22,12 +22,25 @@ pub(super) fn selected_node_access_match(
             physical::PhysicalAccess::RuntimeInput,
         )
         | (ir::NodeAccessPlan::LabelScan { .. }, physical::PhysicalAccess::LabelScan)
-        | (ir::NodeAccessPlan::EqualityIndex { .. }, physical::PhysicalAccess::EqualityIndex)
         | (ir::NodeAccessPlan::RangeIndex { .. }, physical::PhysicalAccess::RangeIndex)
         | (ir::NodeAccessPlan::VectorSearch { .. }, physical::PhysicalAccess::VectorSearch)
         | (ir::NodeAccessPlan::TextSearch { .. }, physical::PhysicalAccess::TextSearch)
-        | (ir::NodeAccessPlan::Intersect(_), physical::PhysicalAccess::SetIntersection)
-        | (ir::NodeAccessPlan::Union(_), physical::PhysicalAccess::SetUnion) => {
+        | (ir::NodeAccessPlan::Intersect(_), physical::PhysicalAccess::SetIntersection) => {
+            SelectedAccessShapeMatch::Matched
+        }
+        (ir::NodeAccessPlan::Union(children), physical::PhysicalAccess::BitmapBatchUnion)
+            if node_union_is_literal_batch(children) =>
+        {
+            SelectedAccessShapeMatch::Matched
+        }
+        (ir::NodeAccessPlan::Union(children), physical::PhysicalAccess::SetUnion)
+            if !node_union_is_literal_batch(children) =>
+        {
+            SelectedAccessShapeMatch::Matched
+        }
+        (ir::NodeAccessPlan::EqualityIndex { index, value, .. }, access)
+            if node_equality_access_matches(index, value, access) =>
+        {
             SelectedAccessShapeMatch::Matched
         }
         (
@@ -58,4 +71,57 @@ pub(super) fn selected_node_access_match(
             SelectedAccessShapeMismatch::PhysicalAccessFamilyMismatch,
         ),
     }
+}
+
+fn node_union_is_literal_batch(children: &ir::AtLeast<ir::NodeAccessSourcePlan, 2>) -> bool {
+    let Some(ir::NodeAccessPlan::EqualityIndex {
+        index: first_index,
+        key: first_key,
+        value: first_value,
+    }) = children.first().map(AsRef::as_ref)
+    else {
+        return false;
+    };
+    first_index.uniqueness == crate::catalog::IndexUniqueness::NonUnique
+        && first_value.semantics() == ir::EqualityIndexValueSemantics::Indexed
+        && children.iter().all(|child| {
+            matches!(
+                child.as_ref(),
+                ir::NodeAccessPlan::EqualityIndex { index, key, value }
+                    if index == first_index
+                        && key == first_key
+                        && value.semantics() == ir::EqualityIndexValueSemantics::Indexed
+            )
+        })
+}
+
+fn node_equality_access_matches(
+    index: &crate::catalog::NodeEqualityIndexMeta,
+    value: &ir::IndexValue,
+    access: &physical::PhysicalAccess,
+) -> bool {
+    matches!(
+        (value.semantics(), index.uniqueness, access),
+        (
+            ir::EqualityIndexValueSemantics::NonReflexive,
+            _,
+            physical::PhysicalAccess::Empty,
+        ) | (
+            ir::EqualityIndexValueSemantics::Indexed,
+            crate::catalog::IndexUniqueness::NonUnique,
+            physical::PhysicalAccess::EqualityBitmapPoint,
+        ) | (
+            ir::EqualityIndexValueSemantics::Indexed,
+            crate::catalog::IndexUniqueness::Unique,
+            physical::PhysicalAccess::EqualityUniqueVerified,
+        ) | (
+            ir::EqualityIndexValueSemantics::AuthoritativeNull,
+            _,
+            physical::PhysicalAccess::EqualityAuthoritativeScan,
+        ) | (
+            ir::EqualityIndexValueSemantics::RuntimeDependent,
+            _,
+            physical::PhysicalAccess::EqualityDynamic,
+        )
+    )
 }

@@ -66,29 +66,12 @@ impl<'db> ExecutionContext<'db> {
                 window.apply(self.edge_bitmap(&plan.bitmap).await?.len() as usize)
             }
             exec::ExecCountPlan::NodeUnique(plan) => {
-                validate_node_equality_index(
-                    &plan.lookup.index.metadata().index_id,
-                    &plan.lookup.key,
-                )?;
-                if plan.lookup.key != plan.verification.key
-                    || plan.lookup.value != plan.verification.value
-                {
-                    return Err(HelixDbError::InvariantViolation(
-                        "unique count verification does not match its exact owner lookup"
-                            .to_string(),
-                    ));
-                }
                 let window = self.count_window(&plan.window)?;
-                let value = indexed_value(&plan.lookup.value);
-                let ids = self
-                    .lookup_managed_equality_point_exact(
-                        crate::index_lifecycle::IndexElementKind::Node,
-                        &plan.lookup.key,
-                        &value,
-                        true,
-                    )
-                    .await?;
-                window.apply(ids.len() as usize)
+                window.apply(usize::from(
+                    self.verified_node_unique_owner(&plan.lookup, &plan.verification)
+                        .await?
+                        .is_some(),
+                ))
             }
             exec::ExecCountPlan::NodeRange(plan) => {
                 validate_range_index("node_range:", &plan.driver.index.index_id, &plan.driver.key)?;
@@ -536,7 +519,7 @@ impl<'db> ExecutionContext<'db> {
         Ok(accepted)
     }
 
-    async fn scoped_null_matches(
+    pub(in crate::execution::interpreter) async fn scoped_null_matches(
         &self,
         row: &ExecutionRow,
         key: &helix_planner::catalog::ScopedPropertyKey,
@@ -557,7 +540,60 @@ impl<'db> ExecutionContext<'db> {
             .is_none_or(|value| matches!(value, DbPropertyValue::Null)))
     }
 
-    fn node_bitmap<'a>(
+    /// Execute the exact unique-owner primitive and verify the authoritative row.
+    ///
+    /// An absent owner is a legitimate miss. A present owner whose label or
+    /// indexed value disagrees with the plan is catalog corruption, never a
+    /// reason to substitute an authoritative scan.
+    pub(in crate::execution::interpreter) async fn verified_node_unique_owner(
+        &self,
+        lookup: &exec::ExecNodeUniqueOwnerReadPlan,
+        verification: &exec::ExecNodeAuthoritativeVerificationPlan,
+    ) -> Result<Option<u64>> {
+        validate_node_equality_index(&lookup.index.metadata().index_id, &lookup.key)?;
+        if lookup.key != verification.key || lookup.value != verification.value {
+            return Err(HelixDbError::InvariantViolation(
+                "unique verification does not match its exact owner lookup".to_string(),
+            ));
+        }
+        let ids = self
+            .lookup_managed_equality_point_exact(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &lookup.key,
+                &indexed_value(&lookup.value),
+                true,
+            )
+            .await?;
+        let mut ids = ids.into_iter();
+        let Some(id) = ids.next() else {
+            return Ok(None);
+        };
+        if ids.next().is_some() {
+            return Err(HelixDbError::IndexCatalogCorruption(
+                "unique equality owner read returned multiple node IDs".to_string(),
+            ));
+        }
+        let row = ExecutionRow::current(ElementRef::Node(id));
+        let expected = indexed_value(&verification.value);
+        crate::index_lifecycle::secondary::record_equality_graph_read();
+        let properties = self.row_properties(&row).await?;
+        let label_matches = properties.iter().any(|property| {
+            property.name == "$label"
+                && property.value.as_str() == Some(verification.key.label.as_ref())
+        });
+        let value_matches = properties.iter().any(|property| {
+            property.name == verification.key.property.as_ref()
+                && property.value.eq_value(&expected)
+        });
+        if !label_matches || !value_matches {
+            return Err(HelixDbError::IndexCatalogCorruption(
+                "unique equality owner disagrees with its authoritative node".to_string(),
+            ));
+        }
+        Ok(Some(id))
+    }
+
+    pub(in crate::execution::interpreter) fn node_bitmap<'a>(
         &'a self,
         expression: &'a exec::ExecNodeBitmapExpr,
     ) -> BoxFuture<'a, Result<roaring::RoaringTreemap>> {
@@ -603,7 +639,7 @@ impl<'db> ExecutionContext<'db> {
         .boxed()
     }
 
-    fn edge_bitmap<'a>(
+    pub(in crate::execution::interpreter) fn edge_bitmap<'a>(
         &'a self,
         expression: &'a exec::ExecEdgeBitmapExpr,
     ) -> BoxFuture<'a, Result<roaring::RoaringTreemap>> {
@@ -680,27 +716,12 @@ impl<'db> ExecutionContext<'db> {
                 exec::ExecCountCursorPlan::NodeUnique {
                     lookup,
                     verification,
-                } => {
-                    validate_node_equality_index(&lookup.index.metadata().index_id, &lookup.key)?;
-                    if lookup.key != verification.key || lookup.value != verification.value {
-                        return Err(HelixDbError::InvariantViolation(
-                            "unique count cursor verification does not match its exact owner lookup"
-                                .to_string(),
-                        ));
-                    }
-                    let value = indexed_value(&lookup.value);
-                    Ok(self
-                        .lookup_managed_equality_point_exact(
-                            crate::index_lifecycle::IndexElementKind::Node,
-                            &lookup.key,
-                            &value,
-                            true,
-                        )
-                        .await?
-                        .into_iter()
-                        .map(|id| ExecutionRow::current(ElementRef::Node(id)))
-                        .collect())
-                }
+                } => Ok(self
+                    .verified_node_unique_owner(lookup, verification)
+                    .await?
+                    .into_iter()
+                    .map(|id| ExecutionRow::current(ElementRef::Node(id)))
+                    .collect()),
                 exec::ExecCountCursorPlan::NodeRange(plan) => Ok(self
                     .validated_node_range_ids(plan)
                     .await?
@@ -1072,7 +1093,9 @@ impl<'db> ExecutionContext<'db> {
     }
 }
 
-fn indexed_value(value: &exec::ExecIndexedEqualityValue) -> DbPropertyValue {
+pub(in crate::execution::interpreter) fn indexed_value(
+    value: &exec::ExecIndexedEqualityValue,
+) -> DbPropertyValue {
     stream::ast_to_db_value(value.literal().as_property_value().clone())
 }
 
@@ -1090,14 +1113,14 @@ fn count_shape_error(expected: &str, actual: &ExecutionValue) -> HelixDbError {
     HelixDbError::InvariantViolation(format!("count plan expected {expected}, got {actual:?}"))
 }
 
-fn validate_node_equality_index(
+pub(in crate::execution::interpreter) fn validate_node_equality_index(
     index_id: &ir::NonEmptyString,
     key: &helix_planner::catalog::ScopedPropertyKey,
 ) -> Result<()> {
     validate_index_id("node_eq:", index_id, key)
 }
 
-fn validate_edge_equality_index(
+pub(in crate::execution::interpreter) fn validate_edge_equality_index(
     index_id: &ir::NonEmptyString,
     key: &helix_planner::catalog::ScopedPropertyKey,
 ) -> Result<()> {
@@ -1246,7 +1269,7 @@ mod tests {
         assert_eq!(
             crate::index_lifecycle::secondary::equality_read_metrics(),
             crate::index_lifecycle::secondary::SecondaryEqualityReadMetrics {
-                point_reads: 1,
+                point_reads: 2,
                 multi_get_calls: 0,
                 scans: 0,
                 graph_reads: 0,
@@ -1269,7 +1292,7 @@ mod tests {
         assert_eq!(
             crate::index_lifecycle::secondary::equality_read_metrics(),
             crate::index_lifecycle::secondary::SecondaryEqualityReadMetrics {
-                point_reads: 2,
+                point_reads: 3,
                 multi_get_calls: 1,
                 scans: 0,
                 graph_reads: 0,
@@ -1303,6 +1326,92 @@ mod tests {
                 .to_string()
                 .contains("node_eq:Other:status` disagrees with `node_eq:User:status"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_count_performs_one_owner_read_and_one_authoritative_verification() {
+        let db = test_support::open_db_with_config(
+            test_support::in_memory_config("count-exact-unique-owner")
+                .with_unique_equality_index("User", "email"),
+        )
+        .await;
+        test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("email", PropertyValue::from("alice@example.com"))],
+        )
+        .await;
+        let exact = exec::ExecNodeAccessPlan::exact_equality(
+            catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:User:email"))
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+            catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
+            ir::IndexValue::Literal(
+                ir::SecondaryIndexLiteral::new(PropertyValue::from("alice@example.com")).unwrap(),
+            ),
+        );
+        let exec::ExecNodeAccessPlan::Unique {
+            lookup,
+            verification,
+        } = exact
+        else {
+            panic!("unique metadata must select the exact unique family")
+        };
+        crate::index_lifecycle::secondary::reset_equality_read_metrics();
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeUnique(exec::ExecNodeUniqueCountPlan {
+                    lookup,
+                    verification,
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        assert_eq!(
+            crate::index_lifecycle::secondary::equality_read_metrics(),
+            crate::index_lifecycle::secondary::SecondaryEqualityReadMetrics {
+                point_reads: 2,
+                multi_get_calls: 0,
+                scans: 0,
+                graph_reads: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_null_count_applies_its_normalized_window_after_matches() {
+        let db = test_support::open_db("count-authoritative-null-window").await;
+        for properties in [
+            vec![("status", PropertyValue::Null)],
+            Vec::new(),
+            vec![("status", PropertyValue::Null)],
+            vec![("status", PropertyValue::from("active"))],
+        ] {
+            test_support::add_node_with_properties(&db, "User", properties).await;
+        }
+        test_support::add_node_with_properties(&db, "Other", vec![("status", PropertyValue::Null)])
+            .await;
+        let window = exec::ExecCountWindowPlan::identity()
+            .then_skip(exec::ExecUsizeExpr::literal(1))
+            .then_limit(exec::ExecUsizeExpr::literal(1));
+
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeAuthoritativeScan(exec::ExecNodeScanCountPlan {
+                    predicate: exec::ExecNodeAuthoritativeScanPredicate::NullEquality {
+                        key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                    },
+                    window,
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(1)
         );
     }
 }

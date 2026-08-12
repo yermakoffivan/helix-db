@@ -97,7 +97,9 @@ fn required_for_access(plan: &exec::ExecAccessPlan) -> RequiredMutationVisibilit
     match plan {
         exec::ExecAccessPlan::Limited(plan) => required_for_access(plan.source()),
         exec::ExecAccessPlan::Node(plan) => match plan {
-            exec::ExecNodeAccessPlan::EqualityIndex { .. }
+            exec::ExecNodeAccessPlan::Bitmap { .. }
+            | exec::ExecNodeAccessPlan::Unique { .. }
+            | exec::ExecNodeAccessPlan::DynamicEquality { .. }
             | exec::ExecNodeAccessPlan::RangeIndex { .. }
             | exec::ExecNodeAccessPlan::SecondarySet { .. } => {
                 RequiredMutationVisibility::one(DeferredMutationFamily::Secondary)
@@ -111,13 +113,17 @@ fn required_for_access(plan: &exec::ExecAccessPlan) -> RequiredMutationVisibilit
             exec::ExecNodeAccessPlan::Empty
             | exec::ExecNodeAccessPlan::FromParam { .. }
             | exec::ExecNodeAccessPlan::FromVar { .. }
-            | exec::ExecNodeAccessPlan::AllScan => RequiredMutationVisibility::NONE,
+            | exec::ExecNodeAccessPlan::AllScan
+            | exec::ExecNodeAccessPlan::AuthoritativeScan { .. } => {
+                RequiredMutationVisibility::NONE
+            }
             exec::ExecNodeAccessPlan::LabelScan { .. } => {
                 RequiredMutationVisibility::one(DeferredMutationFamily::Topology)
             }
         },
         exec::ExecAccessPlan::Edge(plan) => match plan {
-            exec::ExecEdgeAccessPlan::EqualityIndex { .. }
+            exec::ExecEdgeAccessPlan::Bitmap { .. }
+            | exec::ExecEdgeAccessPlan::DynamicEquality { .. }
             | exec::ExecEdgeAccessPlan::RangeIndex { .. }
             | exec::ExecEdgeAccessPlan::SecondarySet { .. } => {
                 RequiredMutationVisibility::one(DeferredMutationFamily::Secondary)
@@ -131,7 +137,10 @@ fn required_for_access(plan: &exec::ExecAccessPlan) -> RequiredMutationVisibilit
             exec::ExecEdgeAccessPlan::Empty
             | exec::ExecEdgeAccessPlan::FromParam { .. }
             | exec::ExecEdgeAccessPlan::FromVar { .. }
-            | exec::ExecEdgeAccessPlan::AllScan => RequiredMutationVisibility::NONE,
+            | exec::ExecEdgeAccessPlan::AllScan
+            | exec::ExecEdgeAccessPlan::AuthoritativeScan { .. } => {
+                RequiredMutationVisibility::NONE
+            }
             exec::ExecEdgeAccessPlan::LabelScan { .. } => {
                 RequiredMutationVisibility::one(DeferredMutationFamily::Topology)
             }
@@ -167,18 +176,16 @@ mod tests {
     fn search_accesses_require_only_their_physical_family() {
         let secondary = exec::ExecOp::Access {
             plan: Box::new(exec::ExecAccessPlan::Node(
-                exec::ExecNodeAccessPlan::EqualityIndex {
-                    index: helix_planner::catalog::NodeEqualityIndexMeta::try_new("user-email")
-                        .unwrap(),
-                    key: helix_planner::catalog::ScopedPropertyKey::try_new("User", "email")
-                        .unwrap(),
-                    value: helix_planner::ir::IndexValue::Literal(
+                exec::ExecNodeAccessPlan::exact_equality(
+                    helix_planner::catalog::NodeEqualityIndexMeta::try_new("user-email").unwrap(),
+                    helix_planner::catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
+                    helix_planner::ir::IndexValue::Literal(
                         helix_planner::ir::SecondaryIndexLiteral::new(
                             helix_ast::value::PropertyValue::from("a@example.com"),
                         )
                         .unwrap(),
                     ),
-                },
+                ),
             )),
         };
         let required = required_for(&secondary);

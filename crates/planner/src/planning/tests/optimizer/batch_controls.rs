@@ -76,7 +76,7 @@ fn cascades_batch_conditions_preserve_selected_index_runs_and_dependencies() {
             ExecOp::Access { plan }
                 if matches!(
                     plan.as_ref(),
-                    ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+                    ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
                         if key.label == "Audit" && key.property == "event_id"
                 )
         ));
@@ -128,7 +128,7 @@ fn cascades_repeated_roots_preserve_aliases_while_reusing_memo_work() {
             ExecOp::Access { plan }
                 if matches!(
                     plan.as_ref(),
-                    ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, .. })
+                    ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap { bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { key, .. } })
                         if key.label == "Audit" && key.property == "event_id"
                 )
         ));
@@ -211,10 +211,10 @@ fn cascades_foreach_body_preserves_selected_index_runs_and_body_conditions() {
         ExecOp::Access { plan }
             if matches!(
                 plan.as_ref(),
-                ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, value, .. })
+                ExecAccessPlan::Node(ExecNodeAccessPlan::DynamicEquality { key, param, .. })
                     if key.label == "Audit"
                         && key.property == "event_id"
-                        && matches!(value, IndexValue::Param(name) if name.as_ref() == "event_id")
+                        && param.as_ref() == "event_id"
             )
     ));
     assert!(matches!(
@@ -278,10 +278,10 @@ fn cascades_nested_foreach_bodies_preserve_selected_index_runs() {
         ExecOp::Access { plan }
             if matches!(
                 plan.as_ref(),
-                ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, value, .. })
+                ExecAccessPlan::Node(ExecNodeAccessPlan::DynamicEquality { key, param, .. })
                     if key.label == "Audit"
                         && key.property == "event_id"
-                        && matches!(value, IndexValue::Param(name) if name.as_ref() == "event_id")
+                        && param.as_ref() == "event_id"
             )
     ));
     let ExecOp::ForEach {
@@ -300,10 +300,10 @@ fn cascades_nested_foreach_bodies_preserve_selected_index_runs() {
         ExecOp::Access { plan }
             if matches!(
                 plan.as_ref(),
-                ExecAccessPlan::Node(ExecNodeAccessPlan::EqualityIndex { key, value, .. })
+                ExecAccessPlan::Node(ExecNodeAccessPlan::DynamicEquality { key, param, .. })
                     if key.label == "Audit"
                         && key.property == "event_id"
-                        && matches!(value, IndexValue::Param(name) if name.as_ref() == "event_id")
+                        && param.as_ref() == "event_id"
             )
     ));
     assert_eq!(

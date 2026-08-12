@@ -223,7 +223,9 @@ pub(crate) fn assert_batched_node_equality_set(
     assert!(matches!(
         unwrapped_first_exec_access(plan),
         ExecAccessPlan::Node(ExecNodeAccessPlan::SecondarySet {
-            set: crate::exec::ExecNodeSecondarySetPlan::Equality { key, values, .. }
+            set: crate::exec::ExecNodeSecondarySetPlan::Bitmap(
+                crate::exec::ExecNodeBitmapExpr::BatchedUnionRead { key, values, .. }
+            )
         }) if key.label == label && key.property == property && values.len() == value_count
     ));
 }
@@ -237,7 +239,9 @@ pub(crate) fn assert_batched_edge_equality_set(
     assert!(matches!(
         unwrapped_first_exec_access(plan),
         ExecAccessPlan::Edge(ExecEdgeAccessPlan::SecondarySet {
-            set: crate::exec::ExecEdgeSecondarySetPlan::Equality { key, values, .. }
+            set: crate::exec::ExecEdgeSecondarySetPlan::Bitmap(
+                crate::exec::ExecEdgeBitmapExpr::BatchedUnionRead { key, values, .. }
+            )
         }) if key.label == label && key.property == property && values.len() == value_count
     ));
 }
@@ -256,7 +260,10 @@ pub(crate) fn assert_ordered_edge_secondary_intersection(
             && driver.key.property == range_property
             && filters.iter().any(|filter| matches!(
                 filter,
-                crate::exec::ExecEdgeSecondarySetPlan::Equality { key, .. }
+                crate::exec::ExecEdgeSecondarySetPlan::Bitmap(
+                    crate::exec::ExecEdgeBitmapExpr::PointRead { key, .. }
+                    | crate::exec::ExecEdgeBitmapExpr::BatchedUnionRead { key, .. }
+                )
                     if key.label == label && key.property == equality_property
             ))
     ));
@@ -276,7 +283,10 @@ pub(crate) fn assert_ordered_node_secondary_intersection(
             && driver.key.property == range_property
             && filters.iter().any(|filter| matches!(
                 filter,
-                crate::exec::ExecNodeSecondarySetPlan::Equality { key, .. }
+                crate::exec::ExecNodeSecondarySetPlan::Bitmap(
+                    crate::exec::ExecNodeBitmapExpr::PointRead { key, .. }
+                    | crate::exec::ExecNodeBitmapExpr::BatchedUnionRead { key, .. }
+                )
                     if key.label == label && key.property == equality_property
             ))
     ));

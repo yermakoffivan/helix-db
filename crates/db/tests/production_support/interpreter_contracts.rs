@@ -861,13 +861,13 @@ pub(crate) async fn run_request_read_view_guards() {
             .expect("range key validates");
     for (plan, expected) in [
         (
-            exec::ExecAccessPlan::Node(exec::ExecNodeAccessPlan::EqualityIndex {
-                index: catalog::NodeEqualityIndexMeta::new(
+            exec::ExecAccessPlan::Node(exec::ExecNodeAccessPlan::exact_equality(
+                catalog::NodeEqualityIndexMeta::new(
                     ir::NonEmptyString::new("guard-node-equality").expect("index ID is non-empty"),
                 ),
-                key: property_key.clone(),
-                value: property_value.clone(),
-            }),
+                property_key.clone(),
+                property_value.clone(),
+            )),
             "secondary equality lookup escaped its request read view",
         ),
         (
@@ -877,13 +877,13 @@ pub(crate) async fn run_request_read_view_guards() {
             "global edge label lookup escaped its request read view",
         ),
         (
-            exec::ExecAccessPlan::Edge(exec::ExecEdgeAccessPlan::EqualityIndex {
-                index: catalog::EdgeEqualityIndexMeta::new(
+            exec::ExecAccessPlan::Edge(exec::ExecEdgeAccessPlan::exact_equality(
+                catalog::EdgeEqualityIndexMeta::new(
                     ir::NonEmptyString::new("guard-edge-equality").expect("index ID is non-empty"),
                 ),
-                key: property_key,
-                value: property_value,
-            }),
+                property_key,
+                property_value,
+            )),
             "edge secondary equality lookup escaped its request read view",
         ),
         (
