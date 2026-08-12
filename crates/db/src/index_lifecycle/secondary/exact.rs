@@ -245,6 +245,266 @@ async fn consume_active_range_rows(
     Ok(owners)
 }
 
+#[cfg(all(feature = "production-coverage", not(test)))]
+pub(crate) async fn run_production_contracts() {
+    use slatedb::object_store::memory::InMemory;
+
+    fn active_handle(
+        definition: crate::index_lifecycle::ValidatedDynamicIndexDefinition,
+        physical: crate::index_lifecycle::PhysicalGeneration,
+    ) -> ActiveIndexHandle {
+        let building = crate::index_lifecycle::IndexRecordV2::building(
+            IndexId::initial(),
+            definition,
+            crate::index_lifecycle::IndexRevision::initial(),
+            physical,
+            crate::index_lifecycle::IndexOperationId::new_v4(),
+        )
+        .expect("exact serving fixture starts building");
+        let active = building
+            .transition(crate::index_lifecycle::IndexStateTransition::Activate)
+            .expect("exact serving fixture activates");
+        ActiveIndexHandle::try_from_record(DataScope::LegacyUnscoped, &active)
+            .expect("exact serving fixture projects an Active handle")
+    }
+
+    fn secondary_handle(definition: crate::config::SecondaryIndexDefinition) -> ActiveIndexHandle {
+        active_handle(
+            crate::index_lifecycle::ValidatedDynamicIndexDefinition::try_from(definition)
+                .expect("exact secondary fixture validates"),
+            crate::index_lifecycle::PhysicalGeneration::Secondary {
+                generation: IndexGenerationId::initial(),
+            },
+        )
+    }
+
+    async fn put_entry(db: &slatedb::Db, handle: &ActiveIndexHandle, value: &str, entity_id: u64) {
+        let definition = handle
+            .secondary_definition()
+            .expect("exact entry fixture uses a secondary handle");
+        let direction = match definition.direction() {
+            RangeIndexDirection::Asc => StorageRangeIndexDirection::Asc,
+            RangeIndexDirection::Desc => StorageRangeIndexDirection::Desc,
+        };
+        let canonical = if definition_uses_equality_bitmap(definition)
+            || matches!(
+                definition,
+                ValidatedSecondaryIndexDefinition::NodeEquality { unique: true, .. }
+            ) {
+            CanonicalSecondaryValue::equality_string(value)
+        } else {
+            CanonicalSecondaryValue::range_string(direction, value)
+        };
+        let entity_id = IndexEntityId::new(entity_id);
+        let lane = definition_lane(definition);
+        let key = secondary_entry_key(
+            handle.scope(),
+            handle.index_id(),
+            handle.generation(),
+            definition,
+            canonical,
+            entity_id,
+        )
+        .expect("exact entry key validates");
+        let value_bytes = if definition_uses_equality_bitmap(definition) {
+            SecondaryEqualityBitmapValue::new(roaring::RoaringTreemap::from_iter([entity_id.get()]))
+                .encode()
+        } else {
+            encode_secondary_entry(&SecondaryEntryValue {
+                index_id: handle.index_id(),
+                generation: handle.generation(),
+                lane,
+                entity_id,
+            })
+        };
+        db.put(key, value_bytes)
+            .await
+            .expect("exact entry persists");
+        db.put(
+            authoritative_property_key(
+                handle.scope(),
+                IndexEntity {
+                    kind: definition.element_kind(),
+                    id: entity_id,
+                },
+            ),
+            crate::encoding::v1::property::encode_properties(&[
+                Property::string("$label", definition.label().as_str()),
+                Property::string(definition.property().as_str(), value),
+            ]),
+        )
+        .await
+        .expect("exact authoritative row persists");
+    }
+
+    let db = slatedb::Db::builder(
+        "secondary-exact-production-contracts",
+        Arc::new(InMemory::new()),
+    )
+    .with_merge_operator(Arc::new(crate::merge_operator::HelixMergeOperator::new()))
+    .build()
+    .await
+    .expect("exact serving database opens");
+    let equality = secondary_handle(
+        crate::config::SecondaryIndexDefinition::node_equality("User", "value").unwrap(),
+    );
+    let unique = secondary_handle(
+        crate::config::SecondaryIndexDefinition::node_unique_equality("User", "value").unwrap(),
+    );
+    let range = secondary_handle(
+        crate::config::SecondaryIndexDefinition::node_range_desc("User", "value").unwrap(),
+    );
+    let text_definition = crate::index_lifecycle::ValidatedDynamicIndexDefinition::try_from(
+        crate::config::TextIndexDefinition::new_node("User", "value").unwrap(),
+    )
+    .unwrap();
+    let text = active_handle(
+        text_definition,
+        crate::index_lifecycle::PhysicalGeneration::Text {
+            generation: IndexGenerationId::initial(),
+        },
+    );
+
+    assert!(lookup_active_equality_point_literal(
+        &db,
+        &text,
+        &PropertyValue::String("value".to_string()),
+    )
+    .await
+    .is_err());
+    assert!(lookup_active_equality_point_literal(
+        &db,
+        &range,
+        &PropertyValue::String("value".to_string()),
+    )
+    .await
+    .is_err());
+    assert!(
+        lookup_active_equality_point_literal(&db, &equality, &PropertyValue::Null)
+            .await
+            .is_err()
+    );
+    assert!(lookup_active_equality_point_literal(
+        &db,
+        &equality,
+        &PropertyValue::String("missing".to_string()),
+    )
+    .await
+    .unwrap()
+    .is_empty());
+
+    put_entry(&db, &equality, "same", 3).await;
+    put_entry(&db, &unique, "owner", 7).await;
+    assert_eq!(
+        lookup_active_equality_point_literal(
+            &db,
+            &unique,
+            &PropertyValue::String("owner".to_string()),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Vec<_>>(),
+        vec![7]
+    );
+    assert!(lookup_active_equality_literal_batch(
+        &db,
+        &equality,
+        &[PropertyValue::String("same".to_string())],
+    )
+    .await
+    .is_err());
+    assert!(lookup_active_equality_literal_batch(
+        &db,
+        &text,
+        &[
+            PropertyValue::String("same".to_string()),
+            PropertyValue::String("other".to_string()),
+        ],
+    )
+    .await
+    .is_err());
+    assert!(lookup_active_equality_literal_batch(
+        &db,
+        &unique,
+        &[
+            PropertyValue::String("same".to_string()),
+            PropertyValue::String("other".to_string()),
+        ],
+    )
+    .await
+    .is_err());
+    assert!(lookup_active_equality_literal_batch(
+        &db,
+        &equality,
+        &[
+            PropertyValue::String("same".to_string()),
+            PropertyValue::Null,
+        ],
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        lookup_active_equality_literal_batch(
+            &db,
+            &equality,
+            &[
+                PropertyValue::String("same".to_string()),
+                PropertyValue::String("missing".to_string()),
+            ],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Vec<_>>(),
+        vec![3]
+    );
+
+    assert!(
+        scan_active_range_generation_with_membership(&db, &text, None, None, &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        scan_active_range_generation_with_membership(&db, &equality, None, None, &[])
+            .await
+            .is_err()
+    );
+    assert!(scan_active_range_generation_with_membership(
+        &db,
+        &range,
+        Some(&SecondaryRangeQuery::Between {
+            lower: PropertyValue::String("z".to_string()),
+            lower_inclusive: true,
+            upper: PropertyValue::String("a".to_string()),
+            upper_inclusive: true,
+        }),
+        None,
+        &[],
+    )
+    .await
+    .unwrap()
+    .is_empty());
+
+    put_entry(&db, &range, "a", 1).await;
+    put_entry(&db, &range, "b", 2).await;
+    let rejects_all = roaring::RoaringTreemap::new();
+    assert!(
+        scan_active_range_generation_with_membership(&db, &range, None, None, &[rejects_all],)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        scan_active_range_generation_with_membership(&db, &range, None, Some(1), &[])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    db.close().await.expect("exact serving database closes");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3679,6 +3679,7 @@ mod tests {
 
     #[cfg(all(feature = "production-coverage", not(test)))]
     pub(super) async fn run_production_contracts() {
+        test_support::run_production_contracts().await;
         evaluated_windows_and_index_identity_validation_cover_boundaries();
         direct_non_search_count_families_match_materialized_sources().await;
         every_direct_storage_count_propagates_its_own_read_failure().await;

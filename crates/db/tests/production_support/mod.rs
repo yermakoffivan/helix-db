@@ -83,6 +83,11 @@ pub async fn interpreter_cardinality_program_contracts() {
     crate::execution::interpreter::run_cardinality_production_contracts().await;
 }
 
+/// Exercises literal secondary reads and verified ranges through exact storage primitives.
+pub async fn secondary_exact_storage_contracts() {
+    crate::index_lifecycle::secondary::run_exact_production_contracts().await;
+}
+
 /// Rejects or completes legacy secondary work when automatic driving is disabled.
 pub async fn migration_disabled_secondary_worker_open_contract() {
     crate::migrations::production_contracts::run_disabled_secondary_worker_open_contract().await;

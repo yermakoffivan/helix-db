@@ -81,6 +81,8 @@ use crate::index_lifecycle::{
 use super::IndexScopeGates;
 
 mod exact;
+#[cfg(all(feature = "production-coverage", not(test)))]
+pub(crate) use exact::run_production_contracts as run_exact_production_contracts;
 pub(crate) use exact::{
     lookup_active_equality_literal_batch, lookup_active_equality_point_literal,
     record_equality_graph_read, scan_active_range_generation_with_membership,
