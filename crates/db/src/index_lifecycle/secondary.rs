@@ -2908,6 +2908,9 @@ pub(crate) async fn lookup_active_equality_generations(
     handle: &ActiveIndexHandle,
     values: &[PropertyValue],
 ) -> Result<roaring::RoaringTreemap> {
+    if values.is_empty() {
+        return Ok(roaring::RoaringTreemap::new());
+    }
     let Some(definition) = handle.secondary_definition() else {
         return Err(corruption(
             "secondary equality batch serving received a non-secondary Active handle",
@@ -2948,6 +2951,21 @@ pub(crate) async fn lookup_active_equality_generations(
     keys.sort_unstable();
     keys.dedup();
     keys.iter().for_each(|_| record_equality_point_read());
+    if keys.len() == 1 {
+        return reader
+            .get(
+                keys.pop()
+                    .expect("one-key equality batch remains non-empty"),
+            )
+            .await?
+            .map(|bytes| {
+                SecondaryEqualityBitmapValue::decode(&bytes)
+                    .map(SecondaryEqualityBitmapValue::into_ids)
+                    .map_err(HelixDbError::from)
+            })
+            .transpose()
+            .map(Option::unwrap_or_default);
+    }
     #[cfg(any(test, feature = "production-coverage"))]
     BENCHMARK_MULTI_GETS.fetch_add(1, AtomicOrdering::Relaxed);
     let mut owners = roaring::RoaringTreemap::new();

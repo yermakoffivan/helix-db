@@ -787,7 +787,7 @@ mod tests {
             crate::index_lifecycle::secondary::equality_read_metrics(),
             crate::index_lifecycle::secondary::SecondaryEqualityReadMetrics {
                 point_reads: 1,
-                multi_get_calls: 1,
+                multi_get_calls: 0,
                 scans: 0,
                 graph_reads: 0,
             }
@@ -851,7 +851,7 @@ mod tests {
             crate::index_lifecycle::secondary::equality_read_metrics(),
             crate::index_lifecycle::secondary::SecondaryEqualityReadMetrics {
                 point_reads: 2,
-                multi_get_calls: 1,
+                multi_get_calls: 0,
                 scans: 0,
                 graph_reads: 0,
             }
@@ -917,7 +917,7 @@ mod tests {
             crate::index_lifecycle::secondary::equality_read_metrics(),
             crate::index_lifecycle::secondary::SecondaryEqualityReadMetrics {
                 point_reads: 1,
-                multi_get_calls: 1,
+                multi_get_calls: 0,
                 scans: 0,
                 graph_reads: 0,
             }

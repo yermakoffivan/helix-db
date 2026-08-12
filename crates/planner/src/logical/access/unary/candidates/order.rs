@@ -42,12 +42,76 @@ fn access_order_satisfaction_candidate(access: &AccessPath, ordering: &ir::Order
     match access {
         AccessPath::Node(path) => match path.source().as_ref() {
             ir::NodeAccessPlan::RangeIndex { key, .. } => range_satisfies_order(key, required),
+            ir::NodeAccessPlan::Intersect(children)
+                if children
+                    .iter()
+                    .all(|child| node_is_secondary(child.as_ref())) =>
+            {
+                children.iter().any(|child| {
+                    matches!(
+                        child.as_ref(),
+                        ir::NodeAccessPlan::RangeIndex { key, .. }
+                            if range_satisfies_order(key, required)
+                    )
+                })
+            }
             _ => false,
         },
         AccessPath::Edge(path) => match path.source().as_ref() {
             ir::EdgeAccessPlan::RangeIndex { key, .. } => range_satisfies_order(key, required),
+            ir::EdgeAccessPlan::Intersect(children)
+                if children
+                    .iter()
+                    .all(|child| edge_is_secondary(child.as_ref())) =>
+            {
+                children.iter().any(|child| {
+                    matches!(
+                        child.as_ref(),
+                        ir::EdgeAccessPlan::RangeIndex { key, .. }
+                            if range_satisfies_order(key, required)
+                    )
+                })
+            }
             _ => false,
         },
+    }
+}
+
+fn node_is_secondary(plan: &ir::NodeAccessPlan) -> bool {
+    match plan {
+        ir::NodeAccessPlan::Empty
+        | ir::NodeAccessPlan::EqualityIndex { .. }
+        | ir::NodeAccessPlan::RangeIndex { .. } => true,
+        ir::NodeAccessPlan::Intersect(children) | ir::NodeAccessPlan::Union(children) => children
+            .iter()
+            .all(|child| node_is_secondary(child.as_ref())),
+        ir::NodeAccessPlan::PointIds { .. }
+        | ir::NodeAccessPlan::FromParam { .. }
+        | ir::NodeAccessPlan::FromVar { .. }
+        | ir::NodeAccessPlan::AllScan
+        | ir::NodeAccessPlan::LabelScan { .. }
+        | ir::NodeAccessPlan::VectorSearch { .. }
+        | ir::NodeAccessPlan::TextSearch { .. }
+        | ir::NodeAccessPlan::ScanThenFilter { .. } => false,
+    }
+}
+
+fn edge_is_secondary(plan: &ir::EdgeAccessPlan) -> bool {
+    match plan {
+        ir::EdgeAccessPlan::Empty
+        | ir::EdgeAccessPlan::EqualityIndex { .. }
+        | ir::EdgeAccessPlan::RangeIndex { .. } => true,
+        ir::EdgeAccessPlan::Intersect(children) | ir::EdgeAccessPlan::Union(children) => children
+            .iter()
+            .all(|child| edge_is_secondary(child.as_ref())),
+        ir::EdgeAccessPlan::PointIds { .. }
+        | ir::EdgeAccessPlan::FromParam { .. }
+        | ir::EdgeAccessPlan::FromVar { .. }
+        | ir::EdgeAccessPlan::AllScan
+        | ir::EdgeAccessPlan::LabelScan { .. }
+        | ir::EdgeAccessPlan::VectorSearch { .. }
+        | ir::EdgeAccessPlan::TextSearch { .. }
+        | ir::EdgeAccessPlan::ScanThenFilter { .. } => false,
     }
 }
 

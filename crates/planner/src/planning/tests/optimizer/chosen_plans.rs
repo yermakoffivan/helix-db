@@ -752,6 +752,42 @@ fn cascades_chosen_access_matrix_proves_index_set_families() {
 }
 
 #[test]
+fn cascades_ordered_secondary_intersections_elide_explicit_sorts() {
+    let indexes = chosen_plan_indexes();
+    let node = executable_traversal(
+        g().n_with_label_where(
+            "User",
+            Predicate::and(vec![
+                Predicate::eq("username", "alice"),
+                Predicate::gte("age", 21),
+            ]),
+        )
+        .order_by("age", Order::Asc)
+        .limit(5usize),
+        ctx(indexes.clone()),
+    );
+    let edge = executable_traversal(
+        g().e_with_label_where(
+            "FOLLOWS",
+            Predicate::and(vec![
+                Predicate::eq("status", "active"),
+                Predicate::lte("weight", 50),
+            ]),
+        )
+        .order_by("weight", Order::Asc)
+        .limit(5usize),
+        ctx(indexes),
+    );
+
+    assert_ordered_node_secondary_intersection(&node, "User", "age", "username");
+    assert_ordered_edge_secondary_intersection(&edge, "FOLLOWS", "weight", "status");
+    assert_no_exec_op_family(&node, ExecOpFamily::Order);
+    assert_no_exec_op_family(&edge, ExecOpFamily::Order);
+    assert_eq!(first_limited_access_limit(&node), Some(5));
+    assert_eq!(first_limited_access_limit(&edge), Some(5));
+}
+
+#[test]
 fn cascades_index_set_limits_remain_semantic_after_set_merges() {
     let indexes = chosen_plan_indexes();
 

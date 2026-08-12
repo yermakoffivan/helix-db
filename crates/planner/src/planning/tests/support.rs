@@ -262,6 +262,26 @@ pub(crate) fn assert_ordered_edge_secondary_intersection(
     ));
 }
 
+pub(crate) fn assert_ordered_node_secondary_intersection(
+    plan: &ExecutablePlan,
+    label: &str,
+    range_property: &str,
+    equality_property: &str,
+) {
+    assert!(matches!(
+        unwrapped_first_exec_access(plan),
+        ExecAccessPlan::Node(ExecNodeAccessPlan::SecondarySet {
+            set: crate::exec::ExecNodeSecondarySetPlan::OrderedIntersect { driver, filters }
+        }) if driver.key.label == label
+            && driver.key.property == range_property
+            && filters.iter().any(|filter| matches!(
+                filter,
+                crate::exec::ExecNodeSecondarySetPlan::Equality { key, .. }
+                    if key.label == label && key.property == equality_property
+            ))
+    ));
+}
+
 pub(crate) fn literal_exec_search_k(plan: &ExecutablePlan) -> usize {
     let SearchLimitPlan::Literal(k) = exec_search_k(plan) else {
         panic!(
