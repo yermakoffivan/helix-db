@@ -382,6 +382,19 @@ async fn run_value_dependency_and_row_contracts() {
     );
     context.enable_request_read_view().await.unwrap();
 
+    assert_eq!(
+        interpreter_vector_result(VectorEntityKind::Node, 7)
+            .entity_id()
+            .local_id(),
+        7
+    );
+    assert_eq!(
+        interpreter_vector_result(VectorEntityKind::Edge, 9)
+            .entity_id()
+            .local_id(),
+        9
+    );
+
     let step = |id| exec::ExecStepId::new(id).unwrap();
     let missing = context.dependency_values(&[step(7)]).unwrap_err();
     assert!(missing
