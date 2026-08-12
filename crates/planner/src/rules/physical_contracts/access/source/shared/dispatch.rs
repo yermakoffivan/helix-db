@@ -22,11 +22,13 @@ where
             leaf::label_scan_contract(element, F::label_cardinality(stats, label), storage)
         }
         family::AccessSourceParts::EqualityIndex {
+            index_id,
             key,
             kind,
             semantics,
         } => leaf::equality_index_contract(
             element,
+            index_id,
             key,
             F::equality_cardinality(stats, key),
             F::label_cardinality(stats, &key.label),

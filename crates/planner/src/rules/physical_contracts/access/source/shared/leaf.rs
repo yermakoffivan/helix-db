@@ -88,6 +88,7 @@ pub(super) fn label_scan_contract(
 
 pub(super) fn equality_index_contract(
     element: properties::ElementKind,
+    index_id: &ir::NonEmptyString,
     key: &catalog::ScopedPropertyKey,
     cardinality: Option<u64>,
     label_cardinality: Option<u64>,
@@ -126,6 +127,7 @@ pub(super) fn equality_index_contract(
             id_cost,
             storage.secondary_row_materialization(rows),
             rows,
+            index_id.clone(),
             key.clone(),
         )
     } else {

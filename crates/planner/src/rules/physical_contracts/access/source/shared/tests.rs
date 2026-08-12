@@ -3,14 +3,21 @@ use crate::{catalog, context, cost, exec, ir, properties};
 use helix_ast::index::RangeIndexDirection;
 use std::num::NonZeroUsize;
 
+static TEST_INDEX_ID: std::sync::LazyLock<ir::NonEmptyString> =
+    std::sync::LazyLock::new(|| ir::NonEmptyString::new("node_eq:User:email").unwrap());
+
 #[derive(Debug)]
 enum TestPlan {
     Empty,
     UniqueEquality(catalog::ScopedPropertyKey),
-    NonUniqueEquality(catalog::ScopedPropertyKey),
+    NonUniqueEquality {
+        index_id: ir::NonEmptyString,
+        key: catalog::ScopedPropertyKey,
+    },
     Range(catalog::ScopedPropertyDirectionKey),
     Search(ir::SearchLimitPlan),
     Intersect(Vec<TestPlan>),
+    Union(Vec<TestPlan>),
     Filtered(Box<TestPlan>),
 }
 
@@ -35,11 +42,13 @@ impl AccessSourceFamily for TestFamily {
         match plan {
             TestPlan::Empty => AccessSourceParts::Empty,
             TestPlan::UniqueEquality(key) => AccessSourceParts::EqualityIndex {
+                index_id: &TEST_INDEX_ID,
                 key,
                 kind: EqualityIndexKind::Unique,
                 semantics: ir::EqualityIndexValueSemantics::Indexed,
             },
-            TestPlan::NonUniqueEquality(key) => AccessSourceParts::EqualityIndex {
+            TestPlan::NonUniqueEquality { index_id, key } => AccessSourceParts::EqualityIndex {
+                index_id,
                 key,
                 kind: EqualityIndexKind::NonUnique,
                 semantics: ir::EqualityIndexValueSemantics::Indexed,
@@ -47,6 +56,7 @@ impl AccessSourceFamily for TestFamily {
             TestPlan::Range(key) => AccessSourceParts::RangeIndex { key },
             TestPlan::Search(k) => AccessSourceParts::VectorSearch { k },
             TestPlan::Intersect(plans) => AccessSourceParts::Intersect(plans.iter().collect()),
+            TestPlan::Union(plans) => AccessSourceParts::Union(plans.iter().collect()),
             TestPlan::Filtered(source) => AccessSourceParts::ScanThenFilter { source },
         }
     }
@@ -77,6 +87,13 @@ fn eq_key() -> catalog::ScopedPropertyKey {
     catalog::ScopedPropertyKey::try_new("User", "email").unwrap()
 }
 
+fn non_unique_equality(index_id: &str, key: catalog::ScopedPropertyKey) -> TestPlan {
+    TestPlan::NonUniqueEquality {
+        index_id: ir::NonEmptyString::new(index_id).unwrap(),
+        key,
+    }
+}
+
 fn range_key() -> catalog::ScopedPropertyDirectionKey {
     catalog::ScopedPropertyDirectionKey::try_new("User", "age", RangeIndexDirection::Asc).unwrap()
 }
@@ -89,8 +106,11 @@ fn equality_index_contract_distinguishes_unique_cardinality_and_cost_rows() {
 
     let unique =
         access_contract::<TestFamily>(&TestPlan::UniqueEquality(key.clone()), &storage, &stats);
-    let non_unique =
-        access_contract::<TestFamily>(&TestPlan::NonUniqueEquality(key), &storage, &stats);
+    let non_unique = access_contract::<TestFamily>(
+        &non_unique_equality("node_eq:User:email", key),
+        &storage,
+        &stats,
+    );
 
     assert_eq!(
         unique.delivered.cardinality,
@@ -105,6 +125,34 @@ fn equality_index_contract_distinguishes_unique_cardinality_and_cost_rows() {
         non_unique.estimated_rows,
         storage.equality_index_rows(Some(9))
     );
+}
+
+#[test]
+fn equality_union_batches_only_the_same_logical_index() {
+    let key = eq_key();
+    let stats = context::StatsSnapshot::default().with_node_eq_cardinality(key.clone(), 9);
+    let storage = cost::StorageCostProfile::default();
+    let same_index = access_contract::<TestFamily>(
+        &TestPlan::Union(vec![
+            non_unique_equality("node_eq:User:email", key.clone()),
+            non_unique_equality("node_eq:User:email", key.clone()),
+        ]),
+        &storage,
+        &stats,
+    );
+    let different_indexes = access_contract::<TestFamily>(
+        &TestPlan::Union(vec![
+            non_unique_equality("node_eq:User:email:primary", key.clone()),
+            non_unique_equality("node_eq:User:email:shadow", key),
+        ]),
+        &storage,
+        &stats,
+    );
+
+    assert_eq!(same_index.cost.multi_get_calls, 1);
+    assert_eq!(same_index.cost.object_reads, 2);
+    assert_eq!(different_indexes.cost.multi_get_calls, 0);
+    assert_ne!(same_index.cost, different_indexes.cost);
 }
 
 #[test]

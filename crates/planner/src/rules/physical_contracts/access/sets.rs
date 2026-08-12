@@ -46,10 +46,10 @@ pub(super) fn access_set_contract(
     }
     let batchable_equality = (access == physical::PhysicalAccess::SetUnion)
         .then(|| {
-            let first = children.first()?.batchable_equality_key()?;
+            let first = children.first()?.batchable_equality_identity()?;
             children
                 .iter()
-                .all(|child| child.batchable_equality_key() == Some(first))
+                .all(|child| child.batchable_equality_identity() == Some(first))
                 .then_some(())
         })
         .flatten()

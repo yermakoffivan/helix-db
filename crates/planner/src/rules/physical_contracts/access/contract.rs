@@ -1,4 +1,4 @@
-use crate::{catalog, cost, physical, properties};
+use crate::{catalog, cost, ir, physical, properties};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::rules) struct AccessPhysicalContract {
@@ -21,7 +21,10 @@ enum AccessExecutionCost {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SecondaryIdSource {
     Other,
-    BatchableEquality(catalog::ScopedPropertyKey),
+    BatchableEquality {
+        index_id: ir::NonEmptyString,
+        key: catalog::ScopedPropertyKey,
+    },
 }
 
 impl AccessPhysicalContract {
@@ -65,6 +68,7 @@ impl AccessPhysicalContract {
         id_cost: cost::CostVector,
         materialization_cost: cost::CostVector,
         estimated_rows: cost::EstimatedRows,
+        index_id: ir::NonEmptyString,
         key: catalog::ScopedPropertyKey,
     ) -> Self {
         Self {
@@ -74,7 +78,7 @@ impl AccessPhysicalContract {
             estimated_rows,
             execution: AccessExecutionCost::SecondaryIds {
                 cost: id_cost,
-                source: SecondaryIdSource::BatchableEquality(key),
+                source: SecondaryIdSource::BatchableEquality { index_id, key },
             },
         }
     }
@@ -86,12 +90,14 @@ impl AccessPhysicalContract {
         }
     }
 
-    pub(in crate::rules) fn batchable_equality_key(&self) -> Option<&catalog::ScopedPropertyKey> {
+    pub(in crate::rules) fn batchable_equality_identity(
+        &self,
+    ) -> Option<(&ir::NonEmptyString, &catalog::ScopedPropertyKey)> {
         match &self.execution {
             AccessExecutionCost::SecondaryIds {
-                source: SecondaryIdSource::BatchableEquality(key),
+                source: SecondaryIdSource::BatchableEquality { index_id, key },
                 ..
-            } => Some(key),
+            } => Some((index_id, key)),
             AccessExecutionCost::MaterializedRows
             | AccessExecutionCost::SecondaryIds {
                 source: SecondaryIdSource::Other,

@@ -41,8 +41,9 @@ impl shared::AccessSourceFamily for EdgeAccessFamily {
             ir::EdgeAccessPlan::LabelScan { label } => {
                 shared::AccessSourceParts::LabelScan { label }
             }
-            ir::EdgeAccessPlan::EqualityIndex { key, value, .. } => {
+            ir::EdgeAccessPlan::EqualityIndex { index, key, value } => {
                 shared::AccessSourceParts::EqualityIndex {
+                    index_id: &index.index_id,
                     key,
                     kind: shared::EqualityIndexKind::NonUnique,
                     semantics: value.semantics(),

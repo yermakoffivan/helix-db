@@ -11,6 +11,7 @@ pub(in crate::rules) enum AccessSourceParts<'a, Plan> {
         label: &'a ir::NonEmptyString,
     },
     EqualityIndex {
+        index_id: &'a ir::NonEmptyString,
         key: &'a catalog::ScopedPropertyKey,
         kind: EqualityIndexKind,
         semantics: ir::EqualityIndexValueSemantics,

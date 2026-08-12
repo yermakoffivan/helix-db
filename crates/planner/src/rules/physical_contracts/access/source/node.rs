@@ -43,6 +43,7 @@ impl shared::AccessSourceFamily for NodeAccessFamily {
             }
             ir::NodeAccessPlan::EqualityIndex { index, key, value } => {
                 shared::AccessSourceParts::EqualityIndex {
+                    index_id: &index.index_id,
                     key,
                     kind: match index.uniqueness {
                         catalog::IndexUniqueness::Unique => shared::EqualityIndexKind::Unique,
