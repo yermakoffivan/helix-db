@@ -86,40 +86,47 @@ pub(super) fn label_scan_contract(
     )
 }
 
+pub(super) struct EqualityIndexContractInput<'a> {
+    pub(super) element: properties::ElementKind,
+    pub(super) index_id: &'a ir::NonEmptyString,
+    pub(super) key: &'a catalog::ScopedPropertyKey,
+    pub(super) cardinality: Option<u64>,
+    pub(super) label_cardinality: Option<u64>,
+    pub(super) kind: EqualityIndexKind,
+    pub(super) semantics: ir::EqualityIndexValueSemantics,
+}
+
 pub(super) fn equality_index_contract(
-    element: properties::ElementKind,
-    index_id: &ir::NonEmptyString,
-    key: &catalog::ScopedPropertyKey,
-    cardinality: Option<u64>,
-    label_cardinality: Option<u64>,
-    kind: EqualityIndexKind,
-    semantics: ir::EqualityIndexValueSemantics,
+    input: EqualityIndexContractInput<'_>,
     storage: &cost::StorageCostProfile,
 ) -> AccessPhysicalContract {
-    let rows = match semantics {
+    let rows = match input.semantics {
         ir::EqualityIndexValueSemantics::NonReflexive => cost::EstimatedRows::ZERO,
         ir::EqualityIndexValueSemantics::Indexed
         | ir::EqualityIndexValueSemantics::AuthoritativeNull
         | ir::EqualityIndexValueSemantics::RuntimeDependent => {
-            equality_rows(cardinality, kind, storage)
+            equality_rows(input.cardinality, input.kind, storage)
         }
     };
-    let id_cost = match semantics {
+    let id_cost = match input.semantics {
         ir::EqualityIndexValueSemantics::NonReflexive => cost::CostVector::ZERO,
         ir::EqualityIndexValueSemantics::AuthoritativeNull => storage.null_equality_scan(
-            label_cardinality.map_or(storage.default_unknown_scan_rows, cost::EstimatedRows::rows),
+            input
+                .label_cardinality
+                .map_or(storage.default_unknown_scan_rows, cost::EstimatedRows::rows),
         ),
         ir::EqualityIndexValueSemantics::Indexed
-        | ir::EqualityIndexValueSemantics::RuntimeDependent => match kind {
+        | ir::EqualityIndexValueSemantics::RuntimeDependent => match input.kind {
             EqualityIndexKind::Unique => storage.unique_equality_lookup(rows),
             EqualityIndexKind::NonUnique => storage.bitmap_equality_lookup(rows),
         },
     };
     let delivered = with_key_locality(
-        access_delivered_with(element, equality_cardinality(kind)),
+        access_delivered_with(input.element, equality_cardinality(input.kind)),
         properties::KeyLocality::Close,
     );
-    if kind == EqualityIndexKind::NonUnique && semantics == ir::EqualityIndexValueSemantics::Indexed
+    if input.kind == EqualityIndexKind::NonUnique
+        && input.semantics == ir::EqualityIndexValueSemantics::Indexed
     {
         AccessPhysicalContract::new_batchable_equality(
             physical::PhysicalAccess::EqualityIndex,
@@ -127,8 +134,8 @@ pub(super) fn equality_index_contract(
             id_cost,
             storage.secondary_row_materialization(rows),
             rows,
-            index_id.clone(),
-            key.clone(),
+            input.index_id.clone(),
+            input.key.clone(),
         )
     } else {
         AccessPhysicalContract::new_secondary(

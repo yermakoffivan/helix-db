@@ -27,13 +27,15 @@ where
             kind,
             semantics,
         } => leaf::equality_index_contract(
-            element,
-            index_id,
-            key,
-            F::equality_cardinality(stats, key),
-            F::label_cardinality(stats, &key.label),
-            kind,
-            semantics,
+            leaf::EqualityIndexContractInput {
+                element,
+                index_id,
+                key,
+                cardinality: F::equality_cardinality(stats, key),
+                label_cardinality: F::label_cardinality(stats, &key.label),
+                kind,
+                semantics,
+            },
             storage,
         ),
         family::AccessSourceParts::RangeIndex { key } => {
