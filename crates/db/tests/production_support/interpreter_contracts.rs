@@ -863,12 +863,13 @@ pub(crate) async fn run_request_read_view_guards() {
         (
             exec::ExecAccessPlan::Node(exec::ExecNodeAccessPlan::exact_equality(
                 catalog::NodeEqualityIndexMeta::new(
-                    ir::NonEmptyString::new("guard-node-equality").expect("index ID is non-empty"),
+                    ir::NonEmptyString::new("node_eq:Document:rank")
+                        .expect("index ID is non-empty"),
                 ),
                 property_key.clone(),
                 property_value.clone(),
             )),
-            "secondary equality lookup escaped its request read view",
+            "exact secondary equality point read escaped its request read view",
         ),
         (
             exec::ExecAccessPlan::Edge(exec::ExecEdgeAccessPlan::LabelScan {
@@ -879,12 +880,13 @@ pub(crate) async fn run_request_read_view_guards() {
         (
             exec::ExecAccessPlan::Edge(exec::ExecEdgeAccessPlan::exact_equality(
                 catalog::EdgeEqualityIndexMeta::new(
-                    ir::NonEmptyString::new("guard-edge-equality").expect("index ID is non-empty"),
+                    ir::NonEmptyString::new("edge_eq:Document:rank")
+                        .expect("index ID is non-empty"),
                 ),
                 property_key,
                 property_value,
             )),
-            "edge secondary equality lookup escaped its request read view",
+            "exact secondary equality point read escaped its request read view",
         ),
         (
             exec::ExecAccessPlan::Node(exec::ExecNodeAccessPlan::RangeIndex {
