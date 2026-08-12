@@ -2,6 +2,7 @@
 use crate::{catalog, cost, ir, logical, physical, properties, trace};
 
 mod access;
+mod count;
 mod error;
 mod ids;
 mod kv;
@@ -14,6 +15,7 @@ pub mod selected;
 mod validation;
 
 pub use self::access::*;
+pub use self::count::*;
 pub use self::error::ExecPlanError;
 pub use self::ids::*;
 pub use self::kv::*;
