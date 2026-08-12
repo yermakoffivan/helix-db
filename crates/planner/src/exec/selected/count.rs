@@ -141,6 +141,8 @@ impl SelectedRootCount {
             return Err(SelectedRootConstructionError::IncompatiblePhysicalShape);
         };
         let plan = physical.executable().clone();
+        plan.validate()
+            .map_err(|_| SelectedRootConstructionError::CountInputMismatch)?;
         let dependency = plan
             .dependency()
             .map_err(|_| SelectedRootConstructionError::CountInputMismatch)?;

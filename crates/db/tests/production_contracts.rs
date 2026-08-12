@@ -1421,8 +1421,10 @@ async fn public_query_boundary_covers_branch_partition_edges() {
         })
     };
     let scalar_subplan = || {
-        subplan(exec::ExecOp::Project {
-            projection: ir::ProjectionPlan::Count,
+        subplan(exec::ExecOp::Count {
+            plan: Box::new(exec::ExecCountPlan::InputRows {
+                window: exec::ExecCountWindowPlan::identity(),
+            }),
         })
     };
     let branch_plan = |plan| {
@@ -5013,10 +5015,12 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
     };
     for (consumer, expected) in [
         (
-            exec::ExecOp::Project {
-                projection: ir::ProjectionPlan::Count,
+            exec::ExecOp::Count {
+                plan: Box::new(exec::ExecCountPlan::InputRows {
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
             },
-            "Query error: project cannot consume an index lifecycle value",
+            "Query error: count cannot consume an index lifecycle value",
         ),
         (
             exec::ExecOp::Aggregate {
@@ -6526,6 +6530,16 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
         )),
     };
     let project = |projection| exec::ExecOp::Project { projection };
+    let count_rows = || exec::ExecOp::Count {
+        plan: Box::new(exec::ExecCountPlan::InputRows {
+            window: exec::ExecCountWindowPlan::identity(),
+        }),
+    };
+    let count_scalars = || exec::ExecOp::Count {
+        plan: Box::new(exec::ExecCountPlan::InputScalars {
+            window: exec::ExecCountWindowPlan::identity(),
+        }),
+    };
     let linear_plan = |operations: Vec<exec::ExecOp>| {
         let root = operations.len();
         let steps = operations
@@ -6589,7 +6603,7 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
                 exec::ExecOp::Access {
                     plan: Box::new(exec::ExecAccessPlan::Edge(exec::ExecEdgeAccessPlan::Empty)),
                 },
-                project(ir::ProjectionPlan::Count),
+                count_rows(),
             ],
             ExecutionValue::Count(0),
         ),
@@ -6640,24 +6654,20 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
         (
             vec![
                 access(),
-                project(ir::ProjectionPlan::Count),
+                count_rows(),
                 exec::ExecOp::Distinct,
-                project(ir::ProjectionPlan::Count),
+                count_scalars(),
             ],
             ExecutionValue::Count(1),
         ),
         (
-            vec![
-                access(),
-                project(ir::ProjectionPlan::Id),
-                project(ir::ProjectionPlan::Count),
-            ],
+            vec![access(), project(ir::ProjectionPlan::Id), count_scalars()],
             ExecutionValue::Count(2),
         ),
         (
             vec![
                 access(),
-                project(ir::ProjectionPlan::Count),
+                count_rows(),
                 exec::ExecOp::Aggregate {
                     aggregate: ir::AggregatePlan::AggregateBy {
                         function: traversal::AggregateFunction::Count,
@@ -6679,11 +6689,11 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
         (
             vec![
                 access(),
-                project(ir::ProjectionPlan::Count),
+                count_rows(),
                 exec::ExecOp::Limit {
                     count: ir::StreamBoundPlan::Literal(1),
                 },
-                project(ir::ProjectionPlan::Count),
+                count_scalars(),
             ],
             ExecutionValue::Count(1),
         ),
@@ -6694,7 +6704,7 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
                 exec::ExecOp::Limit {
                     count: ir::StreamBoundPlan::Literal(1),
                 },
-                project(ir::ProjectionPlan::Count),
+                count_scalars(),
             ],
             ExecutionValue::Count(1),
         ),
@@ -6707,11 +6717,7 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
             ExecutionValue::Scalars(vec![ExecutionScalar::NodeId(0), ExecutionScalar::NodeId(1)]),
         ),
         (
-            vec![
-                access(),
-                project(ir::ProjectionPlan::Count),
-                project(ir::ProjectionPlan::Id),
-            ],
+            vec![access(), count_rows(), project(ir::ProjectionPlan::Id)],
             ExecutionValue::Scalars(Vec::new()),
         ),
         (
@@ -6734,7 +6740,7 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
                 exec::ExecOp::Reserved {
                     op: ir::ReservedOp::Unfold,
                 },
-                project(ir::ProjectionPlan::Count),
+                count_rows(),
             ],
             ExecutionValue::Count(2),
         ),
@@ -6792,7 +6798,7 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
 
     let invalid_unfold = linear_plan(vec![
         access(),
-        project(ir::ProjectionPlan::Count),
+        count_rows(),
         exec::ExecOp::Reserved {
             op: ir::ReservedOp::Unfold,
         },
@@ -6808,7 +6814,7 @@ async fn public_executable_plan_boundary_covers_scalar_stream_composition() {
 
     let scalar_group = linear_plan(vec![
         access(),
-        project(ir::ProjectionPlan::Count),
+        count_rows(),
         exec::ExecOp::Aggregate {
             aggregate: ir::AggregatePlan::Group(
                 ir::NonEmptyString::new("unused").expect("group property is non-empty"),
@@ -7014,8 +7020,10 @@ async fn public_executable_plan_boundary_covers_merge_and_dependency_shapes() {
     };
     let scalar_plan = dependency_plan(vec![
         (
-            exec::ExecOp::Project {
-                projection: ir::ProjectionPlan::Count,
+            exec::ExecOp::Count {
+                plan: Box::new(exec::ExecCountPlan::InputRows {
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
             },
             exec::ExecSchedule::Pipeline,
         ),
@@ -7058,8 +7066,10 @@ async fn public_executable_plan_boundary_covers_merge_and_dependency_shapes() {
             exec::ExecSchedule::Pipeline,
         ),
         (
-            exec::ExecOp::Project {
-                projection: ir::ProjectionPlan::Count,
+            exec::ExecOp::Count {
+                plan: Box::new(exec::ExecCountPlan::InputRows {
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
             },
             exec::ExecSchedule::Pipeline,
         ),

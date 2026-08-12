@@ -1488,6 +1488,7 @@ impl HelixDB {
         let indexes = self.runtime_catalog_snapshot();
         PlannerContext {
             params,
+            late_bound_params: Default::default(),
             indexes,
             stats: Default::default(),
             runtime_feedback: Default::default(),
@@ -1506,6 +1507,7 @@ impl HelixDB {
         let indexes = self.runtime_catalog_snapshot_scoped(tenant_scope).await?;
         Ok(PlannerContext {
             params,
+            late_bound_params: Default::default(),
             indexes,
             stats: Default::default(),
             runtime_feedback: Default::default(),
@@ -1554,6 +1556,7 @@ impl HelixDB {
         Ok(PreparedPlannerContext {
             context: PlannerContext {
                 params,
+                late_bound_params: Default::default(),
                 indexes,
                 stats: Default::default(),
                 runtime_feedback: Default::default(),

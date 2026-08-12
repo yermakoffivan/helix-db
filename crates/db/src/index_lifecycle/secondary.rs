@@ -2975,6 +2975,59 @@ pub(crate) async fn lookup_active_equality_generations(
     Ok(owners)
 }
 
+/// Executes one planner-selected literal bitmap multi-get.
+///
+/// Unlike the generic union helper, this preserves duplicate physical keys and
+/// always issues exactly one `multi_get`. The executable batch arity has
+/// already been validated by planner IR.
+pub(crate) async fn lookup_active_equality_literal_batch(
+    reader: &(impl DbReadOps + Sync),
+    handle: &ActiveIndexHandle,
+    values: &[PropertyValue],
+) -> Result<roaring::RoaringTreemap> {
+    if values.len() < 2 {
+        return Err(corruption(
+            "literal equality bitmap batch contained fewer than two values",
+        ));
+    }
+    let Some(definition) = handle.secondary_definition() else {
+        return Err(corruption(
+            "literal equality bitmap batch received a non-secondary Active handle",
+        ));
+    };
+    if !definition_uses_equality_bitmap(definition) {
+        return Err(corruption(
+            "literal equality bitmap batch received a non-bitmap definition",
+        ));
+    }
+    let keys = values
+        .iter()
+        .map(|value| {
+            let EqualityValueProjection::Indexed(value) = project_equality_value(value) else {
+                return Err(corruption(
+                    "literal equality bitmap batch received a non-indexed value",
+                ));
+            };
+            secondary_entry_key(
+                handle.scope(),
+                handle.index_id(),
+                handle.generation(),
+                definition,
+                CanonicalSecondaryValue::equality(value),
+                IndexEntityId::initial(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    keys.iter().for_each(|_| record_equality_point_read());
+    #[cfg(any(test, feature = "production-coverage"))]
+    BENCHMARK_MULTI_GETS.fetch_add(1, AtomicOrdering::Relaxed);
+    let mut owners = roaring::RoaringTreemap::new();
+    for bytes in reader.multi_get(&keys).await?.into_iter().flatten() {
+        owners |= SecondaryEqualityBitmapValue::decode(&bytes)?.into_ids();
+    }
+    Ok(owners)
+}
+
 async fn scan_authoritative_null_equality(
     reader: &(impl DbReadOps + Sync),
     handle: &ActiveIndexHandle,
@@ -3066,6 +3119,18 @@ pub(crate) async fn scan_active_range_generation(
     query: Option<&SecondaryRangeQuery>,
     limit: Option<usize>,
 ) -> Result<Vec<u64>> {
+    scan_active_range_generation_with_membership(reader, handle, query, limit, &[]).await
+}
+
+/// Scans an exact range generation and applies planner-ordered bitmap
+/// membership before the accepted-match limit.
+pub(crate) async fn scan_active_range_generation_with_membership(
+    reader: &(impl DbReadOps + Sync),
+    handle: &ActiveIndexHandle,
+    query: Option<&SecondaryRangeQuery>,
+    limit: Option<usize>,
+    membership: &[roaring::RoaringTreemap],
+) -> Result<Vec<u64>> {
     let Some(definition) = handle.secondary_definition() else {
         return Err(corruption(
             "secondary range serving received a non-secondary Active handle",
@@ -3142,6 +3207,12 @@ pub(crate) async fn scan_active_range_generation(
             query,
         )
         .await?
+        {
+            continue;
+        }
+        if !membership
+            .iter()
+            .all(|bitmap| bitmap.contains(value_owner.get()))
         {
             continue;
         }

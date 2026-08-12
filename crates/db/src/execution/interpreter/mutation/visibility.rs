@@ -67,7 +67,8 @@ pub(in crate::execution::interpreter) fn required_for(
         exec::ExecOp::TextSearch { .. } => {
             RequiredMutationVisibility::one(DeferredMutationFamily::Text)
         }
-        exec::ExecOp::KvRead(_)
+        exec::ExecOp::Count { .. }
+        | exec::ExecOp::KvRead(_)
         | exec::ExecOp::Reserved { .. }
         | exec::ExecOp::Barrier { .. }
         | exec::ExecOp::IndexDdl { .. } => RequiredMutationVisibility::ALL,

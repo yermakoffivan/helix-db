@@ -24,7 +24,7 @@ impl<'db> ExecutionContext<'db> {
         }
     }
 
-    pub(super) async fn lookup_equality_index_set(
+    pub(in crate::execution::interpreter) async fn lookup_equality_index_set(
         &self,
         property: &str,
         value: &DbPropertyValue,
@@ -73,7 +73,7 @@ impl<'db> ExecutionContext<'db> {
         }
     }
 
-    pub(super) async fn lookup_managed_equality_union(
+    pub(in crate::execution::interpreter) async fn lookup_managed_equality_union(
         &self,
         element_kind: crate::index_lifecycle::IndexElementKind,
         key: &catalog::ScopedPropertyKey,
@@ -111,7 +111,104 @@ impl<'db> ExecutionContext<'db> {
         }
     }
 
-    pub(super) async fn lookup_global_edge_label_index(
+    /// Execute a planner-selected literal bitmap batch without key folding.
+    pub(in crate::execution::interpreter) async fn lookup_managed_equality_literal_batch(
+        &self,
+        element_kind: crate::index_lifecycle::IndexElementKind,
+        key: &catalog::ScopedPropertyKey,
+        values: &[DbPropertyValue],
+    ) -> Result<roaring::RoaringTreemap> {
+        let identity = secondary_identity(
+            crate::index_lifecycle::IndexIdentityFamily::SecondaryEquality,
+            element_kind,
+            key.label.as_ref(),
+            key.property.as_ref(),
+        )?;
+        if let Some(active) = self.active_write_tx() {
+            let Some(handle) = active.index_context.active_handle(&identity) else {
+                return Err(secondary_catalog_unavailable());
+            };
+            return lookup_managed_active_literal_batch(&active.txn, handle, values).await;
+        }
+        if let Some(view) = self.request_read_view() {
+            if let Some(catalog) = self.request_read_index_catalog() {
+                let Some(handle) = catalog.handle(&identity) else {
+                    return Err(secondary_catalog_unavailable());
+                };
+                return lookup_managed_active_literal_batch(view, handle, values).await;
+            }
+            let Some(record) = crate::index_lifecycle::repository::load_index_record(
+                view,
+                self.tenant_scope,
+                &identity,
+            )
+            .await?
+            else {
+                return Err(secondary_catalog_unavailable());
+            };
+            let Some(handle) = crate::index_lifecycle::ActiveIndexHandle::try_from_record(
+                self.tenant_scope,
+                &record,
+            ) else {
+                return Err(secondary_catalog_unavailable());
+            };
+            return lookup_managed_active_literal_batch(view, &handle, values).await;
+        }
+        Err(HelixDbError::InvariantViolation(
+            "literal secondary equality batch escaped its request read view".to_string(),
+        ))
+    }
+
+    /// Execute one exact equality point primitive with a required uniqueness lane.
+    pub(in crate::execution::interpreter) async fn lookup_managed_equality_point_exact(
+        &self,
+        element_kind: crate::index_lifecycle::IndexElementKind,
+        key: &catalog::ScopedPropertyKey,
+        value: &DbPropertyValue,
+        unique: bool,
+    ) -> Result<roaring::RoaringTreemap> {
+        let identity = secondary_identity(
+            crate::index_lifecycle::IndexIdentityFamily::SecondaryEquality,
+            element_kind,
+            key.label.as_ref(),
+            key.property.as_ref(),
+        )?;
+        if let Some(active) = self.active_write_tx() {
+            let Some(handle) = active.index_context.active_handle(&identity) else {
+                return Err(secondary_catalog_unavailable());
+            };
+            return lookup_managed_active_point_exact(&active.txn, handle, value, unique).await;
+        }
+        if let Some(view) = self.request_read_view() {
+            if let Some(catalog) = self.request_read_index_catalog() {
+                let Some(handle) = catalog.handle(&identity) else {
+                    return Err(secondary_catalog_unavailable());
+                };
+                return lookup_managed_active_point_exact(view, handle, value, unique).await;
+            }
+            let Some(record) = crate::index_lifecycle::repository::load_index_record(
+                view,
+                self.tenant_scope,
+                &identity,
+            )
+            .await?
+            else {
+                return Err(secondary_catalog_unavailable());
+            };
+            let Some(handle) = crate::index_lifecycle::ActiveIndexHandle::try_from_record(
+                self.tenant_scope,
+                &record,
+            ) else {
+                return Err(secondary_catalog_unavailable());
+            };
+            return lookup_managed_active_point_exact(view, &handle, value, unique).await;
+        }
+        Err(HelixDbError::InvariantViolation(
+            "exact secondary equality point read escaped its request read view".to_string(),
+        ))
+    }
+
+    pub(in crate::execution::interpreter) async fn lookup_global_edge_label_index(
         &self,
         label: &str,
     ) -> Result<roaring::RoaringTreemap> {
@@ -518,6 +615,52 @@ async fn lookup_managed_active_equalities_in_view(
     }
     crate::index_lifecycle::secondary::lookup_active_equality_generations(reader, active, values)
         .await
+}
+
+async fn lookup_managed_active_literal_batch(
+    reader: &(impl DbReadOps + Send + Sync),
+    active: &crate::index_lifecycle::ActiveIndexHandle,
+    values: &[DbPropertyValue],
+) -> Result<roaring::RoaringTreemap> {
+    crate::index_lifecycle::secondary::lookup_active_equality_literal_batch(reader, active, values)
+        .await
+}
+
+async fn lookup_managed_active_point_exact(
+    reader: &(impl DbReadOps + Send + Sync),
+    active: &crate::index_lifecycle::ActiveIndexHandle,
+    value: &DbPropertyValue,
+    unique: bool,
+) -> Result<roaring::RoaringTreemap> {
+    let Some(definition) = active.secondary_definition() else {
+        return Err(HelixDbError::IndexCatalogCorruption(
+            "exact equality point resolved another Active family".to_string(),
+        ));
+    };
+    let lane_matches = match definition {
+        crate::index_lifecycle::ValidatedSecondaryIndexDefinition::NodeEquality {
+            unique: actual,
+            ..
+        } => *actual == unique,
+        crate::index_lifecycle::ValidatedSecondaryIndexDefinition::EdgeEquality { .. } => !unique,
+        crate::index_lifecycle::ValidatedSecondaryIndexDefinition::NodeRange { .. }
+        | crate::index_lifecycle::ValidatedSecondaryIndexDefinition::EdgeRange { .. } => false,
+    };
+    if !lane_matches {
+        return Err(HelixDbError::IndexCatalogCorruption(
+            "planner equality uniqueness disagrees with its Active secondary definition"
+                .to_string(),
+        ));
+    }
+    crate::index_lifecycle::secondary::lookup_active_equality_generation(reader, active, value)
+        .await
+}
+
+fn secondary_catalog_unavailable() -> HelixDbError {
+    HelixDbError::IndexLifecycleUnavailable {
+        family: crate::error::IndexFamily::Secondary,
+        reason: crate::error::IndexLifecycleUnavailableReason::CanonicalStateUnavailable,
+    }
 }
 
 pub(super) fn limited_index_ids(

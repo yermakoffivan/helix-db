@@ -195,7 +195,7 @@ impl<'de> Deserialize<'de> for ExecIndexedEqualityValue {
 }
 
 /// Small executable arithmetic expression for count windows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecUsizeExpr {
     /// Literal value.
@@ -208,6 +208,52 @@ pub enum ExecUsizeExpr {
     SaturatingAdd(Box<Self>, Box<Self>),
     /// Saturating subtraction.
     SaturatingSub(Box<Self>, Box<Self>),
+}
+
+/// Maximum arithmetic nodes accepted by one executable window expression.
+pub const MAX_EXEC_USIZE_EXPR_NODES: usize = 64;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecUsizeExprSerde {
+    Literal(usize),
+    Param(ir::NonEmptyString),
+    Min(Box<Self>, Box<Self>),
+    SaturatingAdd(Box<Self>, Box<Self>),
+    SaturatingSub(Box<Self>, Box<Self>),
+}
+
+impl From<ExecUsizeExprSerde> for ExecUsizeExpr {
+    fn from(value: ExecUsizeExprSerde) -> Self {
+        match value {
+            ExecUsizeExprSerde::Literal(value) => Self::Literal(value),
+            ExecUsizeExprSerde::Param(value) => Self::Param(value),
+            ExecUsizeExprSerde::Min(left, right) => {
+                Self::Min(Box::new((*left).into()), Box::new((*right).into()))
+            }
+            ExecUsizeExprSerde::SaturatingAdd(left, right) => {
+                Self::SaturatingAdd(Box::new((*left).into()), Box::new((*right).into()))
+            }
+            ExecUsizeExprSerde::SaturatingSub(left, right) => {
+                Self::SaturatingSub(Box::new((*left).into()), Box::new((*right).into()))
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecUsizeExpr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let expression: Self = ExecUsizeExprSerde::deserialize(deserializer)?.into();
+        if expression.node_count() > MAX_EXEC_USIZE_EXPR_NODES {
+            return Err(D::Error::custom(format!(
+                "executable usize expression exceeds {MAX_EXEC_USIZE_EXPR_NODES} nodes"
+            )));
+        }
+        Ok(expression)
+    }
 }
 
 impl ExecUsizeExpr {
@@ -1013,7 +1059,25 @@ pub enum ExecCountDependencyError {
     MultipleRowInputs,
 }
 
+/// Invalid cross-field state in an executable count program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecCountValidationError {
+    /// The recursive cursor requested its one row dependency more than once.
+    MultipleRowInputs,
+    /// A window arithmetic expression exceeds its executable size bound.
+    WindowExpressionTooLarge,
+    /// Unique lookup and authoritative verification describe different values.
+    UniqueVerificationMismatch,
+}
+
 impl ExecCountPlan {
+    /// Validate recursive dependency, window, and verification invariants.
+    pub fn validate(&self) -> Result<(), ExecCountValidationError> {
+        self.dependency()
+            .map_err(|_| ExecCountValidationError::MultipleRowInputs)?;
+        validate_count_plan(self)
+    }
+
     /// Validate and return the exact selected dependency contract.
     pub fn dependency(&self) -> Result<ExecCountDependency, ExecCountDependencyError> {
         match self {
@@ -1049,6 +1113,110 @@ impl ExecCountPlan {
             | Self::EdgeDynamicEquality(_) => Ok(ExecCountDependency::Direct),
         }
     }
+}
+
+fn validate_count_plan(plan: &ExecCountPlan) -> Result<(), ExecCountValidationError> {
+    match plan {
+        ExecCountPlan::Constant(_) => Ok(()),
+        ExecCountPlan::NodeBitmap(plan) => validate_window(&plan.window),
+        ExecCountPlan::EdgeBitmap(plan) => validate_window(&plan.window),
+        ExecCountPlan::NodeUnique(plan) => {
+            if plan.lookup.key != plan.verification.key
+                || plan.lookup.value != plan.verification.value
+            {
+                return Err(ExecCountValidationError::UniqueVerificationMismatch);
+            }
+            validate_window(&plan.window)
+        }
+        ExecCountPlan::NodeRange(plan) => validate_window(&plan.window),
+        ExecCountPlan::EdgeRange(plan) => validate_window(&plan.window),
+        ExecCountPlan::NodeAuthoritativeScan(plan) => validate_window(&plan.window),
+        ExecCountPlan::EdgeAuthoritativeScan(plan) => validate_window(&plan.window),
+        ExecCountPlan::NodePointReads { window, .. }
+        | ExecCountPlan::EdgePointReads { window, .. }
+        | ExecCountPlan::NodeRuntimeInput { window, .. }
+        | ExecCountPlan::EdgeRuntimeInput { window, .. }
+        | ExecCountPlan::RuntimeInput { window, .. }
+        | ExecCountPlan::NodeFullScan { window }
+        | ExecCountPlan::EdgeFullScan { window }
+        | ExecCountPlan::NodeLabelBitmap { window, .. }
+        | ExecCountPlan::EdgeLabelBitmap { window, .. }
+        | ExecCountPlan::InputRows { window }
+        | ExecCountPlan::InputScalars { window } => validate_window(window),
+        ExecCountPlan::NodeVectorSearch(plan) => validate_window(&plan.window),
+        ExecCountPlan::EdgeVectorSearch(plan) => validate_window(&plan.window),
+        ExecCountPlan::NodeTextSearch(plan) => validate_window(&plan.window),
+        ExecCountPlan::EdgeTextSearch(plan) => validate_window(&plan.window),
+        ExecCountPlan::NodeDynamicEquality(plan) => validate_window(&plan.window),
+        ExecCountPlan::EdgeDynamicEquality(plan) => validate_window(&plan.window),
+        ExecCountPlan::Stream(plan) => {
+            validate_cursor(&plan.cursor)?;
+            validate_window(&plan.window)
+        }
+    }
+}
+
+fn validate_cursor(cursor: &ExecCountCursorPlan) -> Result<(), ExecCountValidationError> {
+    match cursor {
+        ExecCountCursorPlan::NodeUnique {
+            lookup,
+            verification,
+        } if lookup.key != verification.key || lookup.value != verification.value => {
+            Err(ExecCountValidationError::UniqueVerificationMismatch)
+        }
+        ExecCountCursorPlan::Union { driver, rest }
+        | ExecCountCursorPlan::Intersect { driver, rest } => {
+            validate_cursor(driver)?;
+            rest.iter().try_for_each(validate_cursor)
+        }
+        ExecCountCursorPlan::Filter { input, .. }
+        | ExecCountCursorPlan::Order { input, .. }
+        | ExecCountCursorPlan::Expand { input, .. }
+        | ExecCountCursorPlan::VectorSearch { input, .. }
+        | ExecCountCursorPlan::TextSearch { input, .. }
+        | ExecCountCursorPlan::Variable { input, .. }
+        | ExecCountCursorPlan::Distinct { input, .. } => validate_cursor(input),
+        ExecCountCursorPlan::Window { input, window } => {
+            validate_cursor(input)?;
+            validate_window(window)
+        }
+        ExecCountCursorPlan::EmptyRows
+        | ExecCountCursorPlan::InputRows
+        | ExecCountCursorPlan::NodeBitmap(_)
+        | ExecCountCursorPlan::EdgeBitmap(_)
+        | ExecCountCursorPlan::NodeUnique { .. }
+        | ExecCountCursorPlan::NodeRange(_)
+        | ExecCountCursorPlan::EdgeRange(_)
+        | ExecCountCursorPlan::NodeAuthoritativeScan(_)
+        | ExecCountCursorPlan::EdgeAuthoritativeScan(_)
+        | ExecCountCursorPlan::NodePointReads(_)
+        | ExecCountCursorPlan::EdgePointReads(_)
+        | ExecCountCursorPlan::NodeRuntimeInput(_)
+        | ExecCountCursorPlan::EdgeRuntimeInput(_)
+        | ExecCountCursorPlan::RuntimeInput(_)
+        | ExecCountCursorPlan::NodeFullScan
+        | ExecCountCursorPlan::EdgeFullScan
+        | ExecCountCursorPlan::NodeLabelBitmap(_)
+        | ExecCountCursorPlan::EdgeLabelBitmap(_)
+        | ExecCountCursorPlan::NodeVectorSearch { .. }
+        | ExecCountCursorPlan::EdgeVectorSearch { .. }
+        | ExecCountCursorPlan::NodeTextSearch { .. }
+        | ExecCountCursorPlan::EdgeTextSearch { .. }
+        | ExecCountCursorPlan::NodeDynamicEquality { .. }
+        | ExecCountCursorPlan::EdgeDynamicEquality { .. } => Ok(()),
+    }
+}
+
+fn validate_window(window: &ExecCountWindowPlan) -> Result<(), ExecCountValidationError> {
+    if window.skip.node_count() > MAX_EXEC_USIZE_EXPR_NODES
+        || matches!(
+            &window.take,
+            ExecCountTake::AtMost(take) if take.node_count() > MAX_EXEC_USIZE_EXPR_NODES
+        )
+    {
+        return Err(ExecCountValidationError::WindowExpressionTooLarge);
+    }
+    Ok(())
 }
 
 fn cursor_row_input_count(cursor: &ExecCountCursorPlan) -> Result<usize, ExecCountDependencyError> {
@@ -1327,6 +1495,79 @@ mod tests {
             }
             .dependency(),
             Ok(ExecCountDependency::Scalars)
+        );
+    }
+
+    #[test]
+    fn executable_expression_deserialization_rejects_oversized_trees() {
+        let mut expression = ExecUsizeExpr::literal(0);
+        for value in 0..33 {
+            expression = ExecUsizeExpr::SaturatingAdd(
+                Box::new(expression),
+                Box::new(ExecUsizeExpr::literal(value)),
+            );
+        }
+        assert!(expression.node_count() > MAX_EXEC_USIZE_EXPR_NODES);
+        let json = serde_json::to_string(&expression).unwrap();
+
+        let error = serde_json::from_str::<ExecUsizeExpr>(&json).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("executable usize expression exceeds 64 nodes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn program_validation_rejects_oversized_programmatic_windows() {
+        let mut expression = ExecUsizeExpr::literal(0);
+        for value in 0..33 {
+            expression = ExecUsizeExpr::SaturatingAdd(
+                Box::new(expression),
+                Box::new(ExecUsizeExpr::literal(value)),
+            );
+        }
+        let plan = ExecCountPlan::InputRows {
+            window: ExecCountWindowPlan {
+                skip: expression,
+                take: ExecCountTake::All,
+            },
+        };
+
+        assert_eq!(
+            plan.validate(),
+            Err(ExecCountValidationError::WindowExpressionTooLarge)
+        );
+    }
+
+    #[test]
+    fn program_validation_rejects_mismatched_unique_verification() {
+        let index = ExecNodeUniqueEqualityIndex::try_from(
+            catalog::NodeEqualityIndexMeta::new(name("node_eq:User:email"))
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+        )
+        .unwrap();
+        let value = ExecIndexedEqualityValue::try_from(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from("alice@example.com")).unwrap(),
+        )
+        .unwrap();
+        let plan = ExecCountPlan::NodeUnique(ExecNodeUniqueCountPlan {
+            lookup: ExecNodeUniqueOwnerReadPlan {
+                index,
+                key: catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
+                value: value.clone(),
+            },
+            verification: ExecNodeAuthoritativeVerificationPlan {
+                key: catalog::ScopedPropertyKey::try_new("User", "other_email").unwrap(),
+                value,
+            },
+            window: ExecCountWindowPlan::identity(),
+        });
+
+        assert_eq!(
+            plan.validate(),
+            Err(ExecCountValidationError::UniqueVerificationMismatch)
         );
     }
 }

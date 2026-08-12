@@ -6,6 +6,7 @@
 
 mod access;
 mod control;
+mod count;
 mod ddl;
 mod dependencies;
 mod dispatch;
@@ -244,6 +245,7 @@ impl RequestSideEffects {
             exec::ExecOp::Repeat { plan } => Self::subplan(&plan.body),
             exec::ExecOp::ForEach { body, .. } => Self::subplan(body),
             exec::ExecOp::Access { .. }
+            | exec::ExecOp::Count { .. }
             | exec::ExecOp::KvRead(_)
             | exec::ExecOp::Expand { .. }
             | exec::ExecOp::VectorSearch { .. }

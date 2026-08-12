@@ -15,7 +15,76 @@ use crate::encoding::indexes::range::RangeIndexDirection as StorageRangeIndexDir
 use crate::HelixStorage;
 
 impl<'db> ExecutionContext<'db> {
-    pub(super) async fn node_range_index_ids(
+    pub(in crate::execution::interpreter) async fn node_range_index_ids_with_membership(
+        &self,
+        key: &catalog::ScopedPropertyDirectionKey,
+        range: &ir::IndexRange,
+        membership: &[roaring::RoaringTreemap],
+        limit: Option<usize>,
+    ) -> Result<Vec<u64>> {
+        self.range_index_ids_with_membership(
+            crate::index_lifecycle::IndexElementKind::Node,
+            key,
+            range,
+            membership,
+            limit,
+        )
+        .await
+    }
+
+    pub(in crate::execution::interpreter) async fn edge_range_index_ids_with_membership(
+        &self,
+        key: &catalog::ScopedPropertyDirectionKey,
+        range: &ir::IndexRange,
+        membership: &[roaring::RoaringTreemap],
+        limit: Option<usize>,
+    ) -> Result<Vec<u64>> {
+        self.range_index_ids_with_membership(
+            crate::index_lifecycle::IndexElementKind::Edge,
+            key,
+            range,
+            membership,
+            limit,
+        )
+        .await
+    }
+
+    async fn range_index_ids_with_membership(
+        &self,
+        element_kind: crate::index_lifecycle::IndexElementKind,
+        key: &catalog::ScopedPropertyDirectionKey,
+        range: &ir::IndexRange,
+        membership: &[roaring::RoaringTreemap],
+        limit: Option<usize>,
+    ) -> Result<Vec<u64>> {
+        let direction = storage_range_direction(key.direction);
+        let query = range_query(self, range)?;
+        let identity =
+            secondary_range_identity(element_kind, key.label.as_ref(), key.property.as_ref())?;
+        if let Some(active) = self.active_write_tx() {
+            return scan_range_with_membership_in_view(
+                self,
+                &active.txn,
+                &identity,
+                &query,
+                direction,
+                limit,
+                membership,
+            )
+            .await;
+        }
+        if let Some(view) = self.request_read_view() {
+            return scan_range_with_membership_in_view(
+                self, view, &identity, &query, direction, limit, membership,
+            )
+            .await;
+        }
+        Err(HelixDbError::InvariantViolation(
+            "filtered secondary range lookup escaped its request read view".to_string(),
+        ))
+    }
+
+    pub(in crate::execution::interpreter) async fn node_range_index_ids(
         &self,
         key: &catalog::ScopedPropertyDirectionKey,
         range: &ir::IndexRange,
@@ -62,7 +131,7 @@ impl<'db> ExecutionContext<'db> {
         ))
     }
 
-    pub(super) async fn edge_range_index_ids(
+    pub(in crate::execution::interpreter) async fn edge_range_index_ids(
         &self,
         key: &catalog::ScopedPropertyDirectionKey,
         range: &ir::IndexRange,
@@ -206,6 +275,63 @@ async fn scan_managed_range_in_view(
     }
     crate::index_lifecycle::secondary::scan_active_range_generation(reader, &active, query, limit)
         .await
+}
+
+async fn scan_range_with_membership_in_view(
+    context: &ExecutionContext<'_>,
+    reader: &(impl DbReadOps + Send + Sync),
+    identity: &crate::index_lifecycle::IndexIdentity,
+    query: &OwnedRangeQuery,
+    requested_direction: StorageRangeIndexDirection,
+    limit: Option<usize>,
+    membership: &[roaring::RoaringTreemap],
+) -> Result<Vec<u64>> {
+    let managed_query = match query {
+        OwnedRangeQuery::All => None,
+        OwnedRangeQuery::Bounded(query) => Some(query),
+    };
+    let Some(record) = crate::index_lifecycle::repository::load_index_record(
+        reader,
+        context.tenant_scope,
+        identity,
+    )
+    .await?
+    else {
+        return Err(HelixDbError::IndexLifecycleUnavailable {
+            family: crate::error::IndexFamily::Secondary,
+            reason: crate::error::IndexLifecycleUnavailableReason::CanonicalStateUnavailable,
+        });
+    };
+    let Some(active) =
+        crate::index_lifecycle::ActiveIndexHandle::try_from_record(context.tenant_scope, &record)
+    else {
+        return Err(HelixDbError::IndexLifecycleUnavailable {
+            family: crate::error::IndexFamily::Secondary,
+            reason: crate::error::IndexLifecycleUnavailableReason::CanonicalStateUnavailable,
+        });
+    };
+    let Some(definition) = active.secondary_definition() else {
+        return Err(HelixDbError::IndexCatalogCorruption(
+            "secondary range identity resolved another Active family".to_string(),
+        ));
+    };
+    let configured_direction = match definition.direction() {
+        crate::config::RangeIndexDirection::Asc => StorageRangeIndexDirection::Asc,
+        crate::config::RangeIndexDirection::Desc => StorageRangeIndexDirection::Desc,
+    };
+    if configured_direction != requested_direction {
+        return Err(HelixDbError::IndexCatalogCorruption(
+            "planner range direction disagrees with its Active secondary definition".to_string(),
+        ));
+    }
+    crate::index_lifecycle::secondary::scan_active_range_generation_with_membership(
+        reader,
+        &active,
+        managed_query,
+        limit,
+        membership,
+    )
+    .await
 }
 
 enum OwnedRangeQuery {
