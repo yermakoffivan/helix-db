@@ -286,7 +286,7 @@ pub(in crate::execution::interpreter) struct ExecutionContext<'db> {
 }
 
 impl<'db> ExecutionContext<'db> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "production-coverage"))]
     pub(in crate::execution::interpreter) fn new(
         db: &'db HelixDB,
         params: context::ParamBindings,

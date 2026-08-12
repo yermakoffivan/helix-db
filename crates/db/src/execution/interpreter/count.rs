@@ -1132,7 +1132,12 @@ fn validate_index_id(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(feature = "production-coverage", not(test)))]
+pub(super) async fn run_production_contracts() {
+    tests::run_production_contracts().await;
+}
+
+#[cfg(any(test, feature = "production-coverage"))]
 mod tests {
     use helix_ast::expr::Predicate;
     use helix_ast::index::RangeIndexDirection;
@@ -1214,7 +1219,7 @@ mod tests {
             .then_limit(exec::ExecUsizeExpr::literal(take))
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
     fn evaluated_windows_and_index_identity_validation_cover_boundaries() {
         let all = EvaluatedCountWindow {
             skip: 2,
@@ -1259,7 +1264,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn direct_non_search_count_families_match_materialized_sources() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("count-direct-source-matrix")
@@ -1638,6 +1643,7 @@ mod tests {
 
         let variable = test_support::name("rows");
         let mut context = ExecutionContext::new(&db, context::ParamBindings::default());
+        context.enable_request_read_view().await.unwrap();
         context.variables.insert(
             variable.clone(),
             ExecutionValue::Stream(vec![
@@ -1669,9 +1675,10 @@ mod tests {
                 ExecutionValue::Count(expected)
             );
         }
+        context.close_request_read_view().unwrap();
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn every_direct_storage_count_propagates_its_own_read_failure() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("count-direct-storage-errors")
@@ -1876,7 +1883,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn direct_and_cursor_authoritative_counts_propagate_each_predicate_failure() {
         let db = test_support::open_db("count-corrupt-authority-errors").await;
         let node = test_support::add_node_with_properties(
@@ -1968,7 +1975,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn count_window_parameters_shapes_and_runtime_variables_fail_closed() {
         let db = test_support::open_db("count-window-shape-errors").await;
         let property = test_support::name("property");
@@ -2173,7 +2180,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn recursive_count_cursor_matrix_preserves_identity_and_child_order() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("count-recursive-cursor-matrix")
@@ -2549,7 +2556,7 @@ mod tests {
         execution.close_request_read_view().unwrap();
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn every_recursive_cursor_wrapper_propagates_child_failure_in_encoded_order() {
         let db = test_support::open_db("count-recursive-child-errors").await;
         let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
@@ -2641,7 +2648,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn every_recursive_cursor_operation_propagates_its_primitive_failure() {
         let db = test_support::open_db("count-recursive-operation-errors").await;
         let node = test_support::add_node_with_properties(
@@ -2745,7 +2752,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn direct_and_restricted_search_count_families_use_selected_search_primitives() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("count-search-family-matrix")
@@ -2986,7 +2993,7 @@ mod tests {
         execution.close_request_read_view().unwrap();
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn every_direct_and_cursor_search_propagates_its_selected_read_failure() {
         let db = test_support::open_db("count-search-storage-errors").await;
         db.inner_db().close().await.unwrap();
@@ -3072,7 +3079,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn input_shapes_and_parameterized_windows_are_literal_contracts() {
         let db = test_support::open_db("count-input-shapes-and-windows").await;
         let skip = test_support::name("skip");
@@ -3108,7 +3115,7 @@ mod tests {
         assert!(error.to_string().contains("count plan expected rows"));
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn count_window_runtime_dynamic_range_and_deadline_errors_are_exhaustive() {
         let db = test_support::open_db("count-contract-error-matrix").await;
         let missing = test_support::name("missing");
@@ -3338,7 +3345,7 @@ mod tests {
             .is_err());
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn point_and_batch_bitmap_counts_issue_only_the_encoded_primitive() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("count-exact-bitmap-primitives")
@@ -3400,7 +3407,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn bitmap_child_order_is_observed_and_never_reordered() {
         let db = test_support::open_db("count-bitmap-child-order").await;
         let mut context = ExecutionContext::new(&db, context::ParamBindings::default());
@@ -3429,7 +3436,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn bitmap_validation_and_recursive_error_paths_cover_every_exact_variant() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("count-bitmap-error-matrix")
@@ -3524,7 +3531,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn unique_count_performs_one_owner_read_and_one_authoritative_verification() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("count-exact-unique-owner")
@@ -3637,7 +3644,7 @@ mod tests {
         .is_err());
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn authoritative_null_count_applies_its_normalized_window_after_matches() {
         let db = test_support::open_db("count-authoritative-null-window").await;
         for properties in [
@@ -3668,5 +3675,26 @@ mod tests {
             .unwrap(),
             ExecutionValue::Count(1)
         );
+    }
+
+    #[cfg(all(feature = "production-coverage", not(test)))]
+    pub(super) async fn run_production_contracts() {
+        evaluated_windows_and_index_identity_validation_cover_boundaries();
+        direct_non_search_count_families_match_materialized_sources().await;
+        every_direct_storage_count_propagates_its_own_read_failure().await;
+        direct_and_cursor_authoritative_counts_propagate_each_predicate_failure().await;
+        count_window_parameters_shapes_and_runtime_variables_fail_closed().await;
+        recursive_count_cursor_matrix_preserves_identity_and_child_order().await;
+        every_recursive_cursor_wrapper_propagates_child_failure_in_encoded_order().await;
+        every_recursive_cursor_operation_propagates_its_primitive_failure().await;
+        direct_and_restricted_search_count_families_use_selected_search_primitives().await;
+        every_direct_and_cursor_search_propagates_its_selected_read_failure().await;
+        input_shapes_and_parameterized_windows_are_literal_contracts().await;
+        count_window_runtime_dynamic_range_and_deadline_errors_are_exhaustive().await;
+        point_and_batch_bitmap_counts_issue_only_the_encoded_primitive().await;
+        bitmap_child_order_is_observed_and_never_reordered().await;
+        bitmap_validation_and_recursive_error_paths_cover_every_exact_variant().await;
+        unique_count_performs_one_owner_read_and_one_authoritative_verification().await;
+        authoritative_null_count_applies_its_normalized_window_after_matches().await;
     }
 }

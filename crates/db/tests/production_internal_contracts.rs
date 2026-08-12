@@ -259,6 +259,24 @@ async fn interpreter_request_read_view_guards_fail_closed() {
     db::production_coverage::interpreter_request_read_view_guard_contracts().await;
 }
 
+/// Exercises every exact cardinality primitive through a production-linked binary.
+#[test]
+fn interpreter_cardinality_programs_cover_exact_contracts() {
+    std::thread::Builder::new()
+        .name("exact-cardinality-production-contracts".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("cardinality production runtime builds")
+                .block_on(db::production_coverage::interpreter_cardinality_program_contracts());
+        })
+        .expect("cardinality production thread starts")
+        .join()
+        .expect("cardinality production contracts complete");
+}
+
 /// Proves catalog authority excludes lifecycle publication through write-open.
 #[tokio::test]
 async fn interpreter_catalog_authority_transfers_through_write_open() {

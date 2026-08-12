@@ -12,5 +12,9 @@ mod secondary_set;
 
 pub(in crate::execution::interpreter) use search::SearchReadLimit;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "production-coverage"))]
+#[cfg_attr(
+    all(feature = "production-coverage", not(test)),
+    allow(dead_code, unused_imports, unused_macros)
+)]
 pub(in crate::execution::interpreter) mod tests;

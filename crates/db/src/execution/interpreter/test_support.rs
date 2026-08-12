@@ -222,6 +222,7 @@ pub(crate) async fn open_db_with_object_store(
         .expect("object-store db opens")
 }
 
+#[cfg(test)]
 pub(crate) async fn open_reader_with_config(config: TestDbConfig) -> HelixDB {
     HelixDB::open_reader_with_object_store_for_tests_inner(
         config.database.clone(),

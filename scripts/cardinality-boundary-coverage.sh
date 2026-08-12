@@ -100,7 +100,7 @@ done
 # module; integration tests and doctests still exercise that production code.
 : >"$PRODUCTION_CHANGED_LINES_PATH"
 for target_file in "${TARGET_FILES[@]}"; do
-    test_start="$(awk '/^#\[cfg\(test\)\]/{ print NR; exit }' "$ROOT/$target_file")"
+    test_start="$(awk '/^#\[cfg\(.*test/{ print NR; exit }' "$ROOT/$target_file")"
     if [[ -z "$test_start" ]]; then
         test_start=2147483647
     fi

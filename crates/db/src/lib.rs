@@ -823,7 +823,7 @@ impl HelixDB {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "production-coverage"))]
     async fn open_with_object_store_for_tests_inner(
         database: impl Into<String>,
         object_store: Arc<dyn ObjectStore>,

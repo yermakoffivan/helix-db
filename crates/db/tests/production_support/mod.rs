@@ -78,6 +78,11 @@ pub async fn writer_migration_requirement_contracts() {
     crate::migrations::production_contracts::run_writer_migration_requirement_contracts().await;
 }
 
+/// Runs the exhaustive exact cardinality interpreter contract matrix.
+pub async fn interpreter_cardinality_program_contracts() {
+    crate::execution::interpreter::run_cardinality_production_contracts().await;
+}
+
 /// Rejects or completes legacy secondary work when automatic driving is disabled.
 pub async fn migration_disabled_secondary_worker_open_contract() {
     crate::migrations::production_contracts::run_disabled_secondary_worker_open_contract().await;
