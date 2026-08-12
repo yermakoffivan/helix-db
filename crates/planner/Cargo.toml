@@ -13,6 +13,7 @@ thiserror = "2"
 [dev-dependencies]
 criterion = "0.8"
 helix-ast = { path = "../ast", features = ["test-utils"] }
+proptest = "1"
 
 [[bench]]
 name = "planner_scalability"

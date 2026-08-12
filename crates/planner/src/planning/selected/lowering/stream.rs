@@ -78,6 +78,16 @@ impl SelectedCascadesPlanner<'_> {
             | logical::RootStream::VariableWrite(_) => {
                 self.selected_terminal_root_stream_input(child_plans, metrics)
             }
+            logical::RootStream::Cardinality(_) => {
+                match self.selected_root_stream_child(child_plans, metrics)? {
+                    exec::SelectedExecutableRunRoot::Count(count) => {
+                        Ok(exec::SelectedRootStreamInput::Count(count))
+                    }
+                    _ => Err(rejection::unsupported(
+                        rejection::Reason::RootStreamChildKindMismatch,
+                    )),
+                }
+            }
         }
     }
 

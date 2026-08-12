@@ -29,7 +29,7 @@ fn access_expr() -> logical::LogicalExpr {
 fn classifies_selected_terminal_case() {
     let source = logical::LogicalExpr::StreamProject(logical::StreamProject::new(
         variable_stream(),
-        ir::ProjectionPlan::Count,
+        ir::ProjectionPlan::Exists,
     ));
 
     assert!(matches!(
@@ -96,7 +96,7 @@ fn classification_does_not_need_costed_physical_alternative() {
     );
     let source = logical::LogicalExpr::StreamProject(logical::StreamProject::new(
         variable_stream(),
-        ir::ProjectionPlan::Count,
+        ir::ProjectionPlan::Exists,
     ));
 
     assert!(matches!(

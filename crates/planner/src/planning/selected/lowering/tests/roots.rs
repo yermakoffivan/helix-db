@@ -68,7 +68,7 @@ fn selected_run_root_from_plan_wraps_supported_selected_root_families() {
         .selected_run_root_from_plan(
             logical::LogicalExpr::StreamProject(logical::StreamProject::new(
                 support::variable_stream(),
-                ir::ProjectionPlan::Count,
+                ir::ProjectionPlan::Exists,
             )),
             terminal_pipeline_alternative(physical::PhysicalStreamOp::Project),
             support::optimizer_provenance(),
@@ -198,7 +198,7 @@ fn selected_run_root_from_plan_rejects_selected_root_physical_mismatches() {
         (
             logical::LogicalExpr::StreamProject(logical::StreamProject::new(
                 support::variable_stream(),
-                ir::ProjectionPlan::Count,
+                ir::ProjectionPlan::Exists,
             )),
             support::barrier_alternative(),
         ),
@@ -309,7 +309,7 @@ fn selected_run_root_from_plan_rejects_selected_root_suffix_mismatches() {
             .selected_run_root_from_plan(
                 logical::LogicalExpr::StreamProject(logical::StreamProject::new(
                     support::variable_stream(),
-                    ir::ProjectionPlan::Count,
+                    ir::ProjectionPlan::Exists,
                 )),
                 aggregate_pipeline,
                 support::optimizer_provenance(),

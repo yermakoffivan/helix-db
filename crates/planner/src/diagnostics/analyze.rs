@@ -135,6 +135,7 @@ impl<'a> Analyzer<'a> {
     ) {
         match &step.op {
             exec::ExecOp::Access { plan } => self.analyze_access(plan),
+            exec::ExecOp::Count { .. } => {}
             exec::ExecOp::KvRead(read) => self.analyze_kv_read(read),
             exec::ExecOp::Expand { .. } => {
                 self.statistics.expansions = self.statistics.expansions.saturating_add(1);
@@ -573,6 +574,7 @@ fn traversal_depth_for_op(op: &exec::ExecOp, parent_depth: usize) -> usize {
                 .saturating_mul(subplan_maximum_traversal_increment(plan.body.steps())),
         ),
         exec::ExecOp::Filter { .. }
+        | exec::ExecOp::Count { .. }
         | exec::ExecOp::VectorSearch { .. }
         | exec::ExecOp::TextSearch { .. }
         | exec::ExecOp::Limit { .. }
@@ -756,6 +758,7 @@ fn lineage_for_step(
             | exec::KvReadPlan::PrefixScan { .. },
         )
         | exec::ExecOp::Expand { .. }
+        | exec::ExecOp::Count { .. }
         | exec::ExecOp::Project { .. }
         | exec::ExecOp::Aggregate { .. }
         | exec::ExecOp::Variable { .. }
@@ -776,6 +779,7 @@ fn unbounded_scan_scope(op: &exec::ExecOp) -> Option<AccessScope> {
         exec::ExecOp::Access { plan } => unbounded_access_scope(plan),
         exec::ExecOp::KvRead(read) => unbounded_kv_read_scope(read),
         exec::ExecOp::Expand { .. }
+        | exec::ExecOp::Count { .. }
         | exec::ExecOp::VectorSearch { .. }
         | exec::ExecOp::TextSearch { .. }
         | exec::ExecOp::Filter { .. }

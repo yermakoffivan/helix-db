@@ -718,6 +718,8 @@ pub enum ExecCountDistinctPlan {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecCountCursorPlan {
+    /// Statically empty cursor.
+    EmptyRows,
     /// Rows supplied by the count step dependency.
     InputRows,
     /// Node equality bitmap IDs.
@@ -747,6 +749,8 @@ pub enum ExecCountCursorPlan {
     NodeRuntimeInput(ExecRuntimeInputPlan),
     /// Edge runtime input.
     EdgeRuntimeInput(ExecRuntimeInputPlan),
+    /// Runtime rows whose element kind is intentionally unconstrained.
+    RuntimeInput(ExecRuntimeInputPlan),
     /// Full node scan.
     NodeFullScan,
     /// Full edge scan.
@@ -946,6 +950,13 @@ pub enum ExecCountPlan {
         /// Normalized count window.
         window: ExecCountWindowPlan,
     },
+    /// Rows supplied directly by a request parameter or materialized variable.
+    RuntimeInput {
+        /// Exact runtime source.
+        input: ExecRuntimeInputPlan,
+        /// Normalized count window.
+        window: ExecCountWindowPlan,
+    },
     /// Full authoritative node scan.
     NodeFullScan { window: ExecCountWindowPlan },
     /// Full authoritative edge scan.
@@ -984,9 +995,115 @@ pub enum ExecCountPlan {
     InputScalars { window: ExecCountWindowPlan },
 }
 
+/// Runtime input shape required by an exact count program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecCountDependency {
+    /// The count program performs all reads itself.
+    Direct,
+    /// The count program consumes rows from exactly one selected dependency.
+    Rows,
+    /// The count program consumes scalar items from exactly one selected dependency.
+    Scalars,
+}
+
+/// Invalid dependency shape encoded by a recursive count cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecCountDependencyError {
+    /// More than one cursor leaf requested dependency rows.
+    MultipleRowInputs,
+}
+
+impl ExecCountPlan {
+    /// Validate and return the exact selected dependency contract.
+    pub fn dependency(&self) -> Result<ExecCountDependency, ExecCountDependencyError> {
+        match self {
+            Self::InputRows { .. } => Ok(ExecCountDependency::Rows),
+            Self::InputScalars { .. } => Ok(ExecCountDependency::Scalars),
+            Self::Stream(plan) => match cursor_row_input_count(&plan.cursor)? {
+                0 => Ok(ExecCountDependency::Direct),
+                1 => Ok(ExecCountDependency::Rows),
+                _ => Err(ExecCountDependencyError::MultipleRowInputs),
+            },
+            Self::Constant(_)
+            | Self::NodeBitmap(_)
+            | Self::EdgeBitmap(_)
+            | Self::NodeUnique(_)
+            | Self::NodeRange(_)
+            | Self::EdgeRange(_)
+            | Self::NodeAuthoritativeScan(_)
+            | Self::EdgeAuthoritativeScan(_)
+            | Self::NodePointReads { .. }
+            | Self::EdgePointReads { .. }
+            | Self::NodeRuntimeInput { .. }
+            | Self::EdgeRuntimeInput { .. }
+            | Self::RuntimeInput { .. }
+            | Self::NodeFullScan { .. }
+            | Self::EdgeFullScan { .. }
+            | Self::NodeLabelBitmap { .. }
+            | Self::EdgeLabelBitmap { .. }
+            | Self::NodeVectorSearch(_)
+            | Self::EdgeVectorSearch(_)
+            | Self::NodeTextSearch(_)
+            | Self::EdgeTextSearch(_)
+            | Self::NodeDynamicEquality(_)
+            | Self::EdgeDynamicEquality(_) => Ok(ExecCountDependency::Direct),
+        }
+    }
+}
+
+fn cursor_row_input_count(cursor: &ExecCountCursorPlan) -> Result<usize, ExecCountDependencyError> {
+    let count = match cursor {
+        ExecCountCursorPlan::InputRows => 1,
+        ExecCountCursorPlan::Union { driver, rest }
+        | ExecCountCursorPlan::Intersect { driver, rest } => {
+            let mut count = cursor_row_input_count(driver)?;
+            for child in rest {
+                count = count.saturating_add(cursor_row_input_count(child)?);
+                if count > 1 {
+                    return Err(ExecCountDependencyError::MultipleRowInputs);
+                }
+            }
+            count
+        }
+        ExecCountCursorPlan::Filter { input, .. }
+        | ExecCountCursorPlan::Window { input, .. }
+        | ExecCountCursorPlan::Order { input, .. }
+        | ExecCountCursorPlan::Expand { input, .. }
+        | ExecCountCursorPlan::VectorSearch { input, .. }
+        | ExecCountCursorPlan::TextSearch { input, .. }
+        | ExecCountCursorPlan::Variable { input, .. }
+        | ExecCountCursorPlan::Distinct { input, .. } => cursor_row_input_count(input)?,
+        ExecCountCursorPlan::EmptyRows
+        | ExecCountCursorPlan::NodeBitmap(_)
+        | ExecCountCursorPlan::EdgeBitmap(_)
+        | ExecCountCursorPlan::NodeUnique { .. }
+        | ExecCountCursorPlan::NodeRange(_)
+        | ExecCountCursorPlan::EdgeRange(_)
+        | ExecCountCursorPlan::NodeAuthoritativeScan(_)
+        | ExecCountCursorPlan::EdgeAuthoritativeScan(_)
+        | ExecCountCursorPlan::NodePointReads(_)
+        | ExecCountCursorPlan::EdgePointReads(_)
+        | ExecCountCursorPlan::NodeRuntimeInput(_)
+        | ExecCountCursorPlan::EdgeRuntimeInput(_)
+        | ExecCountCursorPlan::RuntimeInput(_)
+        | ExecCountCursorPlan::NodeFullScan
+        | ExecCountCursorPlan::EdgeFullScan
+        | ExecCountCursorPlan::NodeLabelBitmap(_)
+        | ExecCountCursorPlan::EdgeLabelBitmap(_)
+        | ExecCountCursorPlan::NodeVectorSearch { .. }
+        | ExecCountCursorPlan::EdgeVectorSearch { .. }
+        | ExecCountCursorPlan::NodeTextSearch { .. }
+        | ExecCountCursorPlan::EdgeTextSearch { .. }
+        | ExecCountCursorPlan::NodeDynamicEquality { .. }
+        | ExecCountCursorPlan::EdgeDynamicEquality { .. } => 0,
+    };
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use helix_ast::value::PropertyValue;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -1124,6 +1241,58 @@ mod tests {
         assert_eq!(limited.apply(usize::MAX, &mut resolve), Ok(0));
     }
 
+    #[derive(Debug, Clone)]
+    enum WindowOp {
+        Skip(usize),
+        Limit(usize),
+        Range(usize, usize),
+    }
+
+    fn window_value() -> impl Strategy<Value = usize> {
+        prop_oneof![0usize..300, Just(usize::MAX)]
+    }
+
+    fn window_op() -> impl Strategy<Value = WindowOp> {
+        prop_oneof![
+            window_value().prop_map(WindowOp::Skip),
+            window_value().prop_map(WindowOp::Limit),
+            (window_value(), window_value()).prop_map(|(start, end)| WindowOp::Range(start, end)),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_window_sequences_match_sequential_slice_semantics(
+            input_len in 0usize..200,
+            ops in prop::collection::vec(window_op(), 0..40),
+        ) {
+            let mut plan = ExecCountWindowPlan::identity();
+            let mut oracle_len = input_len;
+
+            for op in ops {
+                match op {
+                    WindowOp::Skip(skip) => {
+                        plan = plan.then_skip(literal(skip));
+                        oracle_len = oracle_len.saturating_sub(skip);
+                    }
+                    WindowOp::Limit(limit) => {
+                        plan = plan.then_limit(literal(limit));
+                        oracle_len = oracle_len.min(limit);
+                    }
+                    WindowOp::Range(start, end) => {
+                        plan = plan.then_range(literal(start), literal(end));
+                        oracle_len = oracle_len
+                            .saturating_sub(start)
+                            .min(end.saturating_sub(start));
+                    }
+                }
+            }
+
+            let mut resolve = |_name: &ir::NonEmptyString| -> Result<usize, ()> { Err(()) };
+            prop_assert_eq!(plan.apply(input_len, &mut resolve), Ok(oracle_len));
+        }
+    }
+
     #[test]
     fn count_contract_round_trips() {
         let plan = ExecCountPlan::InputRows {
@@ -1132,5 +1301,32 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
 
         assert_eq!(serde_json::from_str::<ExecCountPlan>(&json).unwrap(), plan);
+    }
+
+    #[test]
+    fn dependency_contract_rejects_multiple_recursive_input_leaves() {
+        let plan = ExecCountPlan::Stream(ExecCountStreamPlan {
+            cursor: ExecCountCursorPlan::Union {
+                driver: Box::new(ExecCountCursorPlan::InputRows),
+                rest: ir::AtLeast::from_one(ExecCountCursorPlan::InputRows),
+            },
+            window: ExecCountWindowPlan::identity(),
+        });
+
+        assert_eq!(
+            plan.dependency(),
+            Err(ExecCountDependencyError::MultipleRowInputs)
+        );
+        assert_eq!(
+            ExecCountPlan::Constant(0).dependency(),
+            Ok(ExecCountDependency::Direct)
+        );
+        assert_eq!(
+            ExecCountPlan::InputScalars {
+                window: ExecCountWindowPlan::identity(),
+            }
+            .dependency(),
+            Ok(ExecCountDependency::Scalars)
+        );
     }
 }

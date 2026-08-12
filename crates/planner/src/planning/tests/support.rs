@@ -30,9 +30,9 @@ pub(crate) use crate::error::{
     SearchTenantValueExpected,
 };
 pub(crate) use crate::exec::{
-    ElementKeyspace, ExecAccessPlan, ExecBranchPlan, ExecCondition, ExecEdgeAccessPlan,
-    ExecMergeMode, ExecMutationPlan, ExecNodeAccessPlan, ExecOp, ExecVariableOp, ExecutablePlan,
-    KvReadPlan,
+    ElementKeyspace, ExecAccessPlan, ExecBranchPlan, ExecCondition, ExecCountPlan,
+    ExecEdgeAccessPlan, ExecMergeMode, ExecMutationPlan, ExecNodeAccessPlan, ExecOp,
+    ExecRuntimeInputPlan, ExecVariableOp, ExecutablePlan, KvReadPlan,
 };
 pub(crate) use crate::ir::{
     AggregatePlan, AtLeast, BatchConditionPlan, BatchOutputPlan, BatchVariableConditionPlan,

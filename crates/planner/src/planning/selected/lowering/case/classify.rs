@@ -48,6 +48,10 @@ impl<'a> SelectedRootPlanCase<'a> {
                 logical::LogicalExpr::StreamVariableWrite(write),
                 physical::PhysicalExpr::Pipeline(_),
             ) => Ok(Self::Terminal(TerminalRootPayload::VariableWrite(write))),
+            (
+                logical::LogicalExpr::StreamCardinality(cardinality),
+                physical::PhysicalExpr::Cardinality(_),
+            ) => Ok(Self::Count(cardinality)),
             _ if selected_root_physical_mismatch(source_expr, physical_expr) => Err(
                 rejection::unsupported(rejection::Reason::SelectedRootPhysicalMismatch),
             ),

@@ -5,6 +5,8 @@ fn seed_rule_set_explores_access_filter_before_access_implementation() {
     let rules = SeedRuleSet::default();
     let optimizer = rules.optimizer();
     let config = optimizer::OptimizerConfig {
+        params: Default::default(),
+        late_bound_params: Default::default(),
         limits: crate::context::OptimizerLimits::default(),
         planner_limits: crate::context::PlannerLimits::default(),
         stats: crate::context::StatsSnapshot::default(),
@@ -53,6 +55,8 @@ fn seed_rule_set_explores_catalog_indexed_access_filters_before_implementation()
     let optimizer = rules.optimizer();
     let key = catalog::ScopedPropertyKey::try_new("User", "age").unwrap();
     let config = optimizer::OptimizerConfig {
+        params: Default::default(),
+        late_bound_params: Default::default(),
         limits: crate::context::OptimizerLimits::default(),
         planner_limits: crate::context::PlannerLimits::default(),
         stats: crate::context::StatsSnapshot::default(),
@@ -88,6 +92,8 @@ fn seed_rule_set_explores_catalog_indexed_access_filter_intersections() {
     let age_key = range_key("User", "age", helix_ast::index::RangeIndexDirection::Asc);
     let score_key = catalog::ScopedPropertyKey::try_new("User", "score").unwrap();
     let config = optimizer::OptimizerConfig {
+        params: Default::default(),
+        late_bound_params: Default::default(),
         limits: crate::context::OptimizerLimits::default(),
         planner_limits: crate::context::PlannerLimits::default(),
         stats: crate::context::StatsSnapshot::default(),
@@ -128,6 +134,8 @@ fn seed_rule_set_explores_catalog_indexed_access_filter_unions() {
     let optimizer = rules.optimizer();
     let age_key = catalog::ScopedPropertyKey::try_new("User", "age").unwrap();
     let config = optimizer::OptimizerConfig {
+        params: Default::default(),
+        late_bound_params: Default::default(),
         limits: crate::context::OptimizerLimits::default(),
         planner_limits: crate::context::PlannerLimits::default(),
         stats: crate::context::StatsSnapshot::default(),

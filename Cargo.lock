@@ -2206,6 +2206,7 @@ dependencies = [
  "criterion 0.8.2",
  "helix-ast",
  "helix-value-semantics",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

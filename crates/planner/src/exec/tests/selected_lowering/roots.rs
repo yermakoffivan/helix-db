@@ -395,7 +395,7 @@ fn selected_root_control_flow_direct_alternatives_require_selected_wrappers() {
 
     let terminal_source = logical::LogicalExpr::StreamProject(logical::StreamProject::new(
         logical::RootStream::VariableSource(logical::VariableSource::new(name("seed"))),
-        ir::ProjectionPlan::Count,
+        ir::ProjectionPlan::Exists,
     ));
     let terminal_alternative = physical::PhysicalAlternative::new(
         physical::PhysicalExpr::Pipeline(physical::PhysicalPipeline::new(
@@ -507,7 +507,7 @@ fn selected_stream_project_lowers_variable_source_terminal_to_native_dag() {
             input: SelectedRootStreamInput::VariableSource(logical::VariableSource::new(name(
                 "seed",
             ))),
-            projection: ir::ProjectionPlan::Count,
+            projection: ir::ProjectionPlan::Exists,
         },
         ir::BatchOutputPlan::Bind(name("count")),
         &profile,
@@ -523,7 +523,7 @@ fn selected_stream_project_lowers_variable_source_terminal_to_native_dag() {
     assert!(matches!(
         &plan.steps()[1].op,
         ExecOp::Project {
-            projection: ir::ProjectionPlan::Count,
+            projection: ir::ProjectionPlan::Exists,
         }
     ));
     assert_eq!(plan.steps()[1].dependencies, vec![plan.steps()[0].id]);

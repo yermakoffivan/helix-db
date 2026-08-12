@@ -115,6 +115,20 @@ impl SelectedCascadesPlanner<'_> {
                     metrics,
                 )
             }
+            case::SelectedRootPlanCase::Count(cardinality) => {
+                let child_plans =
+                    memo_children::MemoChildPlanAvailability::from_available_selection(
+                        selection,
+                        &provenance,
+                    );
+                self.selected_count_run_root(
+                    cardinality,
+                    alternative,
+                    provenance,
+                    child_plans,
+                    metrics,
+                )
+            }
             case::SelectedRootPlanCase::GenericAlternative(family) => {
                 exec::SelectedExecutableRunRoot::classified_alternative_with_provenance(
                     source_expr,

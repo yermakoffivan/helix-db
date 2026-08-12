@@ -113,7 +113,7 @@ fn logical_expr_separates_pure_and_barrier_effects() {
     assert_eq!(
         LogicalExpr::StreamProject(StreamProject::new(
             RootStream::Pipeline(Box::new(stateful_root_pipeline)),
-            ir::ProjectionPlan::Count,
+            ir::ProjectionPlan::Exists,
         ))
         .effect(),
         properties::EffectKind::Barrier

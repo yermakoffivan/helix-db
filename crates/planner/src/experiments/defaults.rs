@@ -414,7 +414,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.kind(), PlanKind::Write);
-        assert_eq!(plan.steps().len(), scale * 13);
+        assert_eq!(plan.steps().len(), scale * 12);
 
         let node_eq_reads = plan
             .steps()
@@ -470,15 +470,12 @@ mod tests {
             .steps()
             .iter()
             .filter(|step| {
-                matches!(
-                    &step.op,
-                    ExecOp::Access { plan }
-                        if matches!(
-                            plan.as_ref(),
-                            ExecAccessPlan::Edge(ExecEdgeAccessPlan::TextSearch { key, .. })
-                                if key.label == "MENTIONS" && key.property == "body"
-                        )
-                )
+                matches!(&step.op, ExecOp::Count { plan }
+                if matches!(
+                    plan.as_ref(),
+                    crate::exec::ExecCountPlan::EdgeTextSearch(search)
+                        if search.key.label == "MENTIONS" && search.key.property == "body"
+                ))
             })
             .count();
         let variable_ops = plan
