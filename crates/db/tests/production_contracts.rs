@@ -2941,7 +2941,7 @@ async fn public_query_boundary_restricts_node_and_edge_text_search_to_the_curren
         .as_array()
         .unwrap()
         .iter()
-        .filter(|id| matches!(id.as_u64(), Some(1 | 2 | 3)))
+        .filter(|id| matches!(id.as_u64(), Some(1..=3)))
         .take(2)
         .cloned()
         .collect::<Vec<_>>();
@@ -4845,6 +4845,7 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
                 vec![
                     ("category", PropertyInput::from("group")),
                     ("code", PropertyInput::from("A")),
+                    ("rank", PropertyInput::from(1_i64)),
                 ],
             ),
         )
@@ -4855,6 +4856,7 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
                 vec![
                     ("category", PropertyInput::from("group")),
                     ("code", PropertyInput::from("B")),
+                    ("rank", PropertyInput::from(2_i64)),
                 ],
             ),
         )
@@ -4865,6 +4867,7 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
                 vec![
                     ("category", PropertyInput::from("other")),
                     ("code", PropertyInput::from("C")),
+                    ("rank", PropertyInput::from(3_i64)),
                 ],
             ),
         )
@@ -4875,6 +4878,7 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
                 NodeRef::var("second"),
                 vec![
                     ("kind", PropertyInput::from("primary")),
+                    ("status", PropertyInput::from("active")),
                     ("weight", PropertyInput::from(1_i64)),
                 ],
             ),
@@ -4886,6 +4890,7 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
                 NodeRef::var("third"),
                 vec![
                     ("kind", PropertyInput::from("primary")),
+                    ("status", PropertyInput::from("inactive")),
                     ("weight", PropertyInput::from(2_i64)),
                 ],
             ),
@@ -4897,6 +4902,7 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
                 NodeRef::var("third"),
                 vec![
                     ("kind", PropertyInput::from("secondary")),
+                    ("status", PropertyInput::from("active")),
                     ("weight", PropertyInput::from(3_i64)),
                 ],
             ),
@@ -4914,8 +4920,16 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
             "unique node equality index",
         ),
         (
+            index::IndexSpec::node_range("Document", "rank"),
+            "ascending node range index",
+        ),
+        (
             index::IndexSpec::edge_equality("LINK", "kind"),
             "edge equality index",
+        ),
+        (
+            index::IndexSpec::edge_equality("LINK", "status"),
+            "second edge equality index",
         ),
         (
             index::IndexSpec::edge_range_desc("LINK", "weight"),
@@ -5121,6 +5135,224 @@ async fn public_query_boundary_covers_active_secondary_index_families() {
             "primary": [0, 1],
             "heavy": [2, 1],
         })
+    );
+
+    let secondary_id_plan = |access: exec::ExecAccessPlan| {
+        let access_id = exec::ExecStepId::new(1).expect("access step ID is positive");
+        let project_id = exec::ExecStepId::new(2).expect("project step ID is positive");
+        exec::ExecutablePlan::new(
+            ir::PlanKind::Read,
+            ir::ReturnPlan::None,
+            ir::AtLeast::try_from_vec(vec![
+                exec::ExecStep {
+                    id: access_id,
+                    dependencies: Vec::new(),
+                    output: ir::BatchOutputPlan::Discard,
+                    condition: exec::ExecCondition::Always,
+                    op: exec::ExecOp::Access {
+                        plan: Box::new(access),
+                    },
+                    schedule: exec::ExecSchedule::Pipeline,
+                    delivered: properties::DeliveredProperties::default(),
+                    cost: cost::CostVector::ZERO,
+                },
+                exec::ExecStep {
+                    id: project_id,
+                    dependencies: vec![access_id],
+                    output: ir::BatchOutputPlan::Discard,
+                    condition: exec::ExecCondition::Always,
+                    op: exec::ExecOp::Project {
+                        projection: ir::ProjectionPlan::Id,
+                    },
+                    schedule: exec::ExecSchedule::Pipeline,
+                    delivered: properties::DeliveredProperties::default(),
+                    cost: cost::CostVector::ZERO,
+                },
+            ])
+            .expect("secondary-set execution plan has two steps"),
+            project_id,
+            trace::PlanningTrace::default(),
+            exec::PlannerMetrics::default(),
+        )
+        .expect("secondary-set execution plan validates")
+    };
+    let node_equality =
+        |property: &str, values: &[&str]| exec::ExecNodeSecondarySetPlan::Equality {
+            index: catalog::NodeEqualityIndexMeta::try_new(format!(
+                "production_node_equality_{property}"
+            ))
+            .expect("logical node equality index name is non-empty"),
+            key: catalog::ScopedPropertyKey::try_new("Document", property)
+                .expect("logical node equality key validates"),
+            values: ir::AtLeast::try_from_vec(
+                values
+                    .iter()
+                    .map(|value| {
+                        ir::IndexValue::Literal(
+                            ir::SecondaryIndexLiteral::new(PropertyValue::from(*value))
+                                .expect("string equality value is index-compatible"),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("node equality set has at least one value"),
+        };
+    let edge_equality =
+        |property: &str, values: &[&str]| exec::ExecEdgeSecondarySetPlan::Equality {
+            index: catalog::EdgeEqualityIndexMeta::try_new(format!(
+                "production_edge_equality_{property}"
+            ))
+            .expect("logical edge equality index name is non-empty"),
+            key: catalog::ScopedPropertyKey::try_new("LINK", property)
+                .expect("logical edge equality key validates"),
+            values: ir::AtLeast::try_from_vec(
+                values
+                    .iter()
+                    .map(|value| {
+                        ir::IndexValue::Literal(
+                            ir::SecondaryIndexLiteral::new(PropertyValue::from(*value))
+                                .expect("string equality value is index-compatible"),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("edge equality set has at least one value"),
+        };
+    let node_range = || exec::ExecNodeSecondaryRangePlan {
+        index: catalog::NodeRangeIndexMeta::try_new("production_node_range_rank")
+            .expect("logical node range index name is non-empty"),
+        key: catalog::ScopedPropertyDirectionKey::try_new(
+            "Document",
+            "rank",
+            index::RangeIndexDirection::Asc,
+        )
+        .expect("logical node range key validates"),
+        range: ir::IndexRange::All,
+    };
+    let edge_range = || exec::ExecEdgeSecondaryRangePlan {
+        index: catalog::EdgeRangeIndexMeta::try_new("production_edge_range_weight")
+            .expect("logical edge range index name is non-empty"),
+        key: catalog::ScopedPropertyDirectionKey::try_new(
+            "LINK",
+            "weight",
+            index::RangeIndexDirection::Desc,
+        )
+        .expect("logical edge range key validates"),
+        range: ir::IndexRange::All,
+    };
+    let node_ids = |ids: &[u64]| {
+        ExecutionValue::Scalars(ids.iter().copied().map(ExecutionScalar::NodeId).collect())
+    };
+    let edge_ids = |ids: &[u64]| {
+        ExecutionValue::Scalars(ids.iter().copied().map(ExecutionScalar::EdgeId).collect())
+    };
+
+    for (set, expected) in [
+        (
+            node_equality("category", &["group", "other"]),
+            node_ids(&[0, 1, 2]),
+        ),
+        (
+            exec::ExecNodeSecondarySetPlan::Union(ir::AtLeast::from_pair(
+                node_equality("category", &["other"]),
+                node_equality("code", &["B"]),
+            )),
+            node_ids(&[1, 2]),
+        ),
+        (
+            exec::ExecNodeSecondarySetPlan::Intersect(ir::AtLeast::from_pair(
+                node_equality("category", &["group"]),
+                node_equality("code", &["B"]),
+            )),
+            node_ids(&[1]),
+        ),
+        (
+            exec::ExecNodeSecondarySetPlan::Range(node_range()),
+            node_ids(&[0, 1, 2]),
+        ),
+        (exec::ExecNodeSecondarySetPlan::Empty, node_ids(&[])),
+    ] {
+        let result = db
+            .execute(
+                &secondary_id_plan(exec::ExecAccessPlan::Node(
+                    exec::ExecNodeAccessPlan::SecondarySet { set },
+                )),
+                context::ParamBindings::default(),
+            )
+            .await
+            .expect("node secondary-set execution succeeds");
+        assert_eq!(result.last, Some(expected));
+    }
+    let ordered_nodes = exec::ExecAccessPlan::Node(exec::ExecNodeAccessPlan::SecondarySet {
+        set: exec::ExecNodeSecondarySetPlan::OrderedIntersect {
+            driver: node_range(),
+            filters: ir::AtLeast::from_one(node_equality("category", &["group"])),
+        },
+    })
+    .limited(properties::PositiveUsize::new(1).expect("ordered node limit is positive"));
+    assert_eq!(
+        db.execute(
+            &secondary_id_plan(ordered_nodes),
+            context::ParamBindings::default(),
+        )
+        .await
+        .expect("ordered node secondary intersection succeeds")
+        .last,
+        Some(node_ids(&[0]))
+    );
+
+    for (set, expected) in [
+        (
+            edge_equality("kind", &["primary", "secondary"]),
+            edge_ids(&[0, 1, 2]),
+        ),
+        (
+            exec::ExecEdgeSecondarySetPlan::Union(ir::AtLeast::from_pair(
+                edge_equality("kind", &["primary"]),
+                edge_equality("status", &["active"]),
+            )),
+            edge_ids(&[0, 1, 2]),
+        ),
+        (
+            exec::ExecEdgeSecondarySetPlan::Intersect(ir::AtLeast::from_pair(
+                edge_equality("kind", &["primary"]),
+                edge_equality("status", &["active"]),
+            )),
+            edge_ids(&[0]),
+        ),
+        (
+            exec::ExecEdgeSecondarySetPlan::Range(edge_range()),
+            edge_ids(&[2, 1, 0]),
+        ),
+        (exec::ExecEdgeSecondarySetPlan::Empty, edge_ids(&[])),
+    ] {
+        let result = db
+            .execute(
+                &secondary_id_plan(exec::ExecAccessPlan::Edge(
+                    exec::ExecEdgeAccessPlan::SecondarySet { set },
+                )),
+                context::ParamBindings::default(),
+            )
+            .await
+            .expect("edge secondary-set execution succeeds");
+        assert_eq!(result.last, Some(expected));
+    }
+    let ordered_edges = exec::ExecAccessPlan::Edge(exec::ExecEdgeAccessPlan::SecondarySet {
+        set: exec::ExecEdgeSecondarySetPlan::OrderedIntersect {
+            driver: edge_range(),
+            filters: ir::AtLeast::from_one(edge_equality("status", &["active"])),
+        },
+    })
+    .limited(properties::PositiveUsize::new(2).expect("ordered edge limit is positive"));
+    assert_eq!(
+        db.execute(
+            &secondary_id_plan(ordered_edges),
+            context::ParamBindings::default(),
+        )
+        .await
+        .expect("ordered edge secondary intersection succeeds")
+        .last,
+        Some(edge_ids(&[2, 0]))
     );
 
     let edge_range_bounds = QueryRequest::read(
