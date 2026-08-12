@@ -46,26 +46,27 @@ def case_key(case: dict[str, Any]) -> tuple[str, int]:
 
 
 def normalized_shape(case: dict[str, Any], variant: str) -> str:
-    if shape := case.get("selected_shape"):
-        return shape
     statistics = case["planner_statistics"]
     accesses = (
         statistics["node_accesses"]
         if case["element"] == "node"
         else statistics["edge_accesses"]
     )
-    if "ordered_range" in case["name"]:
-        return "legacy_row_merge_sort"
-    if "same_index_union" in case["name"]:
-        return "legacy_equality_range_union"
-    if "multi_index_intersection" in case["name"]:
-        return "legacy_equality_range_intersection"
-    if "unique_equality" in case["name"]:
-        return "legacy_unique_equality_range"
-    if accesses["equality_index_lookups"]:
-        return "legacy_equality_range"
-    if accesses["range_index_scans"]:
-        return "legacy_ordered_range"
+    if variant == "baseline":
+        if "ordered_range" in case["name"]:
+            return "legacy_row_merge_sort"
+        if "same_index_union" in case["name"]:
+            return "legacy_equality_range_union"
+        if "multi_index_intersection" in case["name"]:
+            return "legacy_equality_range_intersection"
+        if "unique_equality" in case["name"]:
+            return "legacy_unique_equality_range"
+        if accesses["equality_index_lookups"]:
+            return "legacy_equality_range"
+        if accesses["range_index_scans"]:
+            return "legacy_ordered_range"
+    if shape := case.get("selected_shape"):
+        return shape
     return f"{variant}_other"
 
 
