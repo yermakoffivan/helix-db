@@ -488,14 +488,12 @@ async fn secondary_set_batches_same_index_values_without_graph_hydration() {
         ir::IndexValue::Literal(
             ir::SecondaryIndexLiteral::new(PropertyValue::from("active")).unwrap(),
         ),
-        ir::IndexValue::Literal(
-            ir::SecondaryIndexLiteral::new(PropertyValue::from("paused")).unwrap(),
-        ),
+        ir::IndexValue::Param(test_support::name("selected_status")),
     ])
     .unwrap();
     crate::index_lifecycle::secondary::reset_equality_read_metrics();
 
-    let actual = run_node_access(
+    let actual = run_node_access_with_params(
         &db,
         exec::ExecNodeAccessPlan::SecondarySet {
             set: exec::ExecNodeSecondarySetPlan::Equality {
@@ -506,6 +504,10 @@ async fn secondary_set_batches_same_index_values_without_graph_hydration() {
                 values,
             },
         },
+        context::ParamBindings::default().with_value(
+            test_support::name("selected_status"),
+            PropertyValue::from("paused"),
+        ),
     )
     .await;
 
@@ -520,6 +522,262 @@ async fn secondary_set_batches_same_index_values_without_graph_hydration() {
     assert_eq!(metrics.point_reads, 3);
     assert_eq!(metrics.multi_get_calls, 1);
     assert_eq!(metrics.graph_reads, 0);
+}
+
+#[tokio::test]
+async fn unordered_node_secondary_sets_combine_ids_before_materialization() {
+    let db = test_support::open_db("access-unordered-node-secondary-set").await;
+    let active_admin = test_support::add_node_with_properties(
+        &db,
+        "User",
+        vec![
+            ("status", PropertyValue::from("active")),
+            ("role", PropertyValue::from("admin")),
+            ("rank", PropertyValue::from("a")),
+        ],
+    )
+    .await;
+    let active_member = test_support::add_node_with_properties(
+        &db,
+        "User",
+        vec![
+            ("status", PropertyValue::from("active")),
+            ("role", PropertyValue::from("member")),
+            ("rank", PropertyValue::from("b")),
+        ],
+    )
+    .await;
+    let paused_admin = test_support::add_node_with_properties(
+        &db,
+        "User",
+        vec![
+            ("status", PropertyValue::from("paused")),
+            ("role", PropertyValue::from("admin")),
+            ("rank", PropertyValue::from("c")),
+        ],
+    )
+    .await;
+    seed_active_secondary_generation(
+        &db,
+        SecondaryIndexDefinition::node_equality("User", "status").unwrap(),
+        54,
+        &[
+            ("active", active_admin),
+            ("active", active_member),
+            ("paused", paused_admin),
+        ],
+    )
+    .await;
+    seed_active_secondary_generation(
+        &db,
+        SecondaryIndexDefinition::node_equality("User", "role").unwrap(),
+        55,
+        &[
+            ("admin", active_admin),
+            ("member", active_member),
+            ("admin", paused_admin),
+        ],
+    )
+    .await;
+    seed_active_secondary_generation(
+        &db,
+        SecondaryIndexDefinition::node_range("User", "rank").unwrap(),
+        58,
+        &[
+            ("a", active_admin),
+            ("b", active_member),
+            ("c", paused_admin),
+        ],
+    )
+    .await;
+
+    let status = |value: &'static str| exec::ExecNodeSecondarySetPlan::Equality {
+        index: catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:User:status")),
+        key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+        values: ir::AtLeast::from_one(ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from(value)).unwrap(),
+        )),
+    };
+    let role = |value: &'static str| exec::ExecNodeSecondarySetPlan::Equality {
+        index: catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:User:role")),
+        key: catalog::ScopedPropertyKey::try_new("User", "role").unwrap(),
+        values: ir::AtLeast::from_one(ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from(value)).unwrap(),
+        )),
+    };
+    let range = || exec::ExecNodeSecondaryRangePlan {
+        index: catalog::NodeRangeIndexMeta::new(test_support::name("node_range:User:rank:asc")),
+        key: catalog::ScopedPropertyDirectionKey::try_new(
+            "User",
+            "rank",
+            helix_ast::index::RangeIndexDirection::Asc,
+        )
+        .unwrap(),
+        range: ir::IndexRange::All,
+    };
+    let plan = exec::ExecNodeAccessPlan::SecondarySet {
+        set: exec::ExecNodeSecondarySetPlan::Intersect(ir::AtLeast::from_pair(
+            exec::ExecNodeSecondarySetPlan::Union(ir::AtLeast::from_pair(
+                status("active"),
+                status("paused"),
+            )),
+            role("admin"),
+        )),
+    };
+
+    let mut expected = vec![active_admin, paused_admin];
+    expected.sort_unstable();
+    assert_eq!(
+        run_node_access(&db, plan).await,
+        ExecutionValue::Scalars(expected.into_iter().map(ExecutionScalar::NodeId).collect())
+    );
+    assert_eq!(
+        run_node_access(
+            &db,
+            exec::ExecNodeAccessPlan::SecondarySet {
+                set: exec::ExecNodeSecondarySetPlan::Intersect(ir::AtLeast::from_pair(
+                    exec::ExecNodeSecondarySetPlan::Range(range()),
+                    role("admin"),
+                )),
+            },
+        )
+        .await,
+        ExecutionValue::Scalars(vec![
+            ExecutionScalar::NodeId(active_admin),
+            ExecutionScalar::NodeId(paused_admin),
+        ])
+    );
+    assert_eq!(
+        run_limited_node_access(
+            &db,
+            exec::ExecNodeAccessPlan::SecondarySet {
+                set: exec::ExecNodeSecondarySetPlan::OrderedIntersect {
+                    driver: range(),
+                    filters: ir::AtLeast::<_, 1>::try_from_vec(vec![
+                        status("active"),
+                        role("admin"),
+                    ])
+                    .unwrap(),
+                },
+            },
+            1,
+        )
+        .await,
+        ExecutionValue::Scalars(vec![ExecutionScalar::NodeId(active_admin)])
+    );
+    assert_eq!(
+        run_node_access(
+            &db,
+            exec::ExecNodeAccessPlan::SecondarySet {
+                set: exec::ExecNodeSecondarySetPlan::Empty,
+            },
+        )
+        .await,
+        ExecutionValue::Scalars(Vec::new())
+    );
+}
+
+#[tokio::test]
+async fn unordered_edge_secondary_sets_remain_edge_scoped() {
+    let db = test_support::open_db("access-unordered-edge-secondary-set").await;
+    let from = test_support::add_user(&db, "from").await;
+    let to = test_support::add_user(&db, "to").await;
+    let active_friend = test_support::add_edge_with_properties(
+        &db,
+        from,
+        to,
+        "FOLLOWS",
+        vec![
+            ("status", PropertyValue::from("active")),
+            ("kind", PropertyValue::from("friend")),
+        ],
+    )
+    .await;
+    let paused_friend = test_support::add_edge_with_properties(
+        &db,
+        from,
+        to,
+        "FOLLOWS",
+        vec![
+            ("status", PropertyValue::from("paused")),
+            ("kind", PropertyValue::from("friend")),
+        ],
+    )
+    .await;
+    let active_colleague = test_support::add_edge_with_properties(
+        &db,
+        from,
+        to,
+        "FOLLOWS",
+        vec![
+            ("status", PropertyValue::from("active")),
+            ("kind", PropertyValue::from("colleague")),
+        ],
+    )
+    .await;
+    seed_active_secondary_generation(
+        &db,
+        SecondaryIndexDefinition::edge_equality("FOLLOWS", "status").unwrap(),
+        56,
+        &[
+            ("active", active_friend),
+            ("paused", paused_friend),
+            ("active", active_colleague),
+        ],
+    )
+    .await;
+    seed_active_secondary_generation(
+        &db,
+        SecondaryIndexDefinition::edge_equality("FOLLOWS", "kind").unwrap(),
+        57,
+        &[
+            ("friend", active_friend),
+            ("friend", paused_friend),
+            ("colleague", active_colleague),
+        ],
+    )
+    .await;
+
+    let status = |value: &'static str| exec::ExecEdgeSecondarySetPlan::Equality {
+        index: catalog::EdgeEqualityIndexMeta::new(test_support::name("edge_eq:FOLLOWS:status")),
+        key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+        values: ir::AtLeast::from_one(ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from(value)).unwrap(),
+        )),
+    };
+    let friend = exec::ExecEdgeSecondarySetPlan::Equality {
+        index: catalog::EdgeEqualityIndexMeta::new(test_support::name("edge_eq:FOLLOWS:kind")),
+        key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "kind").unwrap(),
+        values: ir::AtLeast::from_one(ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(PropertyValue::from("friend")).unwrap(),
+        )),
+    };
+    let plan = exec::ExecEdgeAccessPlan::SecondarySet {
+        set: exec::ExecEdgeSecondarySetPlan::Intersect(ir::AtLeast::from_pair(
+            exec::ExecEdgeSecondarySetPlan::Union(ir::AtLeast::from_pair(
+                status("active"),
+                status("paused"),
+            )),
+            friend,
+        )),
+    };
+
+    let mut expected = vec![active_friend, paused_friend];
+    expected.sort_unstable();
+    assert_eq!(
+        run_edge_access(&db, plan).await,
+        ExecutionValue::Scalars(expected.into_iter().map(ExecutionScalar::EdgeId).collect())
+    );
+    assert_eq!(
+        run_edge_access(
+            &db,
+            exec::ExecEdgeAccessPlan::SecondarySet {
+                set: exec::ExecEdgeSecondarySetPlan::Empty,
+            },
+        )
+        .await,
+        ExecutionValue::Scalars(Vec::new())
+    );
 }
 
 #[tokio::test]
@@ -589,21 +847,36 @@ async fn ordered_edge_secondary_intersection_filters_before_applying_limit() {
             ir::SecondaryIndexLiteral::new(PropertyValue::from("active")).unwrap(),
         )),
     };
+    let range = || exec::ExecEdgeSecondaryRangePlan {
+        index: catalog::EdgeRangeIndexMeta::new(test_support::name(
+            "edge_range:FOLLOWS:weight:asc",
+        )),
+        key: catalog::ScopedPropertyDirectionKey::try_new(
+            "FOLLOWS",
+            "weight",
+            helix_ast::index::RangeIndexDirection::Asc,
+        )
+        .unwrap(),
+        range: ir::IndexRange::All,
+    };
+    assert_eq!(
+        run_edge_access(
+            &db,
+            exec::ExecEdgeAccessPlan::SecondarySet {
+                set: exec::ExecEdgeSecondarySetPlan::Range(range()),
+            },
+        )
+        .await,
+        ExecutionValue::Scalars(vec![
+            ExecutionScalar::EdgeId(active_low),
+            ExecutionScalar::EdgeId(inactive_middle),
+            ExecutionScalar::EdgeId(active_high),
+        ])
+    );
     let plan = exec::ExecEdgeAccessPlan::SecondarySet {
         set: exec::ExecEdgeSecondarySetPlan::OrderedIntersect {
-            driver: exec::ExecEdgeSecondaryRangePlan {
-                index: catalog::EdgeRangeIndexMeta::new(test_support::name(
-                    "edge_range:FOLLOWS:weight:asc",
-                )),
-                key: catalog::ScopedPropertyDirectionKey::try_new(
-                    "FOLLOWS",
-                    "weight",
-                    helix_ast::index::RangeIndexDirection::Asc,
-                )
-                .unwrap(),
-                range: ir::IndexRange::All,
-            },
-            filters: ir::AtLeast::from_one(equality),
+            driver: range(),
+            filters: ir::AtLeast::<_, 1>::try_from_vec(vec![equality.clone(), equality]).unwrap(),
         },
     };
 
