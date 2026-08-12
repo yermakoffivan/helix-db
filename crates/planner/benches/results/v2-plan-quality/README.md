@@ -2,7 +2,7 @@
 
 Report-only results from ten interleaved baseline/candidate runs on Darwin arm64. Each binary run performs three warmups and ten measured plans per case.
 
-| Population | Case | Baseline shape | Candidate shape | p50 planning delta | Baseline I/O | Candidate I/O | Allocations/plan |
+| Population | Case | Baseline shape | Candidate shape | p50 planning delta | Baseline costed I/O | Candidate costed I/O | Allocations/plan |
 |---:|---|---|---|---:|---|---|---:|
 | 1000 | edge_equality | legacy_equality_range | bitmap_equality_point | +4.2% | get=0, multi=0, seek=1, next=100 | get=1, multi=0, seek=0, next=0, auth=0 | 369 → 377 |
 | 1000 | edge_equality_ordered_range | legacy_row_merge_sort | ordered_range_bitmap_filter | +8.2% | get=0, multi=0, seek=2, next=600 | get=501, multi=0, seek=1, next=500, auth=500 | 580 → 593 |
@@ -37,4 +37,5 @@ Report-only results from ten interleaved baseline/candidate runs on Darwin arm64
 - Equality intersections combine verified IDs before the final row materialization.
 - Mixed equality/range cases use the ordered range as the driver, filter verified bitmap IDs, and no longer require an explicit sort.
 - Unique equality and range candidates retain authoritative graph verification; non-unique bitmap IDs do not add a graph existence read.
+- I/O columns are the selected plan's storage-cost components; functional executor tests separately assert observed point, multi-get, and graph-read counts.
 - Latency deltas are observations, not pass/fail gates.

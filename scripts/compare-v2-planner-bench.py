@@ -174,7 +174,7 @@ def markdown(report: dict[str, Any]) -> str:
         ),
         "",
         "| Population | Case | Baseline shape | Candidate shape | p50 planning delta | "
-        "Baseline I/O | Candidate I/O | Allocations/plan |",
+        "Baseline costed I/O | Candidate costed I/O | Allocations/plan |",
         "|---:|---|---|---|---:|---|---|---:|",
     ]
     for case in report["cases"]:
@@ -212,6 +212,8 @@ def markdown(report: dict[str, Any]) -> str:
             "bitmap IDs, and no longer require an explicit sort.",
             "- Unique equality and range candidates retain authoritative graph verification; "
             "non-unique bitmap IDs do not add a graph existence read.",
+            "- I/O columns are the selected plan's storage-cost components; functional "
+            "executor tests separately assert observed point, multi-get, and graph-read counts.",
             "- Latency deltas are observations, not pass/fail gates.",
             "",
         ]
