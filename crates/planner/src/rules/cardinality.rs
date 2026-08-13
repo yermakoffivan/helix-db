@@ -116,15 +116,36 @@ fn access_count_plans(
         logical::AccessStream::Window(window) => {
             direct_access_plans(window.access(), static_window(window.window()), rule)
         }
-        logical::AccessStream::Filter(filter) => Ok(vec![exec::ExecCountPlan::Stream(
-            exec::ExecCountStreamPlan {
-                cursor: exec::ExecCountCursorPlan::Filter {
-                    input: Box::new(access_cursor(filter.access(), rule)?),
-                    predicate: filter.predicate().clone(),
+        logical::AccessStream::Filter(filter) => {
+            let (_, late_bound_params) = rule
+                .cardinality_bindings()
+                .expect("cardinality helpers are only called by the cardinality rule");
+            if !late_bound_params.is_empty() {
+                match super::access::index_access_filter(filter, rule.indexes, rule.planner_limits)
+                {
+                    super::access::AccessFilterRewrite::Rewritten(access) => {
+                        return direct_access_plans(
+                            &access,
+                            exec::ExecCountWindowPlan::identity(),
+                            rule,
+                        );
+                    }
+                    super::access::AccessFilterRewrite::RewrittenPipeline(pipeline) => {
+                        return access_pipeline_count(&pipeline, rule);
+                    }
+                    super::access::AccessFilterRewrite::NotApplicable => {}
+                }
+            }
+            Ok(vec![exec::ExecCountPlan::Stream(
+                exec::ExecCountStreamPlan {
+                    cursor: exec::ExecCountCursorPlan::Filter {
+                        input: Box::new(access_cursor(filter.access(), rule)?),
+                        predicate: filter.predicate().clone(),
+                    },
+                    window: exec::ExecCountWindowPlan::identity(),
                 },
-                window: exec::ExecCountWindowPlan::identity(),
-            },
-        )]),
+            )])
+        }
         logical::AccessStream::Pipeline(pipeline) if has_variable_write(pipeline.ops()) => {
             Ok(vec![exec::ExecCountPlan::InputRows {
                 window: exec::ExecCountWindowPlan::identity(),
@@ -582,7 +603,11 @@ fn classify_equality(
         .expect("cardinality helpers are only called by the cardinality rule");
     let literal = match value {
         ir::IndexValue::Literal(literal) => literal.clone(),
-        ir::IndexValue::Param(param) if late_bound_params.contains(param) => {
+        // A foreach frame expands object fields into the parameter namespace.
+        // The AST exposes the container name but cannot enumerate every field
+        // that an iteration may shadow, so any active runtime parameter scope
+        // makes equality parameters inside that scope genuinely late-bound.
+        ir::IndexValue::Param(param) if !late_bound_params.is_empty() => {
             return Ok(EqualityValue::Dynamic(param.clone()));
         }
         ir::IndexValue::Param(param) => {
@@ -2156,6 +2181,7 @@ mod tests {
     #[test]
     fn ordinary_and_scoped_parameters_are_classified_at_the_correct_boundary() {
         let parameter = name("email");
+        let foreach_container = name("items");
         let source = || {
             access(node_path(node_equality(
                 "user_email",
@@ -2181,7 +2207,7 @@ mod tests {
             plans(apply(
                 source(),
                 context::ParamBindings::default(),
-                BTreeSet::from([parameter.clone()]),
+                BTreeSet::from([foreach_container.clone()]),
             ))
             .as_slice(),
             [exec::ExecCountPlan::NodeDynamicEquality(_)]
@@ -2198,7 +2224,7 @@ mod tests {
             plans(apply(
                 edge_source(),
                 context::ParamBindings::default(),
-                BTreeSet::from([parameter]),
+                BTreeSet::from([foreach_container]),
             ))
             .as_slice(),
             [exec::ExecCountPlan::EdgeDynamicEquality(_)]
@@ -3266,16 +3292,17 @@ mod tests {
             );
         });
 
-        let late = name("late");
+        let late_scope = name("items");
+        let shadowed_field = name("status");
         with_rule_input_bindings(
             context::ParamBindings::default(),
-            BTreeSet::from([late.clone()]),
+            BTreeSet::from([late_scope]),
             |rule| {
                 assert!(node_bitmap_expr(
                     &node_equality(
                         "node_eq:User:status",
                         "status",
-                        ir::IndexValue::Param(late.clone()),
+                        ir::IndexValue::Param(shadowed_field.clone()),
                         catalog::IndexUniqueness::NonUnique,
                     ),
                     rule,
@@ -3286,7 +3313,7 @@ mod tests {
                     &edge_equality(
                         "edge_eq:LIKES:status",
                         "status",
-                        ir::IndexValue::Param(late),
+                        ir::IndexValue::Param(shadowed_field),
                     ),
                     rule,
                 )

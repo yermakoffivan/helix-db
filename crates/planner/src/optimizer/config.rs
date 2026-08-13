@@ -21,7 +21,7 @@ pub struct OptimizerConfig {
     pub indexes: catalog::IndexCatalogSnapshot,
     /// Immutable request bindings used to specialize ordinary parameters.
     pub params: context::ParamBindings,
-    /// Parameter names that must remain runtime-dependent.
+    /// Active scopes whose object fields keep enclosed parameters runtime-dependent.
     pub late_bound_params: BTreeSet<ir::NonEmptyString>,
 }
 

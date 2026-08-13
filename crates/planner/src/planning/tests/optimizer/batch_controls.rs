@@ -292,6 +292,133 @@ fn cascades_foreach_body_preserves_selected_index_runs_and_body_conditions() {
 }
 
 #[test]
+fn foreach_count_keeps_object_field_equality_explicitly_dynamic() {
+    let indexes = builtin_label_indexes()
+        .with_node_eq(ScopedPropertyKey::try_new("Audit", "event_id").unwrap());
+    let body = write_batch().var_as(
+        "matching",
+        g().n_with_label_where("Audit", Predicate::eq_param("event_id", "event_id"))
+            .count(),
+    );
+    let batch = write_batch().for_each_param("events", body);
+
+    let plan = crate::planning::plan_write_batch(&batch, &ctx(indexes)).unwrap();
+    let ExecOp::ForEach { param, body } = &plan.steps()[0].op else {
+        panic!("expected foreach entry: {:?}", plan.steps());
+    };
+    assert_eq!(param.as_ref(), "events");
+    assert_eq!(body.steps().len(), 1);
+    assert_eq!(body.steps()[0].dependencies, Vec::new());
+    assert!(
+        matches!(
+            &body.steps()[0].op,
+            ExecOp::Count { plan }
+                if matches!(
+                    plan.as_ref(),
+                    crate::exec::ExecCountPlan::NodeDynamicEquality(dynamic)
+                        if dynamic.key.label == "Audit"
+                            && dynamic.key.property == "event_id"
+                            && dynamic.param.as_ref() == "event_id"
+                )
+        ),
+        "foreach count must encode dynamic equality directly: {:?}",
+        body.steps()[0].op,
+    );
+
+    let edge_indexes = builtin_label_indexes()
+        .with_edge_eq(ScopedPropertyKey::try_new("MENTIONS", "event_id").unwrap());
+    let edge_body = write_batch().var_as(
+        "matching",
+        g().e_with_label_where("MENTIONS", Predicate::eq_param("event_id", "event_id"))
+            .count(),
+    );
+    let edge_batch = write_batch().for_each_param("events", edge_body);
+    let edge_plan = crate::planning::plan_write_batch(&edge_batch, &ctx(edge_indexes)).unwrap();
+    let ExecOp::ForEach {
+        body: edge_body, ..
+    } = &edge_plan.steps()[0].op
+    else {
+        panic!("expected edge foreach entry: {:?}", edge_plan.steps());
+    };
+    assert!(matches!(
+        &edge_body.steps()[0].op,
+        ExecOp::Count { plan }
+            if matches!(
+                plan.as_ref(),
+                crate::exec::ExecCountPlan::EdgeDynamicEquality(dynamic)
+                    if dynamic.key.label == "MENTIONS"
+                        && dynamic.key.property == "event_id"
+                        && dynamic.param.as_ref() == "event_id"
+            )
+    ));
+}
+
+#[test]
+fn foreach_count_keeps_residual_filters_after_dynamic_equality() {
+    let indexes = builtin_label_indexes()
+        .with_node_eq(ScopedPropertyKey::try_new("Audit", "event_id").unwrap());
+    let predicate = Predicate::and(vec![
+        Predicate::eq_param("event_id", "event_id"),
+        Predicate::contains("message", "accepted"),
+    ]);
+    let body = write_batch().var_as(
+        "matching",
+        g().n_with_label_where("Audit", predicate).count(),
+    );
+    let batch = write_batch().for_each_param("events", body);
+
+    let plan = crate::planning::plan_write_batch(&batch, &ctx(indexes)).unwrap();
+    let ExecOp::ForEach { body, .. } = &plan.steps()[0].op else {
+        panic!("expected foreach entry: {:?}", plan.steps());
+    };
+    assert!(matches!(
+        &body.steps()[0].op,
+        ExecOp::Count { plan }
+            if matches!(
+                plan.as_ref(),
+                crate::exec::ExecCountPlan::Stream(crate::exec::ExecCountStreamPlan {
+                    cursor: crate::exec::ExecCountCursorPlan::Filter { input, .. },
+                    ..
+                }) if matches!(
+                    input.as_ref(),
+                    crate::exec::ExecCountCursorPlan::NodeDynamicEquality { key, param, .. }
+                        if key.property == "event_id" && param.as_ref() == "event_id"
+                )
+            )
+    ));
+}
+
+#[test]
+fn foreach_count_without_an_equality_index_uses_an_exact_filter_cursor() {
+    let body = write_batch().var_as(
+        "matching",
+        g().n_with_label_where("Audit", Predicate::eq_param("unindexed", "unindexed"))
+            .count(),
+    );
+    let batch = write_batch().for_each_param("events", body);
+
+    let plan = crate::planning::plan_write_batch(&batch, &ctx(builtin_label_indexes())).unwrap();
+    let ExecOp::ForEach { body, .. } = &plan.steps()[0].op else {
+        panic!("expected foreach entry: {:?}", plan.steps());
+    };
+    assert!(matches!(
+        &body.steps()[0].op,
+        ExecOp::Count { plan }
+            if matches!(
+                plan.as_ref(),
+                crate::exec::ExecCountPlan::Stream(crate::exec::ExecCountStreamPlan {
+                    cursor: crate::exec::ExecCountCursorPlan::Filter { input, .. },
+                    ..
+                }) if matches!(
+                    input.as_ref(),
+                    crate::exec::ExecCountCursorPlan::NodeLabelBitmap(label)
+                        if label.as_ref() == "Audit"
+                )
+            )
+    ));
+}
+
+#[test]
 fn cascades_nested_foreach_bodies_preserve_selected_index_runs() {
     let indexes = builtin_label_indexes()
         .with_node_eq(ScopedPropertyKey::try_new("Audit", "event_id").unwrap());

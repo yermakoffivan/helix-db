@@ -14,8 +14,9 @@ use super::{OptimizerLimits, ParamBindings, PlannerLimits, StatsSnapshot};
 pub struct PlannerContext {
     /// Runtime parameters available during planning.
     pub params: ParamBindings,
-    /// Parameters whose values are shadowed or mutated by an enclosing runtime
-    /// construct such as `foreach` and therefore cannot be specialized.
+    /// Active runtime parameter scopes, such as enclosing `foreach` containers.
+    /// A non-empty set means object fields may shadow parameter names in the
+    /// enclosed query and therefore cannot be specialized.
     #[serde(default)]
     pub late_bound_params: BTreeSet<crate::ir::NonEmptyString>,
     /// Available indexes, pre-keyed for O(1) planner lookups.

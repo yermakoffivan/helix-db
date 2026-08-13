@@ -44,8 +44,8 @@ impl StreamCardinality {
         }
     }
 
-    /// Record equality parameters whose binding is supplied by a surrounding
-    /// runtime scope rather than the immutable request bindings.
+    /// Record runtime scopes whose object fields can replace immutable request
+    /// bindings while this cardinality terminal executes.
     pub fn with_planning_bindings(
         mut self,
         params: context::ParamBindings,
@@ -66,7 +66,7 @@ impl StreamCardinality {
         &self.params
     }
 
-    /// Genuinely late-bound parameters visible at this terminal's scope.
+    /// Active runtime parameter scopes visible at this terminal.
     pub const fn late_bound_params(&self) -> &BTreeSet<ir::NonEmptyString> {
         &self.late_bound_params
     }
