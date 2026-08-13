@@ -628,6 +628,7 @@ dependencies = [
  "helix-ast",
  "helix-metrics",
  "helix-planner",
+ "helix-value-semantics",
  "insta",
  "libc",
  "object_store 0.12.5",
@@ -1340,10 +1341,15 @@ name = "helix-planner"
 version = "0.1.0"
 dependencies = [
  "helix-ast",
+ "helix-value-semantics",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "helix-value-semantics"
+version = "0.1.0"
 
 [[package]]
 name = "hermit-abi"
