@@ -18,3 +18,9 @@ pub(in crate::execution::interpreter) use search::SearchReadLimit;
     allow(dead_code, unused_imports, unused_macros)
 )]
 pub(in crate::execution::interpreter) mod tests;
+
+#[cfg(all(feature = "production-coverage", not(test)))]
+pub(in crate::execution::interpreter) async fn run_production_contracts() {
+    dispatch::tests::run_production_contracts().await;
+    indexes::tests::run_production_contracts().await;
+}

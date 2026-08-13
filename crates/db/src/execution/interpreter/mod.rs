@@ -51,6 +51,7 @@ use crate::HelixDB;
 
 #[cfg(all(feature = "production-coverage", not(test)))]
 pub(crate) async fn run_cardinality_production_contracts() {
+    access::run_production_contracts().await;
     count::run_production_contracts().await;
 }
 

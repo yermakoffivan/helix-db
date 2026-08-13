@@ -257,7 +257,7 @@ impl<'db> ExecutionContext<'db> {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "production-coverage"))]
     pub(super) async fn lookup_global_edge_equality_index(
         &self,
         property: &str,
@@ -676,13 +676,14 @@ pub(super) fn limited_index_ids(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "production-coverage"))]
 pub(super) fn scoped_property_key(key: &catalog::ScopedPropertyKey) -> String {
     crate::config::scoped_secondary_index_property(key.label.as_ref(), key.property.as_ref())
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "production-coverage"))]
+#[cfg_attr(all(feature = "production-coverage", not(test)), allow(dead_code))]
+pub(super) mod tests {
     use super::super::super::test_support;
     use super::*;
     use helix_ast::query::QueryValue;
@@ -697,7 +698,7 @@ mod tests {
         properties::PositiveUsize::new(value).expect("positive test limit")
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn index_value_converts_literals_and_runtime_parameters() {
         let db = test_support::open_db("access-index-value-conversion").await;
         let static_param = name("static_age");
@@ -732,7 +733,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn index_value_rejects_missing_parameters() {
         let db = test_support::open_db("access-index-value-missing-param").await;
         let ctx = ExecutionContext::new(&db, context::ParamBindings::default());
@@ -743,7 +744,7 @@ mod tests {
         assert!(err.to_string().contains("parameter `missing` is not bound"));
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
     fn limited_index_ids_preserve_storage_order_and_apply_positive_limits() {
         let ids = roaring::RoaringTreemap::from_iter([9, 1, 5, 3]);
 
@@ -751,7 +752,7 @@ mod tests {
         assert_eq!(limited_index_ids(ids, Some(positive(2))), vec![1, 3]);
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
     fn scoped_property_key_uses_internal_secondary_index_scope() {
         let key = catalog::ScopedPropertyKey::try_new("User", "email")
             .expect("valid scoped property key");
@@ -762,6 +763,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[tokio::test]
     async fn direct_storage_dispatches_all_index_lookup_contracts() {
         let config = test_support::in_memory_config("access-reader-index-lookups")
@@ -869,7 +871,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn active_transaction_dispatches_index_lookup_contracts() {
         let config = test_support::in_memory_config("access-active-index-lookups")
             .with_equality_index("User", "status")
@@ -939,7 +941,7 @@ mod tests {
         context.abort_request_write_scope();
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn request_snapshot_excludes_concurrent_edge_index_and_endpoint_phantoms() {
         let db = test_support::open_db("access-edge-index-request-snapshot").await;
         let alice = test_support::add_user(&db, "alice").await;
@@ -992,5 +994,15 @@ mod tests {
         context
             .close_request_read_view()
             .expect("request snapshot closes");
+    }
+
+    #[cfg(all(feature = "production-coverage", not(test)))]
+    pub(in crate::execution::interpreter::access) async fn run_production_contracts() {
+        index_value_converts_literals_and_runtime_parameters().await;
+        index_value_rejects_missing_parameters().await;
+        limited_index_ids_preserve_storage_order_and_apply_positive_limits();
+        scoped_property_key_uses_internal_secondary_index_scope();
+        active_transaction_dispatches_index_lookup_contracts().await;
+        request_snapshot_excludes_concurrent_edge_index_and_endpoint_phantoms().await;
     }
 }

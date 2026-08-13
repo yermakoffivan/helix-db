@@ -299,8 +299,9 @@ fn tightest_access_limit(
     current.filter(|current| current <= &next).unwrap_or(next)
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "production-coverage"))]
+#[cfg_attr(all(feature = "production-coverage", not(test)), allow(dead_code))]
+pub(super) mod tests {
     use helix_ast::expr::Predicate;
     use helix_ast::value::PropertyValue;
     use helix_planner::{catalog, context, ir};
@@ -312,7 +313,7 @@ mod tests {
         properties::PositiveUsize::new(value).expect("positive test limit")
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
     fn truncate_ids_applies_optional_positive_limit() {
         let mut ids = vec![1, 2, 3, 4];
         truncate_ids(&mut ids, Some(positive(2)));
@@ -350,7 +351,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
     fn tightest_access_limit_keeps_the_smallest_nested_limit() {
         assert_eq!(tightest_access_limit(None, positive(5)).get(), 5);
         assert_eq!(
@@ -367,7 +368,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn access_dispatch_covers_node_equality_and_edge_source_variants() {
         let config = test_support::in_memory_config("access-dispatch-variants")
             .with_equality_index("User", "email");
@@ -430,7 +431,7 @@ mod tests {
         execution.close_request_read_view().unwrap();
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn exact_access_dispatch_covers_bitmap_unique_scan_and_dynamic_families() {
         let db = test_support::open_db_with_config(
             test_support::in_memory_config("access-exact-family-matrix")
@@ -757,7 +758,7 @@ mod tests {
         execution.close_request_read_view().unwrap();
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn exact_access_dispatch_rejects_each_invalid_dynamic_and_set_driver_contract() {
         let db = test_support::open_db("access-dispatch-contract-errors").await;
         let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
@@ -917,7 +918,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(test, tokio::test)]
     async fn exact_access_dispatch_propagates_scan_predicate_index_and_search_failures() {
         let corrupt_db = test_support::open_db("access-dispatch-corrupt-authority").await;
         let node = test_support::add_node_with_properties(
@@ -1102,5 +1103,15 @@ mod tests {
                 .await
                 .is_err());
         }
+    }
+
+    #[cfg(all(feature = "production-coverage", not(test)))]
+    pub(in crate::execution::interpreter::access) async fn run_production_contracts() {
+        truncate_ids_applies_optional_positive_limit();
+        tightest_access_limit_keeps_the_smallest_nested_limit();
+        access_dispatch_covers_node_equality_and_edge_source_variants().await;
+        exact_access_dispatch_covers_bitmap_unique_scan_and_dynamic_families().await;
+        exact_access_dispatch_rejects_each_invalid_dynamic_and_set_driver_contract().await;
+        exact_access_dispatch_propagates_scan_predicate_index_and_search_failures().await;
     }
 }
