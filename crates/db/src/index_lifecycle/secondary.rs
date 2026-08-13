@@ -4515,10 +4515,10 @@ mod tests {
         let oversized_error = lookup_active_equality_point_literal(&db, &equality, &oversized)
             .await
             .unwrap_err();
-        assert!(
-            oversized_error.to_string().contains("non-indexed value"),
-            "{oversized_error:?}"
-        );
+        assert!(matches!(
+            oversized_error,
+            HelixDbError::SecondaryIndexValue(SecondaryIndexValueError::EncodedKeyTooLarge { .. })
+        ));
         assert!(scan_active_range_generation_with_membership(
             &db,
             &range,

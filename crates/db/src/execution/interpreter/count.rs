@@ -1961,6 +1961,26 @@ mod tests {
             execute_direct_count(
                 &db,
                 exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
+                    driver: exec::ExecNodeVerifiedRangeScanPlan {
+                        range: ir::IndexRange::Lower {
+                            lower: ir::IndexBound::Inclusive(
+                                ir::RangeIndexValue::literal(PropertyValue::from("a")).unwrap(),
+                            ),
+                        },
+                        ..node_range.clone()
+                    },
+                    membership: exec::ExecNodeRangeMembershipPlan::All,
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(2)
+        );
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
                     driver: node_range,
                     membership: exec::ExecNodeRangeMembershipPlan::All,
                     window: bounded(1, 1),
@@ -2244,6 +2264,181 @@ mod tests {
             );
         }
         context.close_request_read_view().unwrap();
+        let node_key =
+            catalog::ScopedPropertyDirectionKey::try_new("User", "rank", RangeIndexDirection::Asc)
+                .unwrap();
+        let edge_key = catalog::ScopedPropertyDirectionKey::try_new(
+            "FOLLOWS",
+            "rank",
+            RangeIndexDirection::Asc,
+        )
+        .unwrap();
+        assert!(context
+            .node_range_index_count_with_membership(&node_key, &ir::IndexRange::All, &[], None)
+            .await
+            .is_err());
+        assert!(context
+            .edge_range_index_count_with_membership(&edge_key, &ir::IndexRange::All, &[], None)
+            .await
+            .is_err());
+    }
+
+    #[cfg_attr(test, tokio::test)]
+    async fn dynamic_equality_runtime_classification_covers_every_named_case() {
+        let db = test_support::open_db_with_config(
+            test_support::in_memory_config("count-dynamic-equality-classification")
+                .with_equality_index("User", "status")
+                .with_unique_equality_index("User", "email")
+                .with_edge_equality_index("FOLLOWS", "status"),
+        )
+        .await;
+        let active = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        let null = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("status", PropertyValue::Null)],
+        )
+        .await;
+        let missing = test_support::add_node_with_properties(&db, "User", Vec::new()).await;
+        let owner = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("email", PropertyValue::from("owner@example.com"))],
+        )
+        .await;
+        test_support::add_edge_with_properties(
+            &db,
+            active,
+            null,
+            "FOLLOWS",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        assert_ne!(missing, active);
+
+        let param = test_support::name("late");
+        let node =
+            exec::ExecCountPlan::NodeDynamicEquality(exec::ExecNodeDynamicEqualityCountPlan {
+                index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                    "node_eq:User:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                param: param.clone(),
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+        for (value, expected) in [
+            (PropertyValue::from("active"), 1),
+            (PropertyValue::Null, 3),
+            (PropertyValue::F64(f64::NAN), 0),
+        ] {
+            assert_eq!(
+                execute_direct_count_with_params(
+                    &db,
+                    node.clone(),
+                    context::ParamBindings::default().with_value(param.clone(), value),
+                )
+                .await
+                .unwrap(),
+                ExecutionValue::Count(expected)
+            );
+        }
+        for value in [
+            PropertyValue::Array(Vec::new()),
+            PropertyValue::String("x".repeat(
+                crate::encoding::v1::property::equality_value::MAX_EQUALITY_CANONICAL_LEN + 1,
+            )),
+        ] {
+            assert!(execute_direct_count_with_params(
+                &db,
+                node.clone(),
+                context::ParamBindings::default().with_value(param.clone(), value),
+            )
+            .await
+            .is_err());
+        }
+
+        let unique =
+            exec::ExecCountPlan::NodeDynamicEquality(exec::ExecNodeDynamicEqualityCountPlan {
+                index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                    "node_eq:User:email",
+                ))
+                .with_uniqueness(catalog::IndexUniqueness::Unique),
+                key: catalog::ScopedPropertyKey::try_new("User", "email").unwrap(),
+                param: param.clone(),
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+        for (value, expected) in [
+            (PropertyValue::from("owner@example.com"), 1),
+            (PropertyValue::from("missing@example.com"), 0),
+            (PropertyValue::F64(f64::NAN), 0),
+        ] {
+            assert_eq!(
+                execute_direct_count_with_params(
+                    &db,
+                    unique.clone(),
+                    context::ParamBindings::default().with_value(param.clone(), value),
+                )
+                .await
+                .unwrap(),
+                ExecutionValue::Count(expected)
+            );
+        }
+        db.inner_db()
+            .put(
+                keys::Key::Data {
+                    scope: crate::encoding::v1::keys::tenant::DataScope::LegacyUnscoped,
+                    kind: keys::DataKeyKind::NodeProperty(keys::NodePropertyKey::new(owner)),
+                }
+                .to_bytes(),
+                crate::encoding::v1::property::encode_properties(&[
+                    crate::encoding::v1::property::Property::string("$label", "User"),
+                    crate::encoding::v1::property::Property::string(
+                        "email",
+                        "different@example.com",
+                    ),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert!(execute_direct_count_with_params(
+            &db,
+            unique,
+            context::ParamBindings::default()
+                .with_value(param.clone(), PropertyValue::from("owner@example.com"),),
+        )
+        .await
+        .is_err());
+
+        let edge =
+            exec::ExecCountPlan::EdgeDynamicEquality(exec::ExecEdgeDynamicEqualityCountPlan {
+                index: catalog::EdgeEqualityIndexMeta::new(test_support::name(
+                    "edge_eq:FOLLOWS:status",
+                )),
+                key: catalog::ScopedPropertyKey::try_new("FOLLOWS", "status").unwrap(),
+                param: param.clone(),
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+        for (value, expected) in [
+            (PropertyValue::from("active"), 1),
+            (PropertyValue::Null, 0),
+            (PropertyValue::F64(f64::NAN), 0),
+        ] {
+            assert_eq!(
+                execute_direct_count_with_params(
+                    &db,
+                    edge.clone(),
+                    context::ParamBindings::default().with_value(param.clone(), value),
+                )
+                .await
+                .unwrap(),
+                ExecutionValue::Count(expected)
+            );
+        }
     }
 
     #[cfg_attr(test, tokio::test)]
@@ -4243,6 +4438,24 @@ mod tests {
                 graph_reads: 1,
             }
         );
+        let missing_value = indexed("missing@example.com");
+        let mut missing_lookup = lookup.clone();
+        missing_lookup.value = missing_value.clone();
+        let mut missing_verification = verification.clone();
+        missing_verification.value = missing_value;
+        assert_eq!(
+            execute_direct_count(
+                &db,
+                exec::ExecCountPlan::NodeUnique(exec::ExecNodeUniqueCountPlan {
+                    lookup: missing_lookup,
+                    verification: missing_verification,
+                    window: exec::ExecCountWindowPlan::identity(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ExecutionValue::Count(0)
+        );
         let mut invalid_lookup = lookup.clone();
         invalid_lookup.index = exec::ExecNodeUniqueEqualityIndex::try_from(
             catalog::NodeEqualityIndexMeta::new(test_support::name("node_eq:Other:email"))
@@ -4659,6 +4872,7 @@ mod tests {
         test_support::run_production_contracts().await;
         evaluated_windows_and_index_identity_validation_cover_boundaries();
         direct_non_search_count_families_match_materialized_sources().await;
+        dynamic_equality_runtime_classification_covers_every_named_case().await;
         every_direct_storage_count_propagates_its_own_read_failure().await;
         direct_and_cursor_authoritative_counts_propagate_each_predicate_failure().await;
         count_window_parameters_shapes_and_runtime_variables_fail_closed().await;

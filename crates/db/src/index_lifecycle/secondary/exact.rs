@@ -537,6 +537,15 @@ pub(crate) async fn run_production_contracts() {
     .await
     .unwrap()
     .is_empty());
+    let oversized = PropertyValue::String(
+        "x".repeat(crate::encoding::v1::property::equality_value::MAX_EQUALITY_CANONICAL_LEN + 1),
+    );
+    assert!(matches!(
+        lookup_active_equality_point_literal(&db, &equality, &oversized).await,
+        Err(HelixDbError::SecondaryIndexValue(
+            SecondaryIndexValueError::EncodedKeyTooLarge { .. }
+        ))
+    ));
 
     put_entry(&db, &equality, "same", 3).await;
     put_entry(&db, &unique, "owner", 7).await;
@@ -559,6 +568,17 @@ pub(crate) async fn run_production_contracts() {
     )
     .await
     .is_err());
+    assert!(matches!(
+        lookup_active_equality_literal_batch(
+            &db,
+            &equality,
+            &[PropertyValue::String("same".to_string()), oversized],
+        )
+        .await,
+        Err(HelixDbError::SecondaryIndexValue(
+            SecondaryIndexValueError::EncodedKeyTooLarge { .. }
+        ))
+    ));
     assert!(lookup_active_equality_literal_batch(
         &db,
         &text,

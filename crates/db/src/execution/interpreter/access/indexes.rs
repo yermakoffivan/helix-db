@@ -897,6 +897,68 @@ pub(super) mod tests {
             .enable_request_write_scope()
             .await
             .expect("transaction and its exact mutation catalog open together");
+        let node_key = catalog::ScopedPropertyKey::try_new("User", "status").unwrap();
+        let missing_key = catalog::ScopedPropertyKey::try_new("Missing", "status").unwrap();
+
+        assert_eq!(
+            context
+                .lookup_managed_equality_literal_batch(
+                    crate::index_lifecycle::IndexElementKind::Node,
+                    &node_key,
+                    &[
+                        DbPropertyValue::String("active".to_string()),
+                        DbPropertyValue::String("missing".to_string()),
+                    ],
+                )
+                .await
+                .expect("transaction exact literal batch succeeds")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![alice]
+        );
+        assert_eq!(
+            context
+                .lookup_managed_equality_point_exact(
+                    crate::index_lifecycle::IndexElementKind::Node,
+                    &node_key,
+                    &DbPropertyValue::String("active".to_string()),
+                    false,
+                )
+                .await
+                .expect("transaction exact point read succeeds")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![alice]
+        );
+        assert!(context
+            .lookup_managed_equality_literal_batch(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &missing_key,
+                &[
+                    DbPropertyValue::String("active".to_string()),
+                    DbPropertyValue::String("missing".to_string()),
+                ],
+            )
+            .await
+            .is_err());
+        assert!(context
+            .lookup_managed_equality_point_exact(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &missing_key,
+                &DbPropertyValue::String("active".to_string()),
+                false,
+            )
+            .await
+            .is_err());
+        assert!(context
+            .lookup_managed_equality_point_exact(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &node_key,
+                &DbPropertyValue::String("active".to_string()),
+                true,
+            )
+            .await
+            .is_err());
 
         assert_eq!(
             context
@@ -939,6 +1001,83 @@ pub(super) mod tests {
             Some((alice, bob))
         );
         context.abort_request_write_scope();
+        assert!(context
+            .lookup_managed_equality_literal_batch(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &node_key,
+                &[
+                    DbPropertyValue::String("active".to_string()),
+                    DbPropertyValue::String("missing".to_string()),
+                ],
+            )
+            .await
+            .is_err());
+        assert!(context
+            .lookup_managed_equality_point_exact(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &node_key,
+                &DbPropertyValue::String("active".to_string()),
+                false,
+            )
+            .await
+            .is_err());
+        context
+            .enable_request_read_view()
+            .await
+            .expect("exact fallback request snapshot opens");
+        assert_eq!(
+            context
+                .lookup_managed_equality_literal_batch(
+                    crate::index_lifecycle::IndexElementKind::Node,
+                    &node_key,
+                    &[
+                        DbPropertyValue::String("active".to_string()),
+                        DbPropertyValue::String("missing".to_string()),
+                    ],
+                )
+                .await
+                .expect("snapshot fallback literal batch succeeds")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![alice]
+        );
+        assert_eq!(
+            context
+                .lookup_managed_equality_point_exact(
+                    crate::index_lifecycle::IndexElementKind::Node,
+                    &node_key,
+                    &DbPropertyValue::String("active".to_string()),
+                    false,
+                )
+                .await
+                .expect("snapshot fallback point read succeeds")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![alice]
+        );
+        assert!(context
+            .lookup_managed_equality_literal_batch(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &missing_key,
+                &[
+                    DbPropertyValue::String("active".to_string()),
+                    DbPropertyValue::String("missing".to_string()),
+                ],
+            )
+            .await
+            .is_err());
+        assert!(context
+            .lookup_managed_equality_point_exact(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &missing_key,
+                &DbPropertyValue::String("active".to_string()),
+                false,
+            )
+            .await
+            .is_err());
+        context
+            .close_request_read_view()
+            .expect("exact fallback request snapshot closes");
     }
 
     #[cfg_attr(test, tokio::test)]
