@@ -83,7 +83,7 @@ use super::IndexScopeGates;
 mod exact;
 #[cfg(all(feature = "production-coverage", not(test)))]
 pub(crate) use exact::run_production_contracts as run_exact_production_contracts;
-#[cfg(any(test, feature = "production-coverage"))]
+#[cfg(test)]
 pub(crate) use exact::scan_active_range_generation_with_membership;
 pub(crate) use exact::{
     count_active_range_generation_with_membership, lookup_active_equality_literal_batch,

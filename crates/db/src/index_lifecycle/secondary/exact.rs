@@ -46,10 +46,25 @@ pub(crate) async fn lookup_active_equality_point_literal(
             "literal equality point read received a range definition",
         ));
     }
-    let EqualityValueProjection::Indexed(value) = project_equality_value(value) else {
-        return Err(corruption(
-            "literal equality point read received a non-indexed value",
-        ));
+    let value = match project_equality_value(value) {
+        EqualityValueProjection::Indexed(value) => value,
+        EqualityValueProjection::Oversized {
+            encoded_len,
+            maximum,
+        } => {
+            return Err(SecondaryIndexValueError::EncodedKeyTooLarge {
+                encoded_len,
+                maximum,
+            }
+            .into());
+        }
+        EqualityValueProjection::AuthoritativeNull
+        | EqualityValueProjection::NonReflexive
+        | EqualityValueProjection::Unsupported(_) => {
+            return Err(corruption(
+                "literal equality point read received a non-indexed value",
+            ));
+        }
     };
     let lane = definition_lane(definition);
     let key = secondary_entry_key(
@@ -102,10 +117,25 @@ pub(crate) async fn lookup_active_equality_literal_batch(
     let keys = values
         .iter()
         .map(|value| {
-            let EqualityValueProjection::Indexed(value) = project_equality_value(value) else {
-                return Err(corruption(
-                    "literal equality bitmap batch received a non-indexed value",
-                ));
+            let value = match project_equality_value(value) {
+                EqualityValueProjection::Indexed(value) => value,
+                EqualityValueProjection::Oversized {
+                    encoded_len,
+                    maximum,
+                } => {
+                    return Err(SecondaryIndexValueError::EncodedKeyTooLarge {
+                        encoded_len,
+                        maximum,
+                    }
+                    .into());
+                }
+                EqualityValueProjection::AuthoritativeNull
+                | EqualityValueProjection::NonReflexive
+                | EqualityValueProjection::Unsupported(_) => {
+                    return Err(corruption(
+                        "literal equality bitmap batch received a non-indexed value",
+                    ));
+                }
             };
             secondary_entry_key(
                 handle.scope(),
@@ -396,9 +426,19 @@ pub(crate) async fn run_production_contracts() {
                 definition,
                 ValidatedSecondaryIndexDefinition::NodeEquality { unique: true, .. }
             ) {
-            CanonicalSecondaryValue::equality_string(value)
+            let EqualityValueProjection::Indexed(value) =
+                project_equality_value(&PropertyValue::String(value.to_owned()))
+            else {
+                panic!("string equality fixtures are always indexable")
+            };
+            CanonicalSecondaryValue::equality(value)
         } else {
-            CanonicalSecondaryValue::range_string(direction, value)
+            let RangeValueProjection::Indexed(value) =
+                project_range_value(&PropertyValue::String(value.to_owned()), direction)
+            else {
+                panic!("string range fixtures are always indexable")
+            };
+            CanonicalSecondaryValue::range(value)
         };
         let entity_id = IndexEntityId::new(entity_id);
         let lane = definition_lane(definition);
@@ -682,6 +722,59 @@ mod tests {
         )
         .await
         .is_err());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_equality_literals_reject_non_indexed_values_and_preserve_size_errors() {
+        let db = super::super::tests::test_db("secondary-exact-equality-values").await;
+        let handle = super::super::tests::active_read_handle(
+            &db,
+            crate::config::SecondaryIndexDefinition::node_equality("User", "value").unwrap(),
+        )
+        .await;
+
+        for value in [
+            PropertyValue::Null,
+            PropertyValue::F64(f64::NAN),
+            PropertyValue::Array(Vec::new()),
+        ] {
+            assert!(matches!(
+                lookup_active_equality_point_literal(&db, &handle, &value).await,
+                Err(HelixDbError::IndexCatalogCorruption(_))
+            ));
+            assert!(matches!(
+                lookup_active_equality_literal_batch(
+                    &db,
+                    &handle,
+                    &[PropertyValue::String("indexed".to_string()), value],
+                )
+                .await,
+                Err(HelixDbError::IndexCatalogCorruption(_))
+            ));
+        }
+
+        let oversized =
+            PropertyValue::String("x".repeat(
+                crate::encoding::v1::property::equality_value::MAX_EQUALITY_CANONICAL_LEN + 1,
+            ));
+        assert!(matches!(
+            lookup_active_equality_point_literal(&db, &handle, &oversized).await,
+            Err(HelixDbError::SecondaryIndexValue(
+                SecondaryIndexValueError::EncodedKeyTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            lookup_active_equality_literal_batch(
+                &db,
+                &handle,
+                &[PropertyValue::String("indexed".to_string()), oversized],
+            )
+            .await,
+            Err(HelixDbError::SecondaryIndexValue(
+                SecondaryIndexValueError::EncodedKeyTooLarge { .. }
+            ))
+        ));
         db.close().await.unwrap();
     }
 }

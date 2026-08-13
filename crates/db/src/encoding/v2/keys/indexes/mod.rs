@@ -83,8 +83,7 @@ impl CanonicalSecondaryValue {
         Self::Equality(value)
     }
 
-    #[cfg(any(test, feature = "production-coverage"))]
-    #[cfg_attr(all(feature = "production-coverage", not(test)), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn equality_string(value: &str) -> Self {
         let crate::encoding::v1::property::equality_value::EqualityValueProjection::Indexed(value) =
             crate::encoding::v1::property::equality_value::project_equality_value(
@@ -102,8 +101,7 @@ impl CanonicalSecondaryValue {
         Self::Range(value)
     }
 
-    #[cfg(any(test, feature = "production-coverage"))]
-    #[cfg_attr(all(feature = "production-coverage", not(test)), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn range_string(direction: RangeIndexDirection, value: &str) -> Self {
         let crate::encoding::v1::property::range_value::RangeValueProjection::Indexed(value) =
             crate::encoding::v1::property::range_value::project_range_value(

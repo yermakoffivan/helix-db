@@ -1706,8 +1706,11 @@ mod tests {
     use helix_ast::query::QueryValue;
     use helix_ast::value::PropertyValue;
     use helix_planner::{catalog, context};
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::strategy::ValueTree;
+    #[cfg(test)]
     use proptest::test_runner::TestRunner;
 
     use super::super::access::tests::support as access_support;
@@ -4522,6 +4525,7 @@ mod tests {
         execution.close_request_read_view().unwrap();
     }
 
+    #[cfg(test)]
     #[tokio::test]
     async fn randomized_recursive_counts_match_the_materialized_row_oracle() {
         let db = test_support::open_db("count-randomized-recursive-oracle").await;
