@@ -51,7 +51,7 @@ impl<'a> SelectedRootPlanCase<'a> {
             (
                 logical::LogicalExpr::StreamCardinality(cardinality),
                 physical::PhysicalExpr::Cardinality(count),
-            ) => Ok(Self::Count(cardinality, count.as_ref().clone())),
+            ) => Ok(Self::Count(cardinality, count.clone())),
             _ if selected_root_physical_mismatch(source_expr, physical_expr) => Err(
                 rejection::unsupported(rejection::Reason::SelectedRootPhysicalMismatch),
             ),

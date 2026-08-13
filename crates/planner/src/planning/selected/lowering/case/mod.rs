@@ -21,6 +21,9 @@ pub(super) enum SelectedRootPlanCase<'a> {
     ShortestPath(&'a logical::RootShortestPath),
     Pipeline(&'a logical::RootPipeline),
     Terminal(TerminalRootPayload<'a>),
-    Count(&'a logical::StreamCardinality, physical::PhysicalCountPlan),
+    Count(
+        &'a logical::StreamCardinality,
+        Box<physical::PhysicalCountPlan>,
+    ),
     GenericAlternative(exec::SelectedExecutableAlternativeFamily),
 }
