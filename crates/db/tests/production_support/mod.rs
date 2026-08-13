@@ -461,6 +461,12 @@ pub async fn interpreter_topology_mutation_contracts() {
     crate::execution::interpreter::production_contracts::run_topology_mutation_contracts().await;
 }
 
+/// Exercises scheduler transfer and row-projection branches through production code.
+pub async fn interpreter_scheduler_and_projection_contracts() {
+    crate::execution::interpreter::production_contracts::run_scheduler_and_projection_contracts()
+        .await;
+}
+
 #[cfg(feature = "index-lifecycle-testing")]
 pub use crate::execution::interpreter::production_contracts::{
     run_text_transaction_batch_benchmark_sample, TextTransactionBatchBenchmarkCase,

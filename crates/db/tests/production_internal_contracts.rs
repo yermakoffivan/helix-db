@@ -394,6 +394,12 @@ async fn interpreter_topology_mutations_preserve_transactional_semantics() {
     db::production_coverage::interpreter_topology_mutation_contracts().await;
 }
 
+/// Proves parallel dependency transfer and row projections execute their encoded shapes.
+#[tokio::test]
+async fn interpreter_scheduler_and_projection_paths_are_production_linked() {
+    db::production_coverage::interpreter_scheduler_and_projection_contracts().await;
+}
+
 /// Verifies process-local writer identity and readiness through the public boundary.
 #[test]
 fn process_local_runtime_dependencies_preserve_identity_and_readiness() {
