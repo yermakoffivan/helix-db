@@ -11,7 +11,7 @@ mod mismatch;
 mod tests;
 
 use super::terminal::TerminalRootPayload;
-use crate::{exec, logical};
+use crate::{exec, logical, physical};
 
 pub(super) enum SelectedRootPlanCase<'a> {
     IndexDdl(&'a logical::RootIndexDdl),
@@ -21,6 +21,6 @@ pub(super) enum SelectedRootPlanCase<'a> {
     ShortestPath(&'a logical::RootShortestPath),
     Pipeline(&'a logical::RootPipeline),
     Terminal(TerminalRootPayload<'a>),
-    Count(&'a logical::StreamCardinality),
+    Count(&'a logical::StreamCardinality, physical::PhysicalCountPlan),
     GenericAlternative(exec::SelectedExecutableAlternativeFamily),
 }

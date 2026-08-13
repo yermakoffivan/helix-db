@@ -91,7 +91,7 @@ impl SelectedCascadesPlanner<'_> {
         }
     }
 
-    fn selected_root_stream_child(
+    pub(super) fn selected_root_stream_child(
         &mut self,
         child_plans: memo_children::MemoChildPlanAvailability<'_, '_>,
         metrics: &mut exec::PlannerMetrics,

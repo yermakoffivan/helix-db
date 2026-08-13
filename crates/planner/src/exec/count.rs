@@ -1072,9 +1072,16 @@ pub enum ExecCountValidationError {
 impl ExecCountPlan {
     /// Validate recursive dependency, window, and verification invariants.
     pub fn validate(&self) -> Result<(), ExecCountValidationError> {
-        self.dependency()
+        self.validated_dependency().map(|_| ())
+    }
+
+    /// Validate every invariant and return the exact selected dependency contract.
+    pub fn validated_dependency(&self) -> Result<ExecCountDependency, ExecCountValidationError> {
+        let dependency = self
+            .dependency()
             .map_err(|_| ExecCountValidationError::MultipleRowInputs)?;
-        validate_count_plan(self)
+        validate_count_plan(self)?;
+        Ok(dependency)
     }
 
     /// Validate and return the exact selected dependency contract.

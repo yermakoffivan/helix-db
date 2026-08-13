@@ -105,6 +105,7 @@ fn validated_step_index_enforces_count_dependency_shapes() {
         let Err(error) = index::ValidatedStepIndex::new(&graph_steps, id(3)) else {
             panic!("invalid count dependency shape must be rejected")
         };
+        assert!(error.to_string().contains(&format!("{expected:?} input")));
         assert_eq!(
             error,
             ExecPlanError::InvalidCountDependencyCount {
@@ -147,6 +148,7 @@ fn validated_step_index_rejects_malformed_count_programs() {
     let Err(error) = index::ValidatedStepIndex::new(&graph_steps, id(1)) else {
         panic!("malformed count program must be rejected")
     };
+    assert!(error.to_string().contains("invalid program"));
 
     assert_eq!(
         error,

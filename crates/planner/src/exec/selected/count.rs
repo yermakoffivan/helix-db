@@ -17,6 +17,73 @@ pub enum SelectedCountInput {
     Scalars(Box<SelectedExecutableRunRoot>),
 }
 
+impl SelectedCountInput {
+    const fn dependency(&self) -> exec::ExecCountDependency {
+        match self {
+            Self::Direct => exec::ExecCountDependency::Direct,
+            Self::Rows(_) => exec::ExecCountDependency::Rows,
+            Self::Scalars(_) => exec::ExecCountDependency::Scalars,
+        }
+    }
+}
+
+/// Selected cardinality root ready for one-to-one executable lowering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedRootCount {
+    alternative: SelectedPhysicalPlan,
+    provenance: SelectedRootProvenance,
+    input: SelectedCountInput,
+    plan: exec::ExecCountPlan,
+}
+
+impl SelectedRootCount {
+    /// Build a selected count root and validate its exact input contract.
+    pub fn new(
+        alternative: SelectedPhysicalPlan,
+        provenance: SelectedRootProvenance,
+        input: SelectedCountInput,
+    ) -> Result<Self, SelectedRootConstructionError> {
+        let physical::PhysicalExpr::Cardinality(physical) = alternative.expr() else {
+            return Err(SelectedRootConstructionError::IncompatiblePhysicalShape);
+        };
+        let plan = physical.executable().clone();
+        let dependency = plan
+            .validated_dependency()
+            .map_err(|_| SelectedRootConstructionError::CountInputMismatch)?;
+        if dependency != input.dependency() {
+            return Err(SelectedRootConstructionError::CountInputMismatch);
+        }
+        Ok(Self {
+            alternative,
+            provenance,
+            input,
+            plan,
+        })
+    }
+
+    /// Decompose the selected count root for executable lowering.
+    pub fn into_parts(
+        self,
+    ) -> (
+        SelectedPhysicalPlan,
+        SelectedRootProvenance,
+        SelectedCountInput,
+        exec::ExecCountPlan,
+    ) {
+        (self.alternative, self.provenance, self.input, self.plan)
+    }
+
+    /// Selected physical contract.
+    pub const fn alternative(&self) -> &SelectedPhysicalPlan {
+        &self.alternative
+    }
+
+    /// Optimizer provenance.
+    pub const fn provenance(&self) -> &SelectedRootProvenance {
+        &self.provenance
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,74 +175,5 @@ mod tests {
             ),
             Err(SelectedRootConstructionError::CountInputMismatch)
         );
-    }
-}
-
-impl SelectedCountInput {
-    const fn dependency(&self) -> exec::ExecCountDependency {
-        match self {
-            Self::Direct => exec::ExecCountDependency::Direct,
-            Self::Rows(_) => exec::ExecCountDependency::Rows,
-            Self::Scalars(_) => exec::ExecCountDependency::Scalars,
-        }
-    }
-}
-
-/// Selected cardinality root ready for one-to-one executable lowering.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SelectedRootCount {
-    alternative: SelectedPhysicalPlan,
-    provenance: SelectedRootProvenance,
-    input: SelectedCountInput,
-    plan: exec::ExecCountPlan,
-}
-
-impl SelectedRootCount {
-    /// Build a selected count root and validate its exact input contract.
-    pub fn new(
-        alternative: SelectedPhysicalPlan,
-        provenance: SelectedRootProvenance,
-        input: SelectedCountInput,
-    ) -> Result<Self, SelectedRootConstructionError> {
-        let physical::PhysicalExpr::Cardinality(physical) = alternative.expr() else {
-            return Err(SelectedRootConstructionError::IncompatiblePhysicalShape);
-        };
-        let plan = physical.executable().clone();
-        plan.validate()
-            .map_err(|_| SelectedRootConstructionError::CountInputMismatch)?;
-        let dependency = plan
-            .dependency()
-            .map_err(|_| SelectedRootConstructionError::CountInputMismatch)?;
-        if dependency != input.dependency() {
-            return Err(SelectedRootConstructionError::CountInputMismatch);
-        }
-        Ok(Self {
-            alternative,
-            provenance,
-            input,
-            plan,
-        })
-    }
-
-    /// Decompose the selected count root for executable lowering.
-    pub fn into_parts(
-        self,
-    ) -> (
-        SelectedPhysicalPlan,
-        SelectedRootProvenance,
-        SelectedCountInput,
-        exec::ExecCountPlan,
-    ) {
-        (self.alternative, self.provenance, self.input, self.plan)
-    }
-
-    /// Selected physical contract.
-    pub const fn alternative(&self) -> &SelectedPhysicalPlan {
-        &self.alternative
-    }
-
-    /// Optimizer provenance.
-    pub const fn provenance(&self) -> &SelectedRootProvenance {
-        &self.provenance
     }
 }

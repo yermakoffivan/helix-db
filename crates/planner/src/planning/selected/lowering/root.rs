@@ -9,39 +9,25 @@ impl SelectedCascadesPlanner<'_> {
     pub(super) fn selected_count_run_root(
         &mut self,
         _cardinality: &logical::StreamCardinality,
+        count: &physical::PhysicalCountPlan,
         alternative: physical::PhysicalAlternative,
         provenance: exec::SelectedRootProvenance,
         child_plans: memo_children::MemoChildPlanAvailability<'_, '_>,
         metrics: &mut exec::PlannerMetrics,
     ) -> Result<exec::SelectedExecutableRunRoot, error::PlannerError> {
-        let physical::PhysicalExpr::Cardinality(count) = &alternative.expr else {
-            return Err(rejection::unsupported(
-                rejection::Reason::SelectedRootPhysicalMismatch,
-            ));
-        };
-        let input = match count
+        let dependency = count
             .executable()
-            .dependency()
-            .map_err(|_| rejection::unsupported(rejection::Reason::SelectedCountInputMismatch))?
-        {
+            .validated_dependency()
+            .map_err(|_| rejection::unsupported(rejection::Reason::SelectedCountInputMismatch))?;
+        let input = match dependency {
             exec::ExecCountDependency::Direct => exec::SelectedCountInput::Direct,
-            exec::ExecCountDependency::Rows | exec::ExecCountDependency::Scalars => {
-                let child_plans = child_plans.require()?;
-                let child = child_plans
-                    .exactly(1, rejection::Reason::RootStreamChildArityMismatch)?
-                    .single()?;
-                let child = Box::new(self.selected_run_root_from_memo_child(child, metrics)?);
-                match count
-                    .executable()
-                    .dependency()
-                    .expect("dependency was validated")
-                {
-                    exec::ExecCountDependency::Rows => exec::SelectedCountInput::Rows(child),
-                    exec::ExecCountDependency::Scalars => exec::SelectedCountInput::Scalars(child),
-                    exec::ExecCountDependency::Direct => {
-                        unreachable!("direct count was handled without a selected child")
-                    }
-                }
+            exec::ExecCountDependency::Rows => {
+                let child = Box::new(self.selected_root_stream_child(child_plans, metrics)?);
+                exec::SelectedCountInput::Rows(child)
+            }
+            exec::ExecCountDependency::Scalars => {
+                let child = Box::new(self.selected_root_stream_child(child_plans, metrics)?);
+                exec::SelectedCountInput::Scalars(child)
             }
         };
         Ok(exec::SelectedExecutableRunRoot::Count(Box::new(

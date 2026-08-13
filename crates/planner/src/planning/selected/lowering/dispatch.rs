@@ -115,7 +115,7 @@ impl SelectedCascadesPlanner<'_> {
                     metrics,
                 )
             }
-            case::SelectedRootPlanCase::Count(cardinality) => {
+            case::SelectedRootPlanCase::Count(cardinality, count) => {
                 let child_plans =
                     memo_children::MemoChildPlanAvailability::from_available_selection(
                         selection,
@@ -123,6 +123,7 @@ impl SelectedCascadesPlanner<'_> {
                     );
                 self.selected_count_run_root(
                     cardinality,
+                    &count,
                     alternative,
                     provenance,
                     child_plans,

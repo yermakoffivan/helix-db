@@ -104,3 +104,20 @@ fn classification_does_not_need_costed_physical_alternative() {
         SelectedRootPlanCase::Terminal(TerminalRootPayload::Project(_))
     ));
 }
+
+#[test]
+fn count_classification_carries_the_validated_physical_payload() {
+    let source =
+        logical::LogicalExpr::StreamCardinality(logical::StreamCardinality::new(variable_stream()));
+    let plan = exec::ExecCountPlan::Constant(3);
+    let physical = physical::PhysicalExpr::Cardinality(Box::new(physical::PhysicalCountPlan::new(
+        plan.clone(),
+    )));
+
+    let SelectedRootPlanCase::Count(_, count) =
+        SelectedRootPlanCase::classify(&source, &physical).unwrap()
+    else {
+        panic!("cardinality pair must retain its typed physical payload")
+    };
+    assert_eq!(count.executable(), &plan);
+}

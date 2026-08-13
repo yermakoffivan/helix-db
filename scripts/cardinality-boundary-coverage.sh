@@ -13,13 +13,21 @@ case "$SHARD" in
             crates/planner/src/exec/access/edge.rs
             crates/planner/src/exec/access/node.rs
             crates/planner/src/exec/count.rs
+            crates/planner/src/exec/error.rs
             crates/planner/src/exec/lowering/secondary_set.rs
+            crates/planner/src/exec/selected/count.rs
             crates/planner/src/exec/selected/lowering/access/leaf.rs
             crates/planner/src/exec/selected/lowering/count.rs
             crates/planner/src/exec/selected/lowering/contracts/matching/access/source/edge.rs
             crates/planner/src/exec/selected/lowering/contracts/matching/access/source/node.rs
+            crates/planner/src/exec/validation/contracts.rs
+            crates/planner/src/logical/root/terminal.rs
+            crates/planner/src/optimizer/config.rs
             crates/planner/src/physical/access.rs
             crates/planner/src/physical/cardinality.rs
+            crates/planner/src/planning/selected/lowering/case/classify.rs
+            crates/planner/src/planning/selected/lowering/dispatch.rs
+            crates/planner/src/planning/selected/lowering/root.rs
             crates/planner/src/planning/selected/native/equality_bindings.rs
             crates/planner/src/planning/selected/native/pipeline/ops/filter.rs
             crates/planner/src/planning/selected/native/source/lowering/stream.rs
@@ -36,9 +44,11 @@ case "$SHARD" in
         COVERAGE_ARGS=(-p db --lib)
         TARGET_FILES=(
             crates/db/src/execution/interpreter/access/dispatch.rs
+            crates/db/src/execution/interpreter/access/indexes.rs
             crates/db/src/execution/interpreter/access/range.rs
             crates/db/src/execution/interpreter/access/secondary_set.rs
             crates/db/src/execution/interpreter/count.rs
+            crates/db/src/execution/interpreter/dispatch.rs
             crates/db/src/index_lifecycle/secondary/exact.rs
         )
         ;;

@@ -118,12 +118,15 @@ impl<'db> ExecutionContext<'db> {
         key: &catalog::ScopedPropertyKey,
         values: &[DbPropertyValue],
     ) -> Result<roaring::RoaringTreemap> {
-        let identity = secondary_identity(
+        let identity = match secondary_identity(
             crate::index_lifecycle::IndexIdentityFamily::SecondaryEquality,
             element_kind,
             key.label.as_ref(),
             key.property.as_ref(),
-        )?;
+        ) {
+            Ok(identity) => identity,
+            Err(error) => return Err(error),
+        };
         if let Some(active) = self.active_write_tx() {
             let Some(handle) = active.index_context.active_handle(&identity) else {
                 return Err(secondary_catalog_unavailable());
@@ -168,12 +171,15 @@ impl<'db> ExecutionContext<'db> {
         value: &DbPropertyValue,
         unique: bool,
     ) -> Result<roaring::RoaringTreemap> {
-        let identity = secondary_identity(
+        let identity = match secondary_identity(
             crate::index_lifecycle::IndexIdentityFamily::SecondaryEquality,
             element_kind,
             key.label.as_ref(),
             key.property.as_ref(),
-        )?;
+        ) {
+            Ok(identity) => identity,
+            Err(error) => return Err(error),
+        };
         if let Some(active) = self.active_write_tx() {
             let Some(handle) = active.index_context.active_handle(&identity) else {
                 return Err(secondary_catalog_unavailable());
@@ -698,6 +704,40 @@ pub(super) mod tests {
         properties::PositiveUsize::new(value).expect("positive test limit")
     }
 
+    fn active_handle(
+        definition: crate::index_lifecycle::ValidatedDynamicIndexDefinition,
+        physical: crate::index_lifecycle::PhysicalGeneration,
+    ) -> crate::index_lifecycle::ActiveIndexHandle {
+        let building = crate::index_lifecycle::IndexRecordV2::building(
+            crate::index_lifecycle::IndexId::initial(),
+            definition,
+            crate::index_lifecycle::IndexRevision::initial(),
+            physical,
+            crate::index_lifecycle::IndexOperationId::new_v4(),
+        )
+        .expect("exact dispatch fixture starts building");
+        let active = building
+            .transition(crate::index_lifecycle::IndexStateTransition::Activate)
+            .expect("exact dispatch fixture activates");
+        crate::index_lifecycle::ActiveIndexHandle::try_from_record(
+            crate::encoding::v1::keys::tenant::DataScope::LegacyUnscoped,
+            &active,
+        )
+        .expect("active fixture projects one authorized handle")
+    }
+
+    fn secondary_handle(
+        definition: crate::config::SecondaryIndexDefinition,
+    ) -> crate::index_lifecycle::ActiveIndexHandle {
+        active_handle(
+            crate::index_lifecycle::ValidatedDynamicIndexDefinition::try_from(definition)
+                .expect("secondary dispatch fixture validates"),
+            crate::index_lifecycle::PhysicalGeneration::Secondary {
+                generation: crate::index_lifecycle::IndexGenerationId::initial(),
+            },
+        )
+    }
+
     #[cfg_attr(test, tokio::test)]
     async fn index_value_converts_literals_and_runtime_parameters() {
         let db = test_support::open_db("access-index-value-conversion").await;
@@ -869,6 +909,264 @@ pub(super) mod tests {
                 .expect("reader endpoint lookup succeeds"),
             Some((alice, bob))
         );
+    }
+
+    #[cfg_attr(test, tokio::test)]
+    async fn exact_equality_dispatch_rejects_every_wrong_catalog_lane() {
+        use crate::encoding::v1::keys::tenant::DataScope;
+
+        let db = test_support::open_db("access-exact-equality-lanes").await;
+        let value = DbPropertyValue::String("active".to_string());
+        let batch_values = [
+            value.clone(),
+            DbPropertyValue::String("missing".to_string()),
+        ];
+        let oversized_key = catalog::ScopedPropertyKey::try_new(
+            "x".repeat(crate::index_lifecycle::INDEX_COMPONENT_MAX_LEN + 1),
+            "status",
+        )
+        .expect("planner key validates non-empty components");
+        let context = ExecutionContext::new(&db, context::ParamBindings::default());
+        assert!(context
+            .lookup_managed_equality_literal_batch(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &oversized_key,
+                &batch_values,
+            )
+            .await
+            .is_err());
+        assert!(context
+            .lookup_managed_equality_point_exact(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &oversized_key,
+                &value,
+                false,
+            )
+            .await
+            .is_err());
+
+        let node_unique = secondary_handle(
+            crate::config::SecondaryIndexDefinition::node_unique_equality("User", "status")
+                .expect("node unique definition validates"),
+        );
+        assert!(lookup_managed_active_point_exact(
+            db.inner_db().as_ref(),
+            &node_unique,
+            &value,
+            true,
+        )
+        .await
+        .expect("matching unique lane reads literally")
+        .is_empty());
+        assert!(lookup_managed_active_point_exact(
+            db.inner_db().as_ref(),
+            &node_unique,
+            &value,
+            false,
+        )
+        .await
+        .is_err());
+
+        let edge_equality = secondary_handle(
+            crate::config::SecondaryIndexDefinition::edge_equality("FOLLOWS", "status")
+                .expect("edge equality definition validates"),
+        );
+        assert!(lookup_managed_active_point_exact(
+            db.inner_db().as_ref(),
+            &edge_equality,
+            &value,
+            false,
+        )
+        .await
+        .expect("edge equality uses its non-unique lane")
+        .is_empty());
+        assert!(lookup_managed_active_point_exact(
+            db.inner_db().as_ref(),
+            &edge_equality,
+            &value,
+            true,
+        )
+        .await
+        .is_err());
+
+        for range in [
+            crate::config::SecondaryIndexDefinition::node_range("User", "status")
+                .expect("node range definition validates"),
+            crate::config::SecondaryIndexDefinition::edge_range("FOLLOWS", "status")
+                .expect("edge range definition validates"),
+        ] {
+            assert!(lookup_managed_active_point_exact(
+                db.inner_db().as_ref(),
+                &secondary_handle(range),
+                &value,
+                false,
+            )
+            .await
+            .is_err());
+        }
+
+        let vector_definition =
+            crate::index_lifecycle::ValidatedVectorIndexDefinition::try_from_runtime(
+                &crate::config::VectorIndexDefinition::new_node(
+                    "User",
+                    "embedding",
+                    2,
+                    crate::search::vector::VectorDistanceMetric::Cosine,
+                )
+                .expect("vector definition validates"),
+            )
+            .expect("runtime vector definition enters V2");
+        let vector_descriptor =
+            crate::index_lifecycle::VectorGenerationDescriptor::for_definition(&vector_definition);
+        let vector_handle = active_handle(
+            crate::index_lifecycle::ValidatedDynamicIndexDefinition::Vector(vector_definition),
+            crate::index_lifecycle::PhysicalGeneration::Vector {
+                generation: crate::index_lifecycle::IndexGenerationId::initial(),
+                layout: crate::index_lifecycle::VectorPhysicalLayout::Unpartitioned {
+                    physical_index_id: crate::index_lifecycle::VectorPhysicalIndexId::initial(),
+                },
+                descriptor: vector_descriptor,
+            },
+        );
+        assert!(lookup_managed_active_point_exact(
+            db.inner_db().as_ref(),
+            &vector_handle,
+            &value,
+            false,
+        )
+        .await
+        .is_err());
+
+        let prepared_db = test_support::open_db_with_config(
+            test_support::in_memory_config("access-prepared-exact-equality")
+                .with_equality_index("User", "status"),
+        )
+        .await;
+        let alice = test_support::add_node_with_properties(
+            &prepared_db,
+            "User",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        let prepared = prepared_db
+            .planner_context_scoped_prepared(
+                context::ParamBindings::default(),
+                DataScope::LegacyUnscoped,
+            )
+            .await
+            .expect("prepared request captures its exact catalog");
+        let mut prepared_context = ExecutionContext::new_scoped_controlled_with_catalog_freshness(
+            &prepared_db,
+            context::ParamBindings::default(),
+            DataScope::LegacyUnscoped,
+            crate::execution_control::ExecutionControl::unlimited(),
+            super::super::super::runtime_context::PendingCatalogFreshness::Prepared(
+                prepared.into_catalog_proof(),
+            ),
+        );
+        prepared_context
+            .enable_request_read_view()
+            .await
+            .expect("prepared read view opens");
+        let node_key = catalog::ScopedPropertyKey::try_new("User", "status").unwrap();
+        let missing_key = catalog::ScopedPropertyKey::try_new("Missing", "status").unwrap();
+        assert_eq!(
+            prepared_context
+                .lookup_managed_equality_literal_batch(
+                    crate::index_lifecycle::IndexElementKind::Node,
+                    &node_key,
+                    &batch_values,
+                )
+                .await
+                .expect("prepared catalog literal batch succeeds")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![alice]
+        );
+        assert!(prepared_context
+            .lookup_managed_equality_literal_batch(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &missing_key,
+                &batch_values,
+            )
+            .await
+            .is_err());
+        assert!(prepared_context
+            .lookup_managed_equality_point_exact(
+                crate::index_lifecycle::IndexElementKind::Node,
+                &missing_key,
+                &value,
+                false,
+            )
+            .await
+            .is_err());
+        prepared_context
+            .close_request_read_view()
+            .expect("prepared read view closes");
+
+        let fallback_db = test_support::open_db("access-corrupt-exact-equality").await;
+        let corrupt_identity = secondary_identity(
+            crate::index_lifecycle::IndexIdentityFamily::SecondaryEquality,
+            crate::index_lifecycle::IndexElementKind::Node,
+            "Corrupt",
+            "status",
+        )
+        .unwrap();
+        let building_definition =
+            crate::index_lifecycle::ValidatedDynamicIndexDefinition::try_from(
+                crate::config::SecondaryIndexDefinition::node_equality("Building", "status")
+                    .unwrap(),
+            )
+            .unwrap();
+        let building_identity = building_definition.identity();
+        let building_record = crate::index_lifecycle::IndexRecordV2::building(
+            crate::index_lifecycle::IndexId::initial(),
+            building_definition,
+            crate::index_lifecycle::IndexRevision::initial(),
+            crate::index_lifecycle::PhysicalGeneration::Secondary {
+                generation: crate::index_lifecycle::IndexGenerationId::initial(),
+            },
+            crate::index_lifecycle::IndexOperationId::new_v4(),
+        )
+        .unwrap();
+        let index_key = |identity| {
+            crate::encoding::v2::keys::Key::Data {
+                scope: DataScope::LegacyUnscoped,
+                kind: crate::encoding::v2::keys::ScopedKey::index_record(identity),
+            }
+            .to_bytes()
+        };
+        fallback_db
+            .inner_db()
+            .put(
+                index_key(corrupt_identity),
+                bytes::Bytes::from_static(b"corrupt"),
+            )
+            .await
+            .unwrap();
+        fallback_db
+            .inner_db()
+            .put(
+                index_key(building_identity),
+                crate::encoding::v2::values::encode_index_record(&building_record),
+            )
+            .await
+            .unwrap();
+        let mut fallback_context =
+            ExecutionContext::new(&fallback_db, context::ParamBindings::default());
+        fallback_context.enable_request_read_view().await.unwrap();
+        for label in ["Corrupt", "Building"] {
+            let key = catalog::ScopedPropertyKey::try_new(label, "status").unwrap();
+            assert!(fallback_context
+                .lookup_managed_equality_literal_batch(
+                    crate::index_lifecycle::IndexElementKind::Node,
+                    &key,
+                    &batch_values,
+                )
+                .await
+                .is_err());
+        }
+        fallback_context.close_request_read_view().unwrap();
     }
 
     #[cfg_attr(test, tokio::test)]
@@ -1141,6 +1439,7 @@ pub(super) mod tests {
         index_value_rejects_missing_parameters().await;
         limited_index_ids_preserve_storage_order_and_apply_positive_limits();
         scoped_property_key_uses_internal_secondary_index_scope();
+        exact_equality_dispatch_rejects_every_wrong_catalog_lane().await;
         active_transaction_dispatches_index_lookup_contracts().await;
         request_snapshot_excludes_concurrent_edge_index_and_endpoint_phantoms().await;
     }
