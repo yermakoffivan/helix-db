@@ -23,6 +23,110 @@ struct EvaluatedCountWindow {
     take: Option<usize>,
 }
 
+// Keep leaf and recursive structural futures separate. Besides making a
+// category mismatch unrepresentable, this bounds each recursive cursor frame
+// by the structural operations instead of the much larger set of leaf reads.
+enum CountCursorLeaf<'a> {
+    EmptyRows,
+    InputRows,
+    NodeBitmap(&'a exec::ExecNodeBitmapExpr),
+    EdgeBitmap(&'a exec::ExecEdgeBitmapExpr),
+    NodeUnique {
+        lookup: &'a exec::ExecNodeUniqueOwnerReadPlan,
+        verification: &'a exec::ExecNodeAuthoritativeVerificationPlan,
+    },
+    NodeRange(&'a exec::ExecNodeVerifiedRangeScanPlan),
+    EdgeRange(&'a exec::ExecEdgeVerifiedRangeScanPlan),
+    NodeAuthoritativeScan(&'a exec::ExecNodeAuthoritativeScanPredicate),
+    EdgeAuthoritativeScan(&'a exec::ExecEdgeAuthoritativeScanPredicate),
+    NodePointReads(&'a ir::ElementIds),
+    EdgePointReads(&'a ir::ElementIds),
+    NodeRuntimeInput(&'a exec::ExecRuntimeInputPlan),
+    EdgeRuntimeInput(&'a exec::ExecRuntimeInputPlan),
+    RuntimeInput(&'a exec::ExecRuntimeInputPlan),
+    NodeFullScan,
+    EdgeFullScan,
+    NodeLabelBitmap(&'a ir::NonEmptyString),
+    EdgeLabelBitmap(&'a ir::NonEmptyString),
+    NodeVectorSearch {
+        key: &'a helix_planner::catalog::NodeSearchIndexKey,
+        index: &'a ir::SearchIndexPlan,
+        query_vector: &'a ir::VectorQueryInputPlan,
+        k: &'a ir::SearchLimitPlan,
+    },
+    EdgeVectorSearch {
+        key: &'a helix_planner::catalog::EdgeSearchIndexKey,
+        index: &'a ir::SearchIndexPlan,
+        query_vector: &'a ir::VectorQueryInputPlan,
+        k: &'a ir::SearchLimitPlan,
+    },
+    NodeTextSearch {
+        key: &'a helix_planner::catalog::NodeSearchIndexKey,
+        index: &'a ir::SearchIndexPlan,
+        query_text: &'a ir::TextQueryInputPlan,
+        k: &'a ir::SearchLimitPlan,
+    },
+    EdgeTextSearch {
+        key: &'a helix_planner::catalog::EdgeSearchIndexKey,
+        index: &'a ir::SearchIndexPlan,
+        query_text: &'a ir::TextQueryInputPlan,
+        k: &'a ir::SearchLimitPlan,
+    },
+    NodeDynamicEquality {
+        index: &'a helix_planner::catalog::NodeEqualityIndexMeta,
+        key: &'a helix_planner::catalog::ScopedPropertyKey,
+        param: &'a ir::NonEmptyString,
+    },
+    EdgeDynamicEquality {
+        index: &'a helix_planner::catalog::EdgeEqualityIndexMeta,
+        key: &'a helix_planner::catalog::ScopedPropertyKey,
+        param: &'a ir::NonEmptyString,
+    },
+}
+
+enum CountCursorStructural<'a> {
+    Union {
+        driver: &'a exec::ExecCountCursorPlan,
+        rest: &'a ir::AtLeast<exec::ExecCountCursorPlan, 1>,
+    },
+    Intersect {
+        driver: &'a exec::ExecCountCursorPlan,
+        rest: &'a ir::AtLeast<exec::ExecCountCursorPlan, 1>,
+    },
+    Filter {
+        input: &'a exec::ExecCountCursorPlan,
+        predicate: &'a ir::PredicatePlan,
+    },
+    Window {
+        input: &'a exec::ExecCountCursorPlan,
+        window: &'a exec::ExecCountWindowPlan,
+    },
+    Order {
+        input: &'a exec::ExecCountCursorPlan,
+        plan: &'a ir::OrderPlan,
+    },
+    Expand {
+        input: &'a exec::ExecCountCursorPlan,
+        plan: &'a ir::ExpandPlan,
+    },
+    VectorSearch {
+        input: &'a exec::ExecCountCursorPlan,
+        plan: &'a ir::RestrictedVectorSearchPlan,
+    },
+    TextSearch {
+        input: &'a exec::ExecCountCursorPlan,
+        plan: &'a ir::RestrictedTextSearchPlan,
+    },
+    Variable {
+        input: &'a exec::ExecCountCursorPlan,
+        op: &'a helix_planner::logical::PureStreamVariableOp,
+    },
+    Distinct {
+        input: &'a exec::ExecCountCursorPlan,
+        plan: exec::ExecCountDistinctPlan,
+    },
+}
+
 impl EvaluatedCountWindow {
     fn apply(self, cardinality: usize) -> usize {
         let cardinality = cardinality.saturating_sub(self.skip);
@@ -992,18 +1096,189 @@ impl<'db> ExecutionContext<'db> {
         cursor: &'a exec::ExecCountCursorPlan,
         dependency: &'a mut Option<ExecutionValue>,
     ) -> BoxFuture<'a, Result<Vec<ExecutionRow>>> {
+        match cursor {
+            exec::ExecCountCursorPlan::EmptyRows => {
+                self.count_cursor_leaf(CountCursorLeaf::EmptyRows, dependency)
+            }
+            exec::ExecCountCursorPlan::InputRows => {
+                self.count_cursor_leaf(CountCursorLeaf::InputRows, dependency)
+            }
+            exec::ExecCountCursorPlan::NodeBitmap(bitmap) => {
+                self.count_cursor_leaf(CountCursorLeaf::NodeBitmap(bitmap), dependency)
+            }
+            exec::ExecCountCursorPlan::EdgeBitmap(bitmap) => {
+                self.count_cursor_leaf(CountCursorLeaf::EdgeBitmap(bitmap), dependency)
+            }
+            exec::ExecCountCursorPlan::NodeUnique {
+                lookup,
+                verification,
+            } => self.count_cursor_leaf(
+                CountCursorLeaf::NodeUnique {
+                    lookup,
+                    verification,
+                },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::NodeRange(plan) => {
+                self.count_cursor_leaf(CountCursorLeaf::NodeRange(plan), dependency)
+            }
+            exec::ExecCountCursorPlan::EdgeRange(plan) => {
+                self.count_cursor_leaf(CountCursorLeaf::EdgeRange(plan), dependency)
+            }
+            exec::ExecCountCursorPlan::NodeAuthoritativeScan(predicate) => self.count_cursor_leaf(
+                CountCursorLeaf::NodeAuthoritativeScan(predicate),
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::EdgeAuthoritativeScan(predicate) => self.count_cursor_leaf(
+                CountCursorLeaf::EdgeAuthoritativeScan(predicate),
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::NodePointReads(ids) => {
+                self.count_cursor_leaf(CountCursorLeaf::NodePointReads(ids), dependency)
+            }
+            exec::ExecCountCursorPlan::EdgePointReads(ids) => {
+                self.count_cursor_leaf(CountCursorLeaf::EdgePointReads(ids), dependency)
+            }
+            exec::ExecCountCursorPlan::NodeRuntimeInput(input) => {
+                self.count_cursor_leaf(CountCursorLeaf::NodeRuntimeInput(input), dependency)
+            }
+            exec::ExecCountCursorPlan::EdgeRuntimeInput(input) => {
+                self.count_cursor_leaf(CountCursorLeaf::EdgeRuntimeInput(input), dependency)
+            }
+            exec::ExecCountCursorPlan::RuntimeInput(input) => {
+                self.count_cursor_leaf(CountCursorLeaf::RuntimeInput(input), dependency)
+            }
+            exec::ExecCountCursorPlan::NodeFullScan => {
+                self.count_cursor_leaf(CountCursorLeaf::NodeFullScan, dependency)
+            }
+            exec::ExecCountCursorPlan::EdgeFullScan => {
+                self.count_cursor_leaf(CountCursorLeaf::EdgeFullScan, dependency)
+            }
+            exec::ExecCountCursorPlan::NodeLabelBitmap(label) => {
+                self.count_cursor_leaf(CountCursorLeaf::NodeLabelBitmap(label), dependency)
+            }
+            exec::ExecCountCursorPlan::EdgeLabelBitmap(label) => {
+                self.count_cursor_leaf(CountCursorLeaf::EdgeLabelBitmap(label), dependency)
+            }
+            exec::ExecCountCursorPlan::NodeVectorSearch {
+                key,
+                index,
+                query_vector,
+                k,
+            } => self.count_cursor_leaf(
+                CountCursorLeaf::NodeVectorSearch {
+                    key,
+                    index,
+                    query_vector,
+                    k,
+                },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::EdgeVectorSearch {
+                key,
+                index,
+                query_vector,
+                k,
+            } => self.count_cursor_leaf(
+                CountCursorLeaf::EdgeVectorSearch {
+                    key,
+                    index,
+                    query_vector,
+                    k,
+                },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::NodeTextSearch {
+                key,
+                index,
+                query_text,
+                k,
+            } => self.count_cursor_leaf(
+                CountCursorLeaf::NodeTextSearch {
+                    key,
+                    index,
+                    query_text,
+                    k,
+                },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::EdgeTextSearch {
+                key,
+                index,
+                query_text,
+                k,
+            } => self.count_cursor_leaf(
+                CountCursorLeaf::EdgeTextSearch {
+                    key,
+                    index,
+                    query_text,
+                    k,
+                },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::NodeDynamicEquality { index, key, param } => self
+                .count_cursor_leaf(
+                    CountCursorLeaf::NodeDynamicEquality { index, key, param },
+                    dependency,
+                ),
+            exec::ExecCountCursorPlan::EdgeDynamicEquality { index, key, param } => self
+                .count_cursor_leaf(
+                    CountCursorLeaf::EdgeDynamicEquality { index, key, param },
+                    dependency,
+                ),
+            exec::ExecCountCursorPlan::Union { driver, rest } => self
+                .count_cursor_structural(CountCursorStructural::Union { driver, rest }, dependency),
+            exec::ExecCountCursorPlan::Intersect { driver, rest } => self.count_cursor_structural(
+                CountCursorStructural::Intersect { driver, rest },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::Filter { input, predicate } => self.count_cursor_structural(
+                CountCursorStructural::Filter { input, predicate },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::Window { input, window } => self.count_cursor_structural(
+                CountCursorStructural::Window { input, window },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::Order { input, plan } => self
+                .count_cursor_structural(CountCursorStructural::Order { input, plan }, dependency),
+            exec::ExecCountCursorPlan::Expand { input, plan } => self
+                .count_cursor_structural(CountCursorStructural::Expand { input, plan }, dependency),
+            exec::ExecCountCursorPlan::VectorSearch { input, plan } => self
+                .count_cursor_structural(
+                    CountCursorStructural::VectorSearch { input, plan },
+                    dependency,
+                ),
+            exec::ExecCountCursorPlan::TextSearch { input, plan } => self.count_cursor_structural(
+                CountCursorStructural::TextSearch { input, plan },
+                dependency,
+            ),
+            exec::ExecCountCursorPlan::Variable { input, op } => self
+                .count_cursor_structural(CountCursorStructural::Variable { input, op }, dependency),
+            exec::ExecCountCursorPlan::Distinct { input, plan } => self.count_cursor_structural(
+                CountCursorStructural::Distinct { input, plan: *plan },
+                dependency,
+            ),
+        }
+    }
+
+    fn count_cursor_leaf<'a>(
+        &'a mut self,
+        cursor: CountCursorLeaf<'a>,
+        dependency: &'a mut Option<ExecutionValue>,
+    ) -> BoxFuture<'a, Result<Vec<ExecutionRow>>> {
         async move {
             self.check_execution_deadline()?;
             match cursor {
-                exec::ExecCountCursorPlan::EmptyRows => Ok(Vec::new()),
-                exec::ExecCountCursorPlan::InputRows => match dependency.take() {
+                CountCursorLeaf::EmptyRows => Ok(Vec::new()),
+                CountCursorLeaf::InputRows => match dependency.take() {
                     Some(ExecutionValue::Stream(rows)) => Ok(rows),
                     Some(other) => Err(count_shape_error("rows", &other)),
                     None => Err(HelixDbError::InvariantViolation(
                         "count cursor consumed its row dependency more than once".to_string(),
                     )),
                 },
-                exec::ExecCountCursorPlan::NodeBitmap(bitmap) => {
+                CountCursorLeaf::NodeBitmap(bitmap) => {
                     let read = self.node_bitmap(bitmap);
                     let ids = read.await?;
                     Ok(ids
@@ -1011,7 +1286,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Node(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::EdgeBitmap(bitmap) => {
+                CountCursorLeaf::EdgeBitmap(bitmap) => {
                     let read = self.edge_bitmap(bitmap);
                     let ids = read.await?;
                     Ok(ids
@@ -1019,7 +1294,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::NodeUnique {
+                CountCursorLeaf::NodeUnique {
                     lookup,
                     verification,
                 } => {
@@ -1030,7 +1305,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Node(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::NodeRange(plan) => {
+                CountCursorLeaf::NodeRange(plan) => {
                     let read = self.validated_node_range_ids(plan);
                     let ids = read.await?;
                     Ok(ids
@@ -1038,7 +1313,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Node(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::EdgeRange(plan) => {
+                CountCursorLeaf::EdgeRange(plan) => {
                     let read = self.validated_edge_range_ids(plan);
                     let ids = read.await?;
                     Ok(ids
@@ -1046,7 +1321,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::NodeAuthoritativeScan(predicate) => {
+                CountCursorLeaf::NodeAuthoritativeScan(predicate) => {
                     let read = self.scan_element_ids(exec::ElementKeyspace::NodeProperty, None);
                     let ids = read.await?;
                     let mut rows = Vec::new();
@@ -1068,7 +1343,7 @@ impl<'db> ExecutionContext<'db> {
                     }
                     Ok(rows)
                 }
-                exec::ExecCountCursorPlan::EdgeAuthoritativeScan(predicate) => {
+                CountCursorLeaf::EdgeAuthoritativeScan(predicate) => {
                     let read = self.scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None);
                     let ids = read.await?;
                     let mut rows = Vec::new();
@@ -1090,21 +1365,21 @@ impl<'db> ExecutionContext<'db> {
                     }
                     Ok(rows)
                 }
-                exec::ExecCountCursorPlan::NodePointReads(ids) => {
+                CountCursorLeaf::NodePointReads(ids) => {
                     self.node_row_vec(ids.as_ref().to_vec()).await
                 }
-                exec::ExecCountCursorPlan::EdgePointReads(ids) => {
+                CountCursorLeaf::EdgePointReads(ids) => {
                     self.edge_row_vec(ids.as_ref().to_vec()).await
                 }
-                exec::ExecCountCursorPlan::NodeRuntimeInput(input) => {
+                CountCursorLeaf::NodeRuntimeInput(input) => {
                     let ids = self.runtime_ids(input)?;
                     self.node_row_vec(ids).await
                 }
-                exec::ExecCountCursorPlan::EdgeRuntimeInput(input) => {
+                CountCursorLeaf::EdgeRuntimeInput(input) => {
                     let ids = self.runtime_ids(input)?;
                     self.edge_row_vec(ids).await
                 }
-                exec::ExecCountCursorPlan::RuntimeInput(input) => match input {
+                CountCursorLeaf::RuntimeInput(input) => match input {
                     exec::ExecRuntimeInputPlan::Variable(variable) => {
                         match self.variable_value(variable)?.clone() {
                             ExecutionValue::Stream(rows) => Ok(rows),
@@ -1126,7 +1401,7 @@ impl<'db> ExecutionContext<'db> {
                             .collect())
                     }
                 },
-                exec::ExecCountCursorPlan::NodeFullScan => {
+                CountCursorLeaf::NodeFullScan => {
                     let read = self.scan_element_ids(exec::ElementKeyspace::NodeProperty, None);
                     let ids = read.await?;
                     Ok(ids
@@ -1134,7 +1409,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Node(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::EdgeFullScan => {
+                CountCursorLeaf::EdgeFullScan => {
                     let read = self.scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, None);
                     let ids = read.await?;
                     Ok(ids
@@ -1142,7 +1417,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::NodeLabelBitmap(label) => {
+                CountCursorLeaf::NodeLabelBitmap(label) => {
                     let value = DbPropertyValue::String(label.as_ref().to_string());
                     let read = self.lookup_equality_index_set("$label", &value);
                     let ids = read.await?;
@@ -1151,7 +1426,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Node(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::EdgeLabelBitmap(label) => {
+                CountCursorLeaf::EdgeLabelBitmap(label) => {
                     let read = self.lookup_global_edge_label_index(label.as_ref());
                     let ids = read.await?;
                     Ok(ids
@@ -1159,7 +1434,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::NodeVectorSearch {
+                CountCursorLeaf::NodeVectorSearch {
                     key,
                     index,
                     query_vector,
@@ -1176,7 +1451,7 @@ impl<'db> ExecutionContext<'db> {
                     let results = read.await?;
                     self.node_search_row_vec(results).await
                 }
-                exec::ExecCountCursorPlan::EdgeVectorSearch {
+                CountCursorLeaf::EdgeVectorSearch {
                     key,
                     index,
                     query_vector,
@@ -1193,7 +1468,7 @@ impl<'db> ExecutionContext<'db> {
                     let results = read.await?;
                     self.edge_search_row_vec(results).await
                 }
-                exec::ExecCountCursorPlan::NodeTextSearch {
+                CountCursorLeaf::NodeTextSearch {
                     key,
                     index,
                     query_text,
@@ -1210,7 +1485,7 @@ impl<'db> ExecutionContext<'db> {
                     let hits = read.await?;
                     self.node_text_search_row_vec(hits).await
                 }
-                exec::ExecCountCursorPlan::EdgeTextSearch {
+                CountCursorLeaf::EdgeTextSearch {
                     key,
                     index,
                     query_text,
@@ -1227,7 +1502,7 @@ impl<'db> ExecutionContext<'db> {
                     let hits = read.await?;
                     self.edge_text_search_row_vec(hits).await
                 }
-                exec::ExecCountCursorPlan::NodeDynamicEquality { index, key, param } => {
+                CountCursorLeaf::NodeDynamicEquality { index, key, param } => {
                     validate_node_equality_index(&index.index_id, key)?;
                     let value = self.param_value(param)?;
                     let read = self.lookup_managed_equality_union(
@@ -1241,7 +1516,7 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Node(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::EdgeDynamicEquality { index, key, param } => {
+                CountCursorLeaf::EdgeDynamicEquality { index, key, param } => {
                     validate_edge_equality_index(&index.index_id, key)?;
                     let value = self.param_value(param)?;
                     let read = self.lookup_managed_equality_union(
@@ -1255,7 +1530,20 @@ impl<'db> ExecutionContext<'db> {
                         .map(|id| ExecutionRow::current(ElementRef::Edge(id)))
                         .collect())
                 }
-                exec::ExecCountCursorPlan::Union { driver, rest } => {
+            }
+        }
+        .boxed()
+    }
+
+    fn count_cursor_structural<'a>(
+        &'a mut self,
+        cursor: CountCursorStructural<'a>,
+        dependency: &'a mut Option<ExecutionValue>,
+    ) -> BoxFuture<'a, Result<Vec<ExecutionRow>>> {
+        async move {
+            self.check_execution_deadline()?;
+            match cursor {
+                CountCursorStructural::Union { driver, rest } => {
                     let mut rows = self.count_cursor(driver, dependency).await?;
                     let mut seen = rows.iter().cloned().collect::<BTreeSet<_>>();
                     for child in rest {
@@ -1267,7 +1555,7 @@ impl<'db> ExecutionContext<'db> {
                     }
                     Ok(rows)
                 }
-                exec::ExecCountCursorPlan::Intersect { driver, rest } => {
+                CountCursorStructural::Intersect { driver, rest } => {
                     let mut rows = self.count_cursor(driver, dependency).await?;
                     for child in rest {
                         let read = self.count_cursor(child, dependency);
@@ -1276,42 +1564,42 @@ impl<'db> ExecutionContext<'db> {
                     }
                     Ok(rows)
                 }
-                exec::ExecCountCursorPlan::Filter { input, predicate } => {
+                CountCursorStructural::Filter { input, predicate } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
                     let output = self.filter(input, predicate).await?;
                     self.stream_rows(output, "exact count filter")
                 }
-                exec::ExecCountCursorPlan::Window { input, window } => {
+                CountCursorStructural::Window { input, window } => {
                     let rows = self.count_cursor(input, dependency).await?;
                     Ok(self.count_window(window)?.apply_rows(rows))
                 }
-                exec::ExecCountCursorPlan::Order { input, plan } => {
+                CountCursorStructural::Order { input, plan } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
                     let output = self.order(input, plan).await?;
                     self.stream_rows(output, "exact count order")
                 }
-                exec::ExecCountCursorPlan::Expand { input, plan } => {
+                CountCursorStructural::Expand { input, plan } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
                     let output = self.expand(input, plan).await?;
                     self.stream_rows(output, "exact count expansion")
                 }
-                exec::ExecCountCursorPlan::VectorSearch { input, plan } => {
+                CountCursorStructural::VectorSearch { input, plan } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
                     let output = self.restricted_vector_search(input, plan).await?;
                     self.stream_rows(output, "exact count restricted vector search")
                 }
-                exec::ExecCountCursorPlan::TextSearch { input, plan } => {
+                CountCursorStructural::TextSearch { input, plan } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
                     let output = self.restricted_text_search(input, plan).await?;
                     self.stream_rows(output, "exact count restricted text search")
                 }
-                exec::ExecCountCursorPlan::Variable { input, op } => {
+                CountCursorStructural::Variable { input, op } => {
                     let input = ExecutionValue::Stream(self.count_cursor(input, dependency).await?);
                     let executable = exec::ExecVariableOp::Stream(op.to_stream_op());
                     let output = self.variable(input, &executable)?;
                     self.stream_rows(output, "exact count variable")
                 }
-                exec::ExecCountCursorPlan::Distinct { input, plan } => {
+                CountCursorStructural::Distinct { input, plan } => {
                     let mut rows = self.count_cursor(input, dependency).await?;
                     match plan {
                         exec::ExecCountDistinctPlan::HashRows => {
@@ -1418,6 +1706,9 @@ mod tests {
     use helix_ast::query::QueryValue;
     use helix_ast::value::PropertyValue;
     use helix_planner::{catalog, context};
+    use proptest::prelude::*;
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
 
     use super::super::access::tests::support as access_support;
     use super::super::test_support;
@@ -4215,6 +4506,146 @@ mod tests {
                     .await,
                 Err(HelixDbError::QueryDeadlineExceeded)
             ));
+
+            let structural = exec::ExecCountCursorPlan::Union {
+                driver: Box::new(exec::ExecCountCursorPlan::EmptyRows),
+                rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::EmptyRows),
+            };
+            let mut dependency = None;
+            let mut deadline = ExecutionContext::new(&db, context::ParamBindings::default());
+            deadline.fail_deadline_after(0);
+            assert!(matches!(
+                deadline.count_cursor(&structural, &mut dependency).await,
+                Err(HelixDbError::QueryDeadlineExceeded)
+            ));
+        }
+        execution.close_request_read_view().unwrap();
+    }
+
+    #[tokio::test]
+    async fn randomized_recursive_counts_match_the_materialized_row_oracle() {
+        let db = test_support::open_db("count-randomized-recursive-oracle").await;
+        let mut nodes = Vec::new();
+        for index in 0..12 {
+            nodes.push(
+                test_support::add_node_with_properties(
+                    &db,
+                    "User",
+                    vec![
+                        (
+                            "status",
+                            PropertyValue::from(if index % 2 == 0 { "active" } else { "paused" }),
+                        ),
+                        ("rank", PropertyValue::from(format!("{index:02}"))),
+                    ],
+                )
+                .await,
+            );
+        }
+        for (index, node) in nodes.iter().copied().enumerate() {
+            test_support::add_edge_with_properties(
+                &db,
+                node,
+                nodes[(index + 1) % nodes.len()],
+                "NEXT",
+                Vec::new(),
+            )
+            .await;
+        }
+
+        let strategy = (
+            prop::collection::vec(0usize..nodes.len(), 0..24),
+            prop::collection::vec((0u8..8, 0usize..20, 0usize..20), 0..10),
+            0usize..24,
+            prop::option::of(0usize..24),
+        );
+        let mut runner = TestRunner::deterministic();
+        let all_ids = test_support::ids(nodes.clone());
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        execution.enable_request_read_view().await.unwrap();
+
+        for case_index in 0..96 {
+            let (row_indexes, ops, skip, take) = strategy
+                .new_tree(&mut runner)
+                .expect("recursive count oracle strategy is valid")
+                .current();
+            let rows = row_indexes
+                .into_iter()
+                .map(|index| ExecutionRow::current(ElementRef::Node(nodes[index])))
+                .collect::<Vec<_>>();
+            let mut cursor = exec::ExecCountCursorPlan::InputRows;
+            for (kind, first, second) in ops {
+                cursor = match kind {
+                    0 => exec::ExecCountCursorPlan::Window {
+                        input: Box::new(cursor),
+                        window: bounded(first, second),
+                    },
+                    1 => exec::ExecCountCursorPlan::Filter {
+                        input: Box::new(cursor),
+                        predicate: ir::PredicatePlan::new(Predicate::eq("status", "active"))
+                            .unwrap(),
+                    },
+                    2 => exec::ExecCountCursorPlan::Order {
+                        input: Box::new(cursor),
+                        plan: ir::OrderPlan::ExplicitSort(ir::OrderKeys::from(ir::OrderKey {
+                            property: test_support::name("rank"),
+                            order: if first % 2 == 0 {
+                                helix_ast::traversal::Order::Asc
+                            } else {
+                                helix_ast::traversal::Order::Desc
+                            },
+                        })),
+                    },
+                    3 => exec::ExecCountCursorPlan::Distinct {
+                        input: Box::new(cursor),
+                        plan: exec::ExecCountDistinctPlan::HashRows,
+                    },
+                    4 => exec::ExecCountCursorPlan::Distinct {
+                        input: Box::new(cursor),
+                        plan: exec::ExecCountDistinctPlan::OrderedRows,
+                    },
+                    5 => exec::ExecCountCursorPlan::Union {
+                        driver: Box::new(cursor),
+                        rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::EmptyRows),
+                    },
+                    6 => exec::ExecCountCursorPlan::Intersect {
+                        driver: Box::new(cursor),
+                        rest: ir::AtLeast::from_one(exec::ExecCountCursorPlan::NodePointReads(
+                            all_ids.clone(),
+                        )),
+                    },
+                    7 => exec::ExecCountCursorPlan::Expand {
+                        input: Box::new(cursor),
+                        plan: ir::ExpandPlan {
+                            direction: if second % 2 == 0 {
+                                ir::ExpandDirection::Out
+                            } else {
+                                ir::ExpandDirection::In
+                            },
+                            output: ir::ExpandOutput::Nodes,
+                            label: ir::ExpandLabelPlan::Any,
+                        },
+                    },
+                    _ => unreachable!("generated cursor kind is bounded"),
+                };
+            }
+            let window = EvaluatedCountWindow { skip, take };
+            let mut oracle_dependency = Some(ExecutionValue::Stream(rows.clone()));
+            let materialized = execution
+                .count_cursor(&cursor, &mut oracle_dependency)
+                .await
+                .unwrap_or_else(|error| panic!("oracle case {case_index} failed: {error}"));
+            let expected = window.apply(materialized.len());
+
+            let mut scalar_dependency = Some(ExecutionValue::Stream(rows));
+            let actual = execution
+                .count_cursor_cardinality(&cursor, &mut scalar_dependency, window)
+                .await
+                .unwrap_or_else(|error| panic!("scalar case {case_index} failed: {error}"));
+            assert_eq!(
+                actual, expected,
+                "random recursive cardinality case {case_index} diverged for {cursor:?}"
+            );
         }
         execution.close_request_read_view().unwrap();
     }
