@@ -113,13 +113,13 @@ impl<'db> ExecutionContext<'db> {
                         bitmaps
                     }
                 };
-                let read = self.node_range_index_ids_with_membership(
+                let read = self.node_range_index_count_with_membership(
                     &plan.driver.key,
                     &plan.driver.range,
                     &filters,
                     window.threshold(),
                 );
-                let accepted = read.await?.len();
+                let accepted = read.await?;
                 window.apply(accepted)
             }
             exec::ExecCountPlan::EdgeRange(plan) => {
@@ -135,13 +135,13 @@ impl<'db> ExecutionContext<'db> {
                         bitmaps
                     }
                 };
-                let read = self.edge_range_index_ids_with_membership(
+                let read = self.edge_range_index_count_with_membership(
                     &plan.driver.key,
                     &plan.driver.range,
                     &filters,
                     window.threshold(),
                 );
-                let accepted = read.await?.len();
+                let accepted = read.await?;
                 window.apply(accepted)
             }
             exec::ExecCountPlan::NodeAuthoritativeScan(plan) => {

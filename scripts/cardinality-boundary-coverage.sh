@@ -27,6 +27,7 @@ case "$SHARD" in
         COVERAGE_ARGS=(-p db --lib)
         TARGET_FILES=(
             crates/db/src/execution/interpreter/access/dispatch.rs
+            crates/db/src/execution/interpreter/access/range.rs
             crates/db/src/execution/interpreter/access/secondary_set.rs
             crates/db/src/execution/interpreter/count.rs
             crates/db/src/index_lifecycle/secondary/exact.rs
@@ -100,7 +101,12 @@ done
 # module; integration tests and doctests still exercise that production code.
 : >"$PRODUCTION_CHANGED_LINES_PATH"
 for target_file in "${TARGET_FILES[@]}"; do
-    test_start="$(awk '/^#\[cfg\(.*test/{ print NR; exit }' "$ROOT/$target_file")"
+    test_start="$(awk '
+        /^#\[cfg\(.*test/ { candidate = NR; next }
+        candidate && /^#\[/ { next }
+        candidate && /^(pub(\([^)]*\))? )?mod tests/ { print candidate; exit }
+        candidate { candidate = 0 }
+    ' "$ROOT/$target_file")"
     if [[ -z "$test_start" ]]; then
         test_start=2147483647
     fi

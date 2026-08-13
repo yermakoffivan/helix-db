@@ -127,8 +127,59 @@ pub(crate) async fn lookup_active_equality_literal_batch(
     Ok(owners)
 }
 
-/// Scans an exact range generation and applies planner-ordered bitmap
-/// membership before the accepted-match limit.
+trait ExactRangeAccumulator {
+    type Output;
+
+    fn accepted(&self) -> usize;
+    fn accept(&mut self, owner: u64);
+    fn finish(self) -> Self::Output;
+}
+
+#[cfg(any(test, feature = "production-coverage"))]
+#[derive(Default)]
+struct ExactRangeOwners(Vec<u64>);
+
+#[cfg(any(test, feature = "production-coverage"))]
+impl ExactRangeAccumulator for ExactRangeOwners {
+    type Output = Vec<u64>;
+
+    fn accepted(&self) -> usize {
+        self.0.len()
+    }
+
+    fn accept(&mut self, owner: u64) {
+        self.0.push(owner);
+    }
+
+    fn finish(self) -> Self::Output {
+        self.0
+    }
+}
+
+#[derive(Default)]
+struct ExactRangeCount(usize);
+
+impl ExactRangeAccumulator for ExactRangeCount {
+    type Output = usize;
+
+    fn accepted(&self) -> usize {
+        self.0
+    }
+
+    fn accept(&mut self, _owner: u64) {
+        self.0 = self.0.saturating_add(1);
+    }
+
+    fn finish(self) -> Self::Output {
+        self.0
+    }
+}
+
+/// Scans an exact range generation and returns planner-accepted owners.
+///
+/// Bitmap membership is evaluated in executable-plan order and `limit` is an
+/// accepted-owner threshold, not a storage-row limit.
+#[cfg(any(test, feature = "production-coverage"))]
 pub(crate) async fn scan_active_range_generation_with_membership(
     reader: &(impl DbReadOps + Sync),
     handle: &ActiveIndexHandle,
@@ -136,6 +187,48 @@ pub(crate) async fn scan_active_range_generation_with_membership(
     limit: Option<usize>,
     membership: &[roaring::RoaringTreemap],
 ) -> Result<Vec<u64>> {
+    execute_active_range_generation_with_membership(
+        reader,
+        handle,
+        query,
+        limit,
+        membership,
+        ExactRangeOwners::default(),
+    )
+    .await
+}
+
+/// Counts an exact range generation without materializing accepted owners.
+///
+/// Bitmap membership is evaluated in executable-plan order and `limit` is an
+/// accepted-owner threshold, so a bounded physical count stops as soon as the
+/// planner-selected count window has enough verified matches.
+pub(crate) async fn count_active_range_generation_with_membership(
+    reader: &(impl DbReadOps + Sync),
+    handle: &ActiveIndexHandle,
+    query: Option<&SecondaryRangeQuery>,
+    limit: Option<usize>,
+    membership: &[roaring::RoaringTreemap],
+) -> Result<usize> {
+    execute_active_range_generation_with_membership(
+        reader,
+        handle,
+        query,
+        limit,
+        membership,
+        ExactRangeCount::default(),
+    )
+    .await
+}
+
+async fn execute_active_range_generation_with_membership<A: ExactRangeAccumulator>(
+    reader: &(impl DbReadOps + Sync),
+    handle: &ActiveIndexHandle,
+    query: Option<&SecondaryRangeQuery>,
+    limit: Option<usize>,
+    membership: &[roaring::RoaringTreemap],
+    accumulator: A,
+) -> Result<A::Output> {
     let Some(definition) = handle.secondary_definition() else {
         return Err(corruption(
             "secondary range serving received a non-secondary Active handle",
@@ -159,23 +252,35 @@ pub(crate) async fn scan_active_range_generation_with_membership(
     let bounds = match query {
         Some(query) => match secondary_range_scan_bounds(direction, query)? {
             Some(bounds) => bounds,
-            None => return Ok(Vec::new()),
+            None => return Ok(accumulator.finish()),
         },
         None => (Bound::Unbounded, Bound::Unbounded),
     };
+    if limit == Some(0) {
+        return Ok(accumulator.finish());
+    }
     let prefix = IndexKey::data_prefix(
         handle.scope(),
         ScopedKey::secondary_lane_prefix(handle.index_id(), handle.generation(), lane),
     );
     let rows = reader.scan_prefix(&prefix, bounds).await?;
     consume_active_range_rows(
-        reader, handle, definition, direction, lane, rows, query, limit, membership,
+        reader,
+        handle,
+        definition,
+        direction,
+        lane,
+        rows,
+        query,
+        limit,
+        membership,
+        accumulator,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn consume_active_range_rows(
+async fn consume_active_range_rows<A: ExactRangeAccumulator>(
     reader: &(impl DbReadOps + Sync),
     handle: &ActiveIndexHandle,
     definition: &ValidatedSecondaryIndexDefinition,
@@ -185,8 +290,8 @@ async fn consume_active_range_rows(
     query: Option<&SecondaryRangeQuery>,
     limit: Option<usize>,
     membership: &[roaring::RoaringTreemap],
-) -> Result<Vec<u64>> {
-    let mut owners = Vec::new();
+    mut accumulator: A,
+) -> Result<A::Output> {
     while let Some(row) = rows.next_exact().await? {
         let IndexKey::Data {
             kind: ScopedKey::SecondaryEntry(key),
@@ -237,12 +342,12 @@ async fn consume_active_range_rows(
         {
             continue;
         }
-        owners.push(value_owner.get());
-        if limit.is_some_and(|limit| owners.len() >= limit) {
+        accumulator.accept(value_owner.get());
+        if limit.is_some_and(|limit| accumulator.accepted() >= limit) {
             break;
         }
     }
-    Ok(owners)
+    Ok(accumulator.finish())
 }
 
 #[cfg(all(feature = "production-coverage", not(test)))]
@@ -502,6 +607,24 @@ pub(crate) async fn run_production_contracts() {
             .len(),
         1
     );
+    assert_eq!(
+        count_active_range_generation_with_membership(&db, &range, None, None, &[])
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        count_active_range_generation_with_membership(&db, &range, None, Some(1), &[])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        count_active_range_generation_with_membership(&db, &range, None, Some(0), &[])
+            .await
+            .unwrap(),
+        0
+    );
     db.close().await.expect("exact serving database closes");
 }
 
@@ -541,6 +664,21 @@ mod tests {
             None,
             None,
             &[],
+            ExactRangeOwners::default(),
+        )
+        .await
+        .is_err());
+        assert!(consume_active_range_rows(
+            &db,
+            &handle,
+            definition,
+            StorageRangeIndexDirection::Asc,
+            definition_lane(definition),
+            FailingRows,
+            None,
+            None,
+            &[],
+            ExactRangeCount::default(),
         )
         .await
         .is_err());

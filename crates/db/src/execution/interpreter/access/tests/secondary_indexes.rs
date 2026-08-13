@@ -3005,6 +3005,46 @@ async fn direct_range_access_covers_writer_reader_and_active_transaction_views()
             .expect("transaction-owned edge range access succeeds"),
         vec![edge]
     );
+    assert_eq!(
+        transaction_context
+            .node_range_index_count_with_membership(&node_key, &ir::IndexRange::All, &[], None,)
+            .await
+            .expect("transaction-owned node range count succeeds"),
+        2
+    );
+    assert_eq!(
+        transaction_context
+            .edge_range_index_count_with_membership(&edge_key, &ir::IndexRange::All, &[], None,)
+            .await
+            .expect("transaction-owned edge range count succeeds"),
+        1
+    );
+    assert_eq!(
+        transaction_context
+            .node_range_index_count_with_membership(
+                &node_key,
+                &ir::IndexRange::Lower {
+                    lower: ir::IndexBound::Inclusive(
+                        ir::RangeIndexValue::literal(PropertyValue::I64(15)).unwrap(),
+                    ),
+                },
+                &[],
+                None,
+            )
+            .await
+            .expect("transaction-owned bounded node range count succeeds"),
+        1
+    );
+    let absent_key = catalog::ScopedPropertyDirectionKey::try_new(
+        "Missing",
+        "score",
+        helix_ast::index::RangeIndexDirection::Asc,
+    )
+    .unwrap();
+    assert!(transaction_context
+        .node_range_index_count_with_membership(&absent_key, &ir::IndexRange::All, &[], None,)
+        .await
+        .is_err());
     transaction_context.abort_request_write_scope();
 
     drop(writer);
@@ -3024,6 +3064,40 @@ async fn direct_range_access_covers_writer_reader_and_active_transaction_views()
             .expect("direct reader edge range access succeeds"),
         vec![edge]
     );
+}
+
+#[tokio::test]
+async fn exact_range_count_rejects_missing_bounds_and_oversized_identity_components() {
+    let db = test_support::open_db("access-exact-range-count-invalid-inputs").await;
+    let context = ExecutionContext::new(&db, context::ParamBindings::default());
+    let valid_label = ir::NonEmptyString::new("User").unwrap();
+    let valid_property = ir::NonEmptyString::new("score").unwrap();
+    let direction = helix_ast::index::RangeIndexDirection::Asc;
+    let valid_key = catalog::ScopedPropertyDirectionKey::new(
+        valid_label.clone(),
+        valid_property.clone(),
+        direction,
+    );
+    let missing_bound = ir::IndexRange::Lower {
+        lower: ir::IndexBound::Inclusive(ir::RangeIndexValue::Param(
+            ir::NonEmptyString::new("missing").unwrap(),
+        )),
+    };
+    assert!(context
+        .node_range_index_count_with_membership(&valid_key, &missing_bound, &[], None)
+        .await
+        .is_err());
+
+    let oversized = ir::NonEmptyString::new("x".repeat(u16::MAX as usize + 1)).unwrap();
+    for key in [
+        catalog::ScopedPropertyDirectionKey::new(oversized.clone(), valid_property, direction),
+        catalog::ScopedPropertyDirectionKey::new(valid_label, oversized, direction),
+    ] {
+        assert!(context
+            .node_range_index_count_with_membership(&key, &ir::IndexRange::All, &[], None)
+            .await
+            .is_err());
+    }
 }
 
 #[tokio::test]

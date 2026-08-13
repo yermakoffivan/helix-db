@@ -83,9 +83,11 @@ use super::IndexScopeGates;
 mod exact;
 #[cfg(all(feature = "production-coverage", not(test)))]
 pub(crate) use exact::run_production_contracts as run_exact_production_contracts;
+#[cfg(any(test, feature = "production-coverage"))]
+pub(crate) use exact::scan_active_range_generation_with_membership;
 pub(crate) use exact::{
-    lookup_active_equality_literal_batch, lookup_active_equality_point_literal,
-    record_equality_graph_read, scan_active_range_generation_with_membership,
+    count_active_range_generation_with_membership, lookup_active_equality_literal_batch,
+    lookup_active_equality_point_literal, record_equality_graph_read,
 };
 
 #[cfg(any(test, feature = "production-coverage"))]
@@ -4228,11 +4230,41 @@ mod tests {
                     &handle,
                     None,
                     None,
-                    &[membership, second_filter],
+                    &[membership.clone(), second_filter.clone()],
                 )
                 .await
                 .expect("exact range applies membership in encoded order"),
                 vec![20]
+            );
+            assert_eq!(
+                count_active_range_generation_with_membership(&db, &handle, None, None, &[])
+                    .await
+                    .expect("exact range count succeeds without owner materialization"),
+                expected_all.len()
+            );
+            assert_eq!(
+                count_active_range_generation_with_membership(
+                    &db,
+                    &handle,
+                    None,
+                    None,
+                    &[membership.clone(), second_filter.clone()],
+                )
+                .await
+                .expect("exact range count applies membership in encoded order"),
+                1
+            );
+            assert_eq!(
+                count_active_range_generation_with_membership(&db, &handle, None, Some(0), &[],)
+                    .await
+                    .expect("zero accepted-match threshold performs an empty count"),
+                0
+            );
+            assert_eq!(
+                count_active_range_generation_with_membership(&db, &handle, None, Some(2), &[],)
+                    .await
+                    .expect("bounded exact range count stops at its threshold"),
+                expected_all.len().min(2)
             );
             assert_eq!(
                 scan_active_range_generation(
