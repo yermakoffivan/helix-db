@@ -312,10 +312,12 @@ impl<'db> ExecutionContext<'db> {
             }
             exec::ExecCountPlan::Stream(plan) => {
                 let mut dependency = Some(input);
-                let rows = self.count_cursor(&plan.cursor, &mut dependency).await?;
-                evaluated_window
-                    .expect("stream counts carry a window")
-                    .apply(rows.len())
+                self.count_cursor_cardinality(
+                    &plan.cursor,
+                    &mut dependency,
+                    evaluated_window.expect("stream counts carry a window"),
+                )
+                .await?
             }
             exec::ExecCountPlan::InputRows { .. } => {
                 let rows = match input {
@@ -709,6 +711,278 @@ impl<'db> ExecutionContext<'db> {
                     Ok(result)
                 }
             }
+        }
+        .boxed()
+    }
+
+    /// Count an exact recursive cursor without constructing its terminal row collection.
+    ///
+    /// Identity-sensitive cursor nodes still call `count_cursor`, which materializes only
+    /// because their selected primitive requires complete rows. Source cursors and the
+    /// terminal filter/window nodes execute directly to a scalar and honor the encoded
+    /// accepted-row threshold.
+    fn count_cursor_cardinality<'a>(
+        &'a mut self,
+        cursor: &'a exec::ExecCountCursorPlan,
+        dependency: &'a mut Option<ExecutionValue>,
+        window: EvaluatedCountWindow,
+    ) -> BoxFuture<'a, Result<usize>> {
+        async move {
+            self.check_execution_deadline()?;
+            let cardinality = match cursor {
+                exec::ExecCountCursorPlan::EmptyRows => 0,
+                exec::ExecCountCursorPlan::InputRows => match dependency.take() {
+                    Some(ExecutionValue::Stream(rows)) => rows.len(),
+                    Some(other) => return Err(count_shape_error("rows", &other)),
+                    None => {
+                        return Err(HelixDbError::InvariantViolation(
+                            "count cursor consumed its row dependency more than once".to_string(),
+                        ));
+                    }
+                },
+                exec::ExecCountCursorPlan::NodeBitmap(bitmap) => {
+                    self.node_bitmap(bitmap).await?.len() as usize
+                }
+                exec::ExecCountCursorPlan::EdgeBitmap(bitmap) => {
+                    self.edge_bitmap(bitmap).await?.len() as usize
+                }
+                exec::ExecCountCursorPlan::NodeUnique {
+                    lookup,
+                    verification,
+                } => usize::from(
+                    self.verified_node_unique_owner(lookup, verification)
+                        .await?
+                        .is_some(),
+                ),
+                exec::ExecCountCursorPlan::NodeRange(plan) => {
+                    validate_range_index("node_range:", &plan.index.index_id, &plan.key)?;
+                    self.node_range_index_count_with_membership(
+                        &plan.key,
+                        &plan.range,
+                        &[],
+                        window.threshold(),
+                    )
+                    .await?
+                }
+                exec::ExecCountCursorPlan::EdgeRange(plan) => {
+                    validate_range_index("edge_range:", &plan.index.index_id, &plan.key)?;
+                    self.edge_range_index_count_with_membership(
+                        &plan.key,
+                        &plan.range,
+                        &[],
+                        window.threshold(),
+                    )
+                    .await?
+                }
+                exec::ExecCountCursorPlan::NodeAuthoritativeScan(predicate) => {
+                    self.authoritative_node_rows(predicate, window.threshold())
+                        .await?
+                }
+                exec::ExecCountCursorPlan::EdgeAuthoritativeScan(predicate) => {
+                    self.authoritative_edge_rows(predicate, window.threshold())
+                        .await?
+                }
+                exec::ExecCountCursorPlan::NodePointReads(ids) => {
+                    self.existing_node_count(ids.as_ref(), window.threshold())
+                        .await?
+                }
+                exec::ExecCountCursorPlan::EdgePointReads(ids) => {
+                    self.existing_edge_count(ids.as_ref(), window.threshold())
+                        .await?
+                }
+                exec::ExecCountCursorPlan::NodeRuntimeInput(input) => {
+                    let ids = self.runtime_ids(input)?;
+                    self.existing_node_count(&ids, window.threshold()).await?
+                }
+                exec::ExecCountCursorPlan::EdgeRuntimeInput(input) => {
+                    let ids = self.runtime_ids(input)?;
+                    self.existing_edge_count(&ids, window.threshold()).await?
+                }
+                exec::ExecCountCursorPlan::RuntimeInput(input) => self.runtime_row_count(input)?,
+                exec::ExecCountCursorPlan::NodeFullScan => {
+                    let limit = positive_limit(window.threshold());
+                    self.scan_element_ids(exec::ElementKeyspace::NodeProperty, limit)
+                        .await?
+                        .len()
+                }
+                exec::ExecCountCursorPlan::EdgeFullScan => {
+                    let limit = positive_limit(window.threshold());
+                    self.scan_element_ids(exec::ElementKeyspace::EdgeEndpoints, limit)
+                        .await?
+                        .len()
+                }
+                exec::ExecCountCursorPlan::NodeLabelBitmap(label) => {
+                    let value = DbPropertyValue::String(label.as_ref().to_string());
+                    self.lookup_equality_index_set("$label", &value)
+                        .await?
+                        .len() as usize
+                }
+                exec::ExecCountCursorPlan::EdgeLabelBitmap(label) => {
+                    self.lookup_global_edge_label_index(label.as_ref())
+                        .await?
+                        .len() as usize
+                }
+                exec::ExecCountCursorPlan::NodeVectorSearch {
+                    key,
+                    index,
+                    query_vector,
+                    k,
+                } => {
+                    let results = self
+                        .vector_search_results(
+                            VectorElementType::Node,
+                            &key.label,
+                            &key.property,
+                            index,
+                            query_vector,
+                            SearchReadLimit::new(k, None),
+                        )
+                        .await?;
+                    let ids = results
+                        .into_iter()
+                        .map(|result| result.entity_id().local_id())
+                        .collect::<Vec<_>>();
+                    return self
+                        .existing_node_count(&ids, window.threshold())
+                        .await
+                        .map(|cardinality| window.apply(cardinality));
+                }
+                exec::ExecCountCursorPlan::EdgeVectorSearch {
+                    key,
+                    index,
+                    query_vector,
+                    k,
+                } => {
+                    let results = self
+                        .vector_search_results(
+                            VectorElementType::Edge,
+                            &key.label,
+                            &key.property,
+                            index,
+                            query_vector,
+                            SearchReadLimit::new(k, None),
+                        )
+                        .await?;
+                    let ids = results
+                        .into_iter()
+                        .map(|result| result.entity_id().local_id())
+                        .collect::<Vec<_>>();
+                    return self
+                        .existing_edge_count(&ids, window.threshold())
+                        .await
+                        .map(|cardinality| window.apply(cardinality));
+                }
+                exec::ExecCountCursorPlan::NodeTextSearch {
+                    key,
+                    index,
+                    query_text,
+                    k,
+                } => {
+                    let hits = self
+                        .text_search_hits(
+                            TextElementType::Node,
+                            &key.label,
+                            &key.property,
+                            index,
+                            query_text,
+                            SearchReadLimit::new(k, None),
+                        )
+                        .await?;
+                    let ids = hits
+                        .into_iter()
+                        .map(|result| result.entity_id)
+                        .collect::<Vec<_>>();
+                    return self
+                        .existing_node_count(&ids, window.threshold())
+                        .await
+                        .map(|cardinality| window.apply(cardinality));
+                }
+                exec::ExecCountCursorPlan::EdgeTextSearch {
+                    key,
+                    index,
+                    query_text,
+                    k,
+                } => {
+                    let hits = self
+                        .text_search_hits(
+                            TextElementType::Edge,
+                            &key.label,
+                            &key.property,
+                            index,
+                            query_text,
+                            SearchReadLimit::new(k, None),
+                        )
+                        .await?;
+                    let ids = hits
+                        .into_iter()
+                        .map(|result| result.entity_id)
+                        .collect::<Vec<_>>();
+                    return self
+                        .existing_edge_count(&ids, window.threshold())
+                        .await
+                        .map(|cardinality| window.apply(cardinality));
+                }
+                exec::ExecCountCursorPlan::NodeDynamicEquality { index, key, param } => {
+                    validate_node_equality_index(&index.index_id, key)?;
+                    let value = self.param_value(param)?;
+                    self.lookup_managed_equality_union(
+                        crate::index_lifecycle::IndexElementKind::Node,
+                        key,
+                        core::slice::from_ref(&value),
+                    )
+                    .await?
+                    .len() as usize
+                }
+                exec::ExecCountCursorPlan::EdgeDynamicEquality { index, key, param } => {
+                    validate_edge_equality_index(&index.index_id, key)?;
+                    let value = self.param_value(param)?;
+                    self.lookup_managed_equality_union(
+                        crate::index_lifecycle::IndexElementKind::Edge,
+                        key,
+                        core::slice::from_ref(&value),
+                    )
+                    .await?
+                    .len() as usize
+                }
+                exec::ExecCountCursorPlan::Filter { input, predicate } => {
+                    let rows = self.count_cursor(input, dependency).await?;
+                    let mut accepted = 0usize;
+                    for row in rows {
+                        if window
+                            .threshold()
+                            .is_some_and(|threshold| accepted >= threshold)
+                        {
+                            break;
+                        }
+                        self.check_execution_deadline()?;
+                        if self.eval_predicate(&row, predicate.predicate()).await? {
+                            accepted = accepted.saturating_add(1);
+                        }
+                    }
+                    accepted
+                }
+                exec::ExecCountCursorPlan::Window {
+                    input,
+                    window: positioned,
+                } => {
+                    let positioned = self.count_window(positioned)?;
+                    let positioned = self
+                        .count_cursor_cardinality(input, dependency, positioned)
+                        .await?;
+                    return Ok(window.apply(positioned));
+                }
+                exec::ExecCountCursorPlan::Union { .. }
+                | exec::ExecCountCursorPlan::Intersect { .. }
+                | exec::ExecCountCursorPlan::Order { .. }
+                | exec::ExecCountCursorPlan::Expand { .. }
+                | exec::ExecCountCursorPlan::VectorSearch { .. }
+                | exec::ExecCountCursorPlan::TextSearch { .. }
+                | exec::ExecCountCursorPlan::Variable { .. }
+                | exec::ExecCountCursorPlan::Distinct { .. } => {
+                    self.count_cursor(cursor, dependency).await?.len()
+                }
+            };
+            Ok(window.apply(cardinality))
         }
         .boxed()
     }
@@ -1872,6 +2146,11 @@ mod tests {
             },
         ];
         for cursor in cursors {
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert!(execution
+                .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
             let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
                 cursor,
                 window: exec::ExecCountWindowPlan::identity(),
@@ -1940,6 +2219,12 @@ mod tests {
         ];
         let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
         for predicate in node_predicates {
+            let cursor = exec::ExecCountCursorPlan::NodeAuthoritativeScan(predicate.clone());
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert!(execution
+                .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
             for plan in [
                 exec::ExecCountPlan::NodeAuthoritativeScan(exec::ExecNodeScanCountPlan {
                     predicate: predicate.clone(),
@@ -1957,6 +2242,12 @@ mod tests {
             }
         }
         for predicate in edge_predicates {
+            let cursor = exec::ExecCountCursorPlan::EdgeAuthoritativeScan(predicate.clone());
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert!(execution
+                .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
             for plan in [
                 exec::ExecCountPlan::EdgeAuthoritativeScan(exec::ExecEdgeScanCountPlan {
                     predicate: predicate.clone(),
@@ -2433,6 +2724,15 @@ mod tests {
             ),
         ];
         for (cursor, expected) in sources {
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert_eq!(
+                execution
+                    .count_cursor(&cursor, &mut dependency)
+                    .await
+                    .unwrap()
+                    .len(),
+                expected
+            );
             let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
                 cursor,
                 window: exec::ExecCountWindowPlan::identity(),
@@ -2501,6 +2801,15 @@ mod tests {
             (bound, 2),
             (expanded, 1),
         ] {
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert_eq!(
+                execution
+                    .count_cursor(&cursor, &mut dependency)
+                    .await
+                    .unwrap()
+                    .len(),
+                expected
+            );
             let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
                 cursor,
                 window: bounded(0, expected),
@@ -2518,23 +2827,31 @@ mod tests {
             exec::ExecCountDistinctPlan::HashRows,
             exec::ExecCountDistinctPlan::OrderedRows,
         ] {
+            let cursor = exec::ExecCountCursorPlan::Distinct {
+                input: Box::new(exec::ExecCountCursorPlan::InputRows),
+                plan: algorithm,
+            };
+            let rows = vec![
+                ExecutionRow::current(ElementRef::Node(first)),
+                ExecutionRow::current(ElementRef::Node(first)),
+                ExecutionRow::current(ElementRef::Node(second)),
+            ];
+            let mut dependency = Some(ExecutionValue::Stream(rows.clone()));
+            assert_eq!(
+                execution
+                    .count_cursor(&cursor, &mut dependency)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
             let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
-                cursor: exec::ExecCountCursorPlan::Distinct {
-                    input: Box::new(exec::ExecCountCursorPlan::InputRows),
-                    plan: algorithm,
-                },
+                cursor,
                 window: exec::ExecCountWindowPlan::identity(),
             });
             assert_eq!(
                 execution
-                    .execute_count(
-                        ExecutionValue::Stream(vec![
-                            ExecutionRow::current(ElementRef::Node(first)),
-                            ExecutionRow::current(ElementRef::Node(first)),
-                            ExecutionRow::current(ElementRef::Node(second)),
-                        ]),
-                        &plan,
-                    )
+                    .execute_count(ExecutionValue::Stream(rows), &plan)
                     .await
                     .unwrap(),
                 ExecutionValue::Count(2)
@@ -2645,6 +2962,14 @@ mod tests {
                 .count_cursor(&cursor, &mut dependency)
                 .await
                 .is_err());
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor,
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+            assert!(execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                .await
+                .is_err());
         }
     }
 
@@ -2689,6 +3014,14 @@ mod tests {
             let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
             assert!(execution
                 .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor,
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+            assert!(execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
                 .await
                 .is_err());
         }
@@ -2978,6 +3311,15 @@ mod tests {
                 }),
             },
         ] {
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert_eq!(
+                execution
+                    .count_cursor(&cursor, &mut dependency)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
             let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
                 cursor,
                 window: exec::ExecCountWindowPlan::identity(),
@@ -3068,6 +3410,11 @@ mod tests {
             },
         ];
         for cursor in cursors {
+            let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+            assert!(execution
+                .count_cursor(&cursor, &mut dependency)
+                .await
+                .is_err());
             let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
                 cursor,
                 window: window.clone(),
@@ -3322,6 +3669,14 @@ mod tests {
                 .count_cursor(&cursor, &mut dependency)
                 .await
                 .is_err());
+            let plan = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+                cursor,
+                window: exec::ExecCountWindowPlan::identity(),
+            });
+            assert!(execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &plan)
+                .await
+                .is_err());
         }
 
         let mut expired = ExecutionContext::new_scoped_controlled(
@@ -3341,6 +3696,18 @@ mod tests {
         let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
         assert!(expired
             .count_cursor(&exec::ExecCountCursorPlan::EmptyRows, &mut dependency)
+            .await
+            .is_err());
+        let mut dependency = Some(ExecutionValue::Stream(Vec::new()));
+        assert!(expired
+            .count_cursor_cardinality(
+                &exec::ExecCountCursorPlan::EmptyRows,
+                &mut dependency,
+                EvaluatedCountWindow {
+                    skip: 0,
+                    take: None
+                },
+            )
             .await
             .is_err());
     }
@@ -3677,6 +4044,181 @@ mod tests {
         );
     }
 
+    #[cfg_attr(test, tokio::test)]
+    async fn terminal_cursor_counts_avoid_row_output_and_stop_at_the_encoded_threshold() {
+        let db = test_support::open_db_with_config(
+            test_support::in_memory_config("count-terminal-cursor-threshold")
+                .with_equality_index("User", "status"),
+        )
+        .await;
+        let first = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("status", PropertyValue::from("active"))],
+        )
+        .await;
+        let second = test_support::add_node_with_properties(
+            &db,
+            "User",
+            vec![("status", PropertyValue::from("paused"))],
+        )
+        .await;
+        let mut execution = ExecutionContext::new(&db, context::ParamBindings::default());
+        execution.enable_request_read_view().await.unwrap();
+
+        let bitmap = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+            cursor: exec::ExecCountCursorPlan::NodeBitmap(node_point("User", "status", "active")),
+            window: bounded(0, 1),
+        });
+        assert_eq!(
+            execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &bitmap)
+                .await
+                .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        #[cfg(test)]
+        assert_eq!(execution.projection_read_snapshot().property_gets, 0);
+
+        let filter = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+            cursor: exec::ExecCountCursorPlan::Filter {
+                input: Box::new(exec::ExecCountCursorPlan::NodePointReads(
+                    test_support::ids(vec![first, second]),
+                )),
+                predicate: ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+            },
+            window: bounded(0, 1),
+        });
+        assert_eq!(
+            execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &filter)
+                .await
+                .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        #[cfg(test)]
+        {
+            assert_eq!(execution.projection_read_snapshot().property_gets, 1);
+            assert_eq!(execution.projection_read_snapshot().property_decodes, 1);
+        }
+
+        let unbounded_filter = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+            cursor: exec::ExecCountCursorPlan::Filter {
+                input: Box::new(exec::ExecCountCursorPlan::NodePointReads(
+                    test_support::ids(vec![first, second]),
+                )),
+                predicate: ir::PredicatePlan::new(Predicate::eq("status", "active")).unwrap(),
+            },
+            window: exec::ExecCountWindowPlan::identity(),
+        });
+        assert_eq!(
+            execution
+                .execute_count(ExecutionValue::Stream(Vec::new()), &unbounded_filter)
+                .await
+                .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        #[cfg(test)]
+        {
+            assert_eq!(execution.projection_read_snapshot().property_gets, 3);
+            assert_eq!(execution.projection_read_snapshot().property_decodes, 3);
+        }
+
+        let input = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+            cursor: exec::ExecCountCursorPlan::InputRows,
+            window: bounded(1, 1),
+        });
+        assert_eq!(
+            execution
+                .execute_count(
+                    ExecutionValue::Stream(vec![
+                        ExecutionRow::current(ElementRef::Node(first)),
+                        ExecutionRow::current(ElementRef::Node(second)),
+                    ]),
+                    &input,
+                )
+                .await
+                .unwrap(),
+            ExecutionValue::Count(1)
+        );
+        assert!(execution
+            .execute_count(ExecutionValue::Scalars(Vec::new()), &input)
+            .await
+            .is_err());
+
+        let mut consumed = Some(ExecutionValue::Stream(Vec::new()));
+        assert_eq!(
+            execution
+                .count_cursor_cardinality(
+                    &exec::ExecCountCursorPlan::InputRows,
+                    &mut consumed,
+                    EvaluatedCountWindow {
+                        skip: 0,
+                        take: None
+                    },
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(execution
+            .count_cursor_cardinality(
+                &exec::ExecCountCursorPlan::InputRows,
+                &mut consumed,
+                EvaluatedCountWindow {
+                    skip: 0,
+                    take: None
+                },
+            )
+            .await
+            .is_err());
+
+        let positioned_failure = exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
+            cursor: exec::ExecCountCursorPlan::Window {
+                input: Box::new(exec::ExecCountCursorPlan::NodeDynamicEquality {
+                    index: catalog::NodeEqualityIndexMeta::new(test_support::name(
+                        "node_eq:Other:status",
+                    )),
+                    key: catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                    param: test_support::name("missing"),
+                }),
+                window: exec::ExecCountWindowPlan::identity(),
+            },
+            window: exec::ExecCountWindowPlan::identity(),
+        });
+        assert!(execution
+            .execute_count(ExecutionValue::Stream(Vec::new()), &positioned_failure,)
+            .await
+            .is_err());
+
+        #[cfg(test)]
+        {
+            let mut deadline = ExecutionContext::new(&db, context::ParamBindings::default());
+            deadline.fail_deadline_after(2);
+            let mut dependency = Some(ExecutionValue::Stream(vec![ExecutionRow::current(
+                ElementRef::Node(first),
+            )]));
+            assert!(matches!(
+                deadline
+                    .count_cursor_cardinality(
+                        &exec::ExecCountCursorPlan::Filter {
+                            input: Box::new(exec::ExecCountCursorPlan::InputRows),
+                            predicate: ir::PredicatePlan::new(Predicate::eq("status", "active"))
+                                .unwrap(),
+                        },
+                        &mut dependency,
+                        EvaluatedCountWindow {
+                            skip: 0,
+                            take: None,
+                        },
+                    )
+                    .await,
+                Err(HelixDbError::QueryDeadlineExceeded)
+            ));
+        }
+        execution.close_request_read_view().unwrap();
+    }
+
     #[cfg(all(feature = "production-coverage", not(test)))]
     pub(super) async fn run_production_contracts() {
         test_support::run_production_contracts().await;
@@ -3697,5 +4239,6 @@ mod tests {
         bitmap_validation_and_recursive_error_paths_cover_every_exact_variant().await;
         unique_count_performs_one_owner_read_and_one_authoritative_verification().await;
         authoritative_null_count_applies_its_normalized_window_after_matches().await;
+        terminal_cursor_counts_avoid_row_output_and_stop_at_the_encoded_threshold().await;
     }
 }
