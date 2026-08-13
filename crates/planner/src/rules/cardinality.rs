@@ -3630,7 +3630,11 @@ mod tests {
         ];
         for op in &semantic_ops {
             assert!(append_window(exec::ExecCountWindowPlan::identity(), op).is_err());
-            assert!(fold_cursor(exec::ExecCountCursorPlan::NodeFullScan, &[op.clone()]).is_ok());
+            assert!(fold_cursor(
+                exec::ExecCountCursorPlan::NodeFullScan,
+                std::slice::from_ref(op),
+            )
+            .is_ok());
         }
         assert!(matches!(
             fold_cursor(

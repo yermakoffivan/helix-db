@@ -53,9 +53,9 @@ fn access_path_rule_delivers_index_ordering_cardinality_and_locality() {
     assert!(matches!(
         equality.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::EqualityUniqueVerified,
+            access: physical::PhysicalAccess::NodeExact(exact),
             ..
-        }
+        } if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::Unique { .. })
     ));
     assert!(matches!(
         range.delivered.ordering,
@@ -101,11 +101,12 @@ fn access_path_rule_selects_every_exact_equality_physical_family() {
     let indexed = ir::IndexValue::Literal(
         ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::from("active")).unwrap(),
     );
-    assert_eq!(
+    assert!(matches!(
         physical(indexed.clone(), index.clone()).0,
-        physical::PhysicalAccess::EqualityBitmapPoint
-    );
-    assert_eq!(
+        physical::PhysicalAccess::NodeExact(exact)
+            if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::Bitmap { .. })
+    ));
+    assert!(matches!(
         physical(
             indexed,
             index
@@ -113,15 +114,20 @@ fn access_path_rule_selects_every_exact_equality_physical_family() {
                 .with_uniqueness(catalog::IndexUniqueness::Unique),
         )
         .0,
-        physical::PhysicalAccess::EqualityUniqueVerified
-    );
+        physical::PhysicalAccess::NodeExact(exact)
+            if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::Unique { .. })
+    ));
     let (null, null_cardinality) = physical(
         ir::IndexValue::Literal(
             ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::Null).unwrap(),
         ),
         index.clone(),
     );
-    assert_eq!(null, physical::PhysicalAccess::EqualityAuthoritativeScan);
+    assert!(matches!(
+        null,
+        physical::PhysicalAccess::NodeExact(exact)
+            if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::AuthoritativeScan { .. })
+    ));
     assert_eq!(null_cardinality, properties::CardinalityBounds::unknown());
     let (nan, nan_cardinality) = physical(
         ir::IndexValue::Literal(
@@ -129,13 +135,21 @@ fn access_path_rule_selects_every_exact_equality_physical_family() {
         ),
         index.clone(),
     );
-    assert_eq!(nan, physical::PhysicalAccess::Empty);
+    assert!(matches!(
+        nan,
+        physical::PhysicalAccess::NodeExact(exact)
+            if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::Empty)
+    ));
     assert_eq!(nan_cardinality, properties::CardinalityBounds::exact(0));
     let (dynamic, dynamic_cardinality) = physical(
         ir::IndexValue::Param(name("late_status")),
         index.with_uniqueness(catalog::IndexUniqueness::Unique),
     );
-    assert_eq!(dynamic, physical::PhysicalAccess::EqualityDynamic);
+    assert!(matches!(
+        dynamic,
+        physical::PhysicalAccess::NodeExact(exact)
+            if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::DynamicEquality { .. })
+    ));
     assert_eq!(
         dynamic_cardinality,
         properties::CardinalityBounds::unknown()

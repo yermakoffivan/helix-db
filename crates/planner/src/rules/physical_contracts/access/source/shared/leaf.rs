@@ -87,6 +87,7 @@ pub(super) fn label_scan_contract(
 }
 
 pub(super) struct EqualityIndexContractInput<'a> {
+    pub(super) access: physical::PhysicalAccess,
     pub(super) element: properties::ElementKind,
     pub(super) index_id: &'a ir::NonEmptyString,
     pub(super) key: &'a catalog::ScopedPropertyKey,
@@ -100,21 +101,6 @@ pub(super) fn equality_index_contract(
     input: EqualityIndexContractInput<'_>,
     storage: &cost::StorageCostProfile,
 ) -> AccessPhysicalContract {
-    let access = match (input.semantics, input.kind) {
-        (ir::EqualityIndexValueSemantics::NonReflexive, _) => physical::PhysicalAccess::Empty,
-        (ir::EqualityIndexValueSemantics::Indexed, EqualityIndexKind::Unique) => {
-            physical::PhysicalAccess::EqualityUniqueVerified
-        }
-        (ir::EqualityIndexValueSemantics::Indexed, EqualityIndexKind::NonUnique) => {
-            physical::PhysicalAccess::EqualityBitmapPoint
-        }
-        (ir::EqualityIndexValueSemantics::AuthoritativeNull, _) => {
-            physical::PhysicalAccess::EqualityAuthoritativeScan
-        }
-        (ir::EqualityIndexValueSemantics::RuntimeDependent, _) => {
-            physical::PhysicalAccess::EqualityDynamic
-        }
-    };
     let rows = match input.semantics {
         ir::EqualityIndexValueSemantics::NonReflexive => cost::EstimatedRows::ZERO,
         ir::EqualityIndexValueSemantics::Indexed
@@ -152,7 +138,7 @@ pub(super) fn equality_index_contract(
         && input.semantics == ir::EqualityIndexValueSemantics::Indexed
     {
         AccessPhysicalContract::new_batchable_equality(
-            access,
+            input.access,
             delivered,
             id_cost,
             storage.secondary_row_materialization(rows),
@@ -162,7 +148,7 @@ pub(super) fn equality_index_contract(
         )
     } else {
         AccessPhysicalContract::new_secondary(
-            access,
+            input.access,
             delivered,
             id_cost,
             storage.secondary_row_materialization(rows),

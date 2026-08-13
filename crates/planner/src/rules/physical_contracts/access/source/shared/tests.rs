@@ -42,12 +42,22 @@ impl AccessSourceFamily for TestFamily {
         match plan {
             TestPlan::Empty => AccessSourceParts::Empty,
             TestPlan::UniqueEquality(key) => AccessSourceParts::EqualityIndex {
+                access: test_equality_access(
+                    catalog::NodeEqualityIndexMeta::try_new(TEST_INDEX_ID.as_ref())
+                        .unwrap()
+                        .with_uniqueness(catalog::IndexUniqueness::Unique),
+                    key,
+                ),
                 index_id: &TEST_INDEX_ID,
                 key,
                 kind: EqualityIndexKind::Unique,
                 semantics: ir::EqualityIndexValueSemantics::Indexed,
             },
             TestPlan::NonUniqueEquality { index_id, key } => AccessSourceParts::EqualityIndex {
+                access: test_equality_access(
+                    catalog::NodeEqualityIndexMeta::try_new(index_id.as_ref()).unwrap(),
+                    key,
+                ),
                 index_id,
                 key,
                 kind: EqualityIndexKind::NonUnique,
@@ -81,6 +91,22 @@ impl AccessSourceFamily for TestFamily {
     ) -> Option<u64> {
         stats.node_range_cardinality.get(key).copied()
     }
+}
+
+fn test_equality_access(
+    index: catalog::NodeEqualityIndexMeta,
+    key: &catalog::ScopedPropertyKey,
+) -> crate::physical::PhysicalAccess {
+    crate::physical::PhysicalAccess::NodeExact(Box::new(exec::ExecNodeAccessPlan::exact_equality(
+        index,
+        key.clone(),
+        ir::IndexValue::Literal(
+            ir::SecondaryIndexLiteral::new(helix_ast::value::PropertyValue::from(
+                "test@example.com",
+            ))
+            .unwrap(),
+        ),
+    )))
 }
 
 fn eq_key() -> catalog::ScopedPropertyKey {

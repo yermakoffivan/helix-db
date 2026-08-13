@@ -79,9 +79,9 @@ fn seed_rule_set_explores_catalog_indexed_access_filters_before_implementation()
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::EqualityBitmapPoint,
+            access: physical::PhysicalAccess::NodeExact(exact),
             ..
-        }
+        } if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::Bitmap { .. })
     ));
 }
 
@@ -122,9 +122,14 @@ fn seed_rule_set_explores_catalog_indexed_access_filter_intersections() {
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::SetIntersection,
+            access: physical::PhysicalAccess::NodeExact(exact),
             ..
-        }
+        } if matches!(
+            exact.as_ref(),
+            exec::ExecNodeAccessPlan::SecondarySet {
+                set: exec::ExecNodeSecondarySetPlan::OrderedIntersect { .. }
+            }
+        )
     ));
 }
 
@@ -162,8 +167,15 @@ fn seed_rule_set_explores_catalog_indexed_access_filter_unions() {
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::BitmapBatchUnion,
+            access: physical::PhysicalAccess::NodeExact(exact),
             ..
-        }
+        } if matches!(
+            exact.as_ref(),
+            exec::ExecNodeAccessPlan::SecondarySet {
+                set: exec::ExecNodeSecondarySetPlan::Bitmap(
+                    exec::ExecNodeBitmapExpr::BatchedUnionRead { .. }
+                )
+            }
+        )
     ));
 }

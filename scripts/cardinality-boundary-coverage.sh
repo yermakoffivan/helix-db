@@ -14,12 +14,21 @@ case "$SHARD" in
             crates/planner/src/exec/access/node.rs
             crates/planner/src/exec/count.rs
             crates/planner/src/exec/lowering/secondary_set.rs
+            crates/planner/src/exec/selected/lowering/access/leaf.rs
             crates/planner/src/exec/selected/lowering/count.rs
             crates/planner/src/exec/selected/lowering/contracts/matching/access/source/edge.rs
             crates/planner/src/exec/selected/lowering/contracts/matching/access/source/node.rs
+            crates/planner/src/physical/access.rs
             crates/planner/src/physical/cardinality.rs
+            crates/planner/src/planning/selected/native/equality_bindings.rs
+            crates/planner/src/planning/selected/native/pipeline/ops/filter.rs
+            crates/planner/src/planning/selected/native/source/lowering/stream.rs
+            crates/planner/src/planning/selected/native/stream/accumulator/ops.rs
             crates/planner/src/rules/cardinality.rs
-            crates/planner/src/rules/physical_contracts/access/sets.rs
+            crates/planner/src/rules/physical_contracts/access/contract.rs
+            crates/planner/src/rules/physical_contracts/access/source/edge.rs
+            crates/planner/src/rules/physical_contracts/access/source/node.rs
+            crates/planner/src/rules/physical_contracts/access/source/shared/dispatch.rs
             crates/planner/src/rules/physical_contracts/access/source/shared/leaf.rs
         )
         ;;

@@ -1,6 +1,55 @@
 use crate::planning::tests::support::*;
 
 #[test]
+fn ordinary_request_equality_parameters_are_specialized_before_selection() {
+    let indexes = builtin_label_indexes()
+        .with_node_eq(ScopedPropertyKey::try_new("Audit", "event_id").unwrap())
+        .with_edge_eq(ScopedPropertyKey::try_new("MENTIONS", "event_id").unwrap());
+    let mut planner_ctx = ctx(indexes);
+    planner_ctx.params = ParamBindings::default()
+        .with_query_value(
+            NonEmptyString::new("node_event").unwrap(),
+            QueryValue::String("evt-node".to_owned()),
+        )
+        .with_query_value(
+            NonEmptyString::new("edge_event").unwrap(),
+            QueryValue::String("evt-edge".to_owned()),
+        );
+    let batch = read_batch()
+        .var_as(
+            "node",
+            g().n_with_label_where("Audit", Predicate::eq_param("event_id", "node_event")),
+        )
+        .var_as(
+            "edge",
+            g().e_with_label_where("MENTIONS", Predicate::eq_param("event_id", "edge_event")),
+        )
+        .returning(["node", "edge"]);
+
+    let plan = crate::planning::plan_read_batch(&batch, &planner_ctx).unwrap();
+    assert!(matches!(
+        &plan.steps()[0].op,
+        ExecOp::Access { plan }
+            if matches!(
+                plan.as_ref(),
+                ExecAccessPlan::Node(ExecNodeAccessPlan::Bitmap {
+                    bitmap: crate::exec::ExecNodeBitmapExpr::PointRead { value, .. },
+                }) if value.literal().as_property_value() == &PropertyValue::from("evt-node")
+            )
+    ));
+    assert!(matches!(
+        &plan.steps()[1].op,
+        ExecOp::Access { plan }
+            if matches!(
+                plan.as_ref(),
+                ExecAccessPlan::Edge(ExecEdgeAccessPlan::Bitmap {
+                    bitmap: crate::exec::ExecEdgeBitmapExpr::PointRead { value, .. },
+                }) if value.literal().as_property_value() == &PropertyValue::from("evt-edge")
+            )
+    ));
+}
+
+#[test]
 fn cascades_batch_conditions_preserve_selected_index_runs_and_dependencies() {
     let indexes = builtin_label_indexes()
         .with_node_eq(ScopedPropertyKey::try_new("Audit", "event_id").unwrap());

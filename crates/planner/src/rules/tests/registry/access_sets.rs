@@ -104,9 +104,9 @@ fn seed_rule_set_explores_equality_range_intersection_before_access_implementati
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::EqualityBitmapPoint,
+            access: physical::PhysicalAccess::NodeExact(exact),
             ..
-        }
+        } if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::Bitmap { .. })
     ));
 }
 
@@ -212,8 +212,8 @@ fn seed_rule_set_explores_access_subsumption_before_access_implementation() {
     assert!(matches!(
         &best.expr,
         physical::PhysicalExpr::Access {
-            access: physical::PhysicalAccess::EqualityBitmapPoint,
+            access: physical::PhysicalAccess::NodeExact(exact),
             ..
-        }
+        } if matches!(exact.as_ref(), exec::ExecNodeAccessPlan::Bitmap { .. })
     ));
 }

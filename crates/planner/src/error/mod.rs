@@ -59,6 +59,18 @@ pub enum PlannerError {
         /// Debug rendering of the non-literal expression.
         expression: String,
     },
+    /// An equality parameter was not bound when its algorithm had to be selected.
+    #[error("missing planning equality parameter `{param}`")]
+    MissingPlanningEqualityParameter {
+        /// Missing parameter name.
+        param: NonEmptyString,
+    },
+    /// A bound equality value cannot be represented by a secondary-index literal.
+    #[error("unsupported planning equality parameter `{param}`")]
+    UnsupportedPlanningEqualityParameter {
+        /// Unsupported parameter name.
+        param: NonEmptyString,
+    },
     /// Required search index does not exist.
     #[error("missing {element:?} {kind} index for `{label}.{property}`")]
     MissingSearchIndex {

@@ -34,7 +34,7 @@ use self::costing::parallel_merge_cost;
 pub(in crate::exec) use self::costing::{
     edge_access_cost, foreach_subplan_cost, node_access_cost, predicate_cost_for_rows,
 };
-pub(in crate::exec) use self::secondary_set::{edge_secondary_set, node_secondary_set};
+pub(crate) use self::secondary_set::{edge_secondary_set, node_secondary_set};
 
 pub(in crate::exec) struct ExecutableDagBuilder<'a> {
     pub(in crate::exec) profile: &'a cost::StorageCostProfile,

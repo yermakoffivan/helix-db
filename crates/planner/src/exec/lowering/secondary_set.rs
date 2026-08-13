@@ -5,7 +5,7 @@
 
 use crate::{exec, ir};
 
-pub(in crate::exec) fn node_secondary_set(
+pub(crate) fn node_secondary_set(
     plan: &ir::NodeAccessPlan,
 ) -> Option<exec::ExecNodeSecondarySetPlan> {
     match plan {
@@ -65,7 +65,7 @@ pub(in crate::exec) fn node_secondary_set(
     }
 }
 
-pub(in crate::exec) fn edge_secondary_set(
+pub(crate) fn edge_secondary_set(
     plan: &ir::EdgeAccessPlan,
 ) -> Option<exec::ExecEdgeSecondarySetPlan> {
     match plan {

@@ -1,6 +1,6 @@
 use crate::{catalog, cost, ir, physical, properties};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(in crate::rules) struct AccessPhysicalContract {
     pub(in crate::rules) access: physical::PhysicalAccess,
     pub(in crate::rules) delivered: properties::DeliveredProperties,
@@ -28,6 +28,11 @@ enum SecondaryIdSource {
 }
 
 impl AccessPhysicalContract {
+    pub(in crate::rules) fn with_access(mut self, access: physical::PhysicalAccess) -> Self {
+        self.access = access;
+        self
+    }
+
     pub(in crate::rules) fn new(
         access: physical::PhysicalAccess,
         delivered: properties::DeliveredProperties,
