@@ -1129,13 +1129,37 @@ fn node_intersection_count_plans(
     window: exec::ExecCountWindowPlan,
     rule: &optimizer::RuleInput<'_>,
 ) -> Result<Vec<exec::ExecCountPlan>, RuleRejection> {
-    if let Some(bitmap) = node_bitmap_set(children, false, rule)? {
-        return Ok(vec![exec::ExecCountPlan::NodeBitmap(
-            exec::ExecNodeBitmapCountPlan { bitmap, window },
-        )]);
+    let bitmaps = children
+        .iter()
+        .map(|child| node_bitmap_expr(child.as_ref(), rule))
+        .collect::<Result<Option<Vec<_>>, _>>()?;
+    if let Some(bitmaps) = bitmaps {
+        let bitmaps = ir::AtLeast::<_, 1>::try_from_vec(bitmaps)
+            .expect("an intersection has at least two bitmap children");
+        return Ok(planner_selected_orders(
+            &bitmaps,
+            set_order_alternative_limit(rule.planner_limits),
+        )
+        .into_iter()
+        .map(|order| {
+            let (driver, rest) = order.into_first_and_rest();
+            exec::ExecCountPlan::NodeBitmap(exec::ExecNodeBitmapCountPlan {
+                bitmap: exec::ExecNodeBitmapExpr::Intersect {
+                    driver: Box::new(driver),
+                    rest: ir::AtLeast::try_from_vec(rest)
+                        .expect("a bitmap intersection retains at least one child"),
+                },
+                window: window.clone(),
+            })
+        })
+        .collect());
     }
     let mut alternatives = Vec::new();
+    let alternative_limit = set_order_alternative_limit(rule.planner_limits);
     for (driver_index, child) in children.iter().enumerate() {
+        if alternatives.len() >= alternative_limit {
+            break;
+        }
         let ir::NodeAccessPlan::RangeIndex { index, key, range } = child.as_ref() else {
             continue;
         };
@@ -1148,17 +1172,22 @@ fn node_intersection_count_plans(
         let Some(filters) = filters else { continue };
         let filters = ir::AtLeast::<_, 1>::try_from_vec(filters)
             .expect("a range-driver intersection retains at least one bitmap filter");
-        alternatives.push(exec::ExecCountPlan::NodeRange(
-            exec::ExecNodeRangeCountPlan {
-                driver: exec::ExecNodeVerifiedRangeScanPlan {
-                    index: index.clone(),
-                    key: key.clone(),
-                    range: range.clone(),
-                },
-                membership: exec::ExecNodeRangeMembershipPlan::BitmapFilters(filters),
-                window: window.clone(),
-            },
-        ));
+        let remaining = alternative_limit.saturating_sub(alternatives.len());
+        alternatives.extend(
+            planner_selected_orders(&filters, remaining)
+                .into_iter()
+                .map(|filters| {
+                    exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
+                        driver: exec::ExecNodeVerifiedRangeScanPlan {
+                            index: index.clone(),
+                            key: key.clone(),
+                            range: range.clone(),
+                        },
+                        membership: exec::ExecNodeRangeMembershipPlan::BitmapFilters(filters),
+                        window: window.clone(),
+                    })
+                }),
+        );
     }
     if alternatives.is_empty() {
         alternatives.push(exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
@@ -1174,13 +1203,37 @@ fn edge_intersection_count_plans(
     window: exec::ExecCountWindowPlan,
     rule: &optimizer::RuleInput<'_>,
 ) -> Result<Vec<exec::ExecCountPlan>, RuleRejection> {
-    if let Some(bitmap) = edge_bitmap_set(children, false, rule)? {
-        return Ok(vec![exec::ExecCountPlan::EdgeBitmap(
-            exec::ExecEdgeBitmapCountPlan { bitmap, window },
-        )]);
+    let bitmaps = children
+        .iter()
+        .map(|child| edge_bitmap_expr(child.as_ref(), rule))
+        .collect::<Result<Option<Vec<_>>, _>>()?;
+    if let Some(bitmaps) = bitmaps {
+        let bitmaps = ir::AtLeast::<_, 1>::try_from_vec(bitmaps)
+            .expect("an intersection has at least two bitmap children");
+        return Ok(planner_selected_orders(
+            &bitmaps,
+            set_order_alternative_limit(rule.planner_limits),
+        )
+        .into_iter()
+        .map(|order| {
+            let (driver, rest) = order.into_first_and_rest();
+            exec::ExecCountPlan::EdgeBitmap(exec::ExecEdgeBitmapCountPlan {
+                bitmap: exec::ExecEdgeBitmapExpr::Intersect {
+                    driver: Box::new(driver),
+                    rest: ir::AtLeast::try_from_vec(rest)
+                        .expect("a bitmap intersection retains at least one child"),
+                },
+                window: window.clone(),
+            })
+        })
+        .collect());
     }
     let mut alternatives = Vec::new();
+    let alternative_limit = set_order_alternative_limit(rule.planner_limits);
     for (driver_index, child) in children.iter().enumerate() {
+        if alternatives.len() >= alternative_limit {
+            break;
+        }
         let ir::EdgeAccessPlan::RangeIndex { index, key, range } = child.as_ref() else {
             continue;
         };
@@ -1193,17 +1246,22 @@ fn edge_intersection_count_plans(
         let Some(filters) = filters else { continue };
         let filters = ir::AtLeast::<_, 1>::try_from_vec(filters)
             .expect("a range-driver intersection retains at least one bitmap filter");
-        alternatives.push(exec::ExecCountPlan::EdgeRange(
-            exec::ExecEdgeRangeCountPlan {
-                driver: exec::ExecEdgeVerifiedRangeScanPlan {
-                    index: index.clone(),
-                    key: key.clone(),
-                    range: range.clone(),
-                },
-                membership: exec::ExecEdgeRangeMembershipPlan::BitmapFilters(filters),
-                window: window.clone(),
-            },
-        ));
+        let remaining = alternative_limit.saturating_sub(alternatives.len());
+        alternatives.extend(
+            planner_selected_orders(&filters, remaining)
+                .into_iter()
+                .map(|filters| {
+                    exec::ExecCountPlan::EdgeRange(exec::ExecEdgeRangeCountPlan {
+                        driver: exec::ExecEdgeVerifiedRangeScanPlan {
+                            index: index.clone(),
+                            key: key.clone(),
+                            range: range.clone(),
+                        },
+                        membership: exec::ExecEdgeRangeMembershipPlan::BitmapFilters(filters),
+                        window: window.clone(),
+                    })
+                }),
+        );
     }
     if alternatives.is_empty() {
         alternatives.push(exec::ExecCountPlan::Stream(exec::ExecCountStreamPlan {
@@ -1212,6 +1270,27 @@ fn edge_intersection_count_plans(
         }));
     }
     Ok(alternatives)
+}
+
+fn set_order_alternative_limit(limits: &context::PlannerLimits) -> usize {
+    match limits.max_index_union_branches {
+        context::IndexUnionBranchLimit::Disabled => 1,
+        context::IndexUnionBranchLimit::Limited(limit) => limit.get(),
+    }
+}
+
+fn planner_selected_orders<T: Clone>(
+    values: &ir::AtLeast<T, 1>,
+    limit: usize,
+) -> Vec<ir::AtLeast<T, 1>> {
+    (0..values.len().min(limit))
+        .map(|driver_index| {
+            let mut order = values.as_ref().to_vec();
+            let driver = order.remove(driver_index);
+            order.insert(0, driver);
+            ir::AtLeast::try_from_vec(order).expect("a planner-selected order stays non-empty")
+        })
+        .collect()
 }
 
 fn count_cost(
@@ -1226,20 +1305,8 @@ fn count_cost(
         exec::ExecCountPlan::NodeUnique(plan) => storage.unique_equality_lookup(
             storage.unique_equality_rows(stats.node_eq_cardinality.get(&plan.lookup.key).copied()),
         ),
-        exec::ExecCountPlan::NodeRange(plan) => storage.secondary_range_lookup(
-            stats
-                .node_range_cardinality
-                .get(&plan.driver.key)
-                .copied()
-                .map_or(storage.default_range_index_rows, cost::EstimatedRows::rows),
-        ),
-        exec::ExecCountPlan::EdgeRange(plan) => storage.secondary_range_lookup(
-            stats
-                .edge_range_cardinality
-                .get(&plan.driver.key)
-                .copied()
-                .map_or(storage.default_range_index_rows, cost::EstimatedRows::rows),
-        ),
+        exec::ExecCountPlan::NodeRange(plan) => node_range_count_cost(plan, stats, storage),
+        exec::ExecCountPlan::EdgeRange(plan) => edge_range_count_cost(plan, stats, storage),
         exec::ExecCountPlan::NodeAuthoritativeScan(plan) => {
             storage.null_equality_scan(node_scan_rows(&plan.predicate, stats, storage))
         }
@@ -1308,13 +1375,27 @@ fn node_bitmap_cost(
                 cost::EstimatedRows::rows(rows.as_rows().saturating_mul(values.len() as u64)),
             )
         }
-        exec::ExecNodeBitmapExpr::Union { driver, rest }
-        | exec::ExecNodeBitmapExpr::Intersect { driver, rest } => {
+        exec::ExecNodeBitmapExpr::Union { driver, rest } => {
+            let mut rows = node_bitmap_rows(driver, stats, storage);
             rest.iter()
                 .fold(node_bitmap_cost(driver, stats, storage), |cost, child| {
-                    cost.serial(node_bitmap_cost(child, stats, storage)).serial(
-                        storage.secondary_set_operation(storage.default_equality_index_rows),
-                    )
+                    let child_rows = node_bitmap_rows(child, stats, storage);
+                    rows = cost::EstimatedRows::rows(
+                        rows.as_rows().saturating_add(child_rows.as_rows()),
+                    );
+                    cost.serial(node_bitmap_cost(child, stats, storage))
+                        .serial(storage.secondary_set_operation(rows))
+                })
+        }
+        exec::ExecNodeBitmapExpr::Intersect { driver, rest } => {
+            let mut rows = node_bitmap_rows(driver, stats, storage);
+            rest.iter()
+                .fold(node_bitmap_cost(driver, stats, storage), |cost, child| {
+                    let child_rows = node_bitmap_rows(child, stats, storage);
+                    let operation_rows = rows;
+                    rows = cost::EstimatedRows::rows(rows.as_rows().min(child_rows.as_rows()));
+                    cost.serial(node_bitmap_cost(child, stats, storage))
+                        .serial(storage.secondary_set_operation(operation_rows))
                 })
         }
     }
@@ -1342,16 +1423,213 @@ fn edge_bitmap_cost(
                 cost::EstimatedRows::rows(rows.as_rows().saturating_mul(values.len() as u64)),
             )
         }
-        exec::ExecEdgeBitmapExpr::Union { driver, rest }
-        | exec::ExecEdgeBitmapExpr::Intersect { driver, rest } => {
+        exec::ExecEdgeBitmapExpr::Union { driver, rest } => {
+            let mut rows = edge_bitmap_rows(driver, stats, storage);
             rest.iter()
                 .fold(edge_bitmap_cost(driver, stats, storage), |cost, child| {
-                    cost.serial(edge_bitmap_cost(child, stats, storage)).serial(
-                        storage.secondary_set_operation(storage.default_equality_index_rows),
-                    )
+                    let child_rows = edge_bitmap_rows(child, stats, storage);
+                    rows = cost::EstimatedRows::rows(
+                        rows.as_rows().saturating_add(child_rows.as_rows()),
+                    );
+                    cost.serial(edge_bitmap_cost(child, stats, storage))
+                        .serial(storage.secondary_set_operation(rows))
+                })
+        }
+        exec::ExecEdgeBitmapExpr::Intersect { driver, rest } => {
+            let mut rows = edge_bitmap_rows(driver, stats, storage);
+            rest.iter()
+                .fold(edge_bitmap_cost(driver, stats, storage), |cost, child| {
+                    let child_rows = edge_bitmap_rows(child, stats, storage);
+                    let operation_rows = rows;
+                    rows = cost::EstimatedRows::rows(rows.as_rows().min(child_rows.as_rows()));
+                    cost.serial(edge_bitmap_cost(child, stats, storage))
+                        .serial(storage.secondary_set_operation(operation_rows))
                 })
         }
     }
+}
+
+fn node_bitmap_rows(
+    bitmap: &exec::ExecNodeBitmapExpr,
+    stats: &context::StatsSnapshot,
+    storage: &cost::StorageCostProfile,
+) -> cost::EstimatedRows {
+    match bitmap {
+        exec::ExecNodeBitmapExpr::PointRead { key, .. } => {
+            storage.equality_index_rows(stats.node_eq_cardinality.get(key).copied())
+        }
+        exec::ExecNodeBitmapExpr::BatchedUnionRead { key, values, .. } => {
+            let rows = storage
+                .equality_index_rows(stats.node_eq_cardinality.get(key).copied())
+                .as_rows();
+            cost::EstimatedRows::rows(rows.saturating_mul(values.len() as u64))
+        }
+        exec::ExecNodeBitmapExpr::Union { driver, rest } => {
+            let rows = rest.iter().fold(
+                node_bitmap_rows(driver, stats, storage).as_rows(),
+                |rows, child| {
+                    rows.saturating_add(node_bitmap_rows(child, stats, storage).as_rows())
+                },
+            );
+            cost::EstimatedRows::rows(rows)
+        }
+        exec::ExecNodeBitmapExpr::Intersect { driver, rest } => {
+            let rows = rest.iter().fold(
+                node_bitmap_rows(driver, stats, storage).as_rows(),
+                |rows, child| rows.min(node_bitmap_rows(child, stats, storage).as_rows()),
+            );
+            cost::EstimatedRows::rows(rows)
+        }
+    }
+}
+
+fn edge_bitmap_rows(
+    bitmap: &exec::ExecEdgeBitmapExpr,
+    stats: &context::StatsSnapshot,
+    storage: &cost::StorageCostProfile,
+) -> cost::EstimatedRows {
+    match bitmap {
+        exec::ExecEdgeBitmapExpr::PointRead { key, .. } => {
+            storage.equality_index_rows(stats.edge_eq_cardinality.get(key).copied())
+        }
+        exec::ExecEdgeBitmapExpr::BatchedUnionRead { key, values, .. } => {
+            let rows = storage
+                .equality_index_rows(stats.edge_eq_cardinality.get(key).copied())
+                .as_rows();
+            cost::EstimatedRows::rows(rows.saturating_mul(values.len() as u64))
+        }
+        exec::ExecEdgeBitmapExpr::Union { driver, rest } => {
+            let rows = rest.iter().fold(
+                edge_bitmap_rows(driver, stats, storage).as_rows(),
+                |rows, child| {
+                    rows.saturating_add(edge_bitmap_rows(child, stats, storage).as_rows())
+                },
+            );
+            cost::EstimatedRows::rows(rows)
+        }
+        exec::ExecEdgeBitmapExpr::Intersect { driver, rest } => {
+            let rows = rest.iter().fold(
+                edge_bitmap_rows(driver, stats, storage).as_rows(),
+                |rows, child| rows.min(edge_bitmap_rows(child, stats, storage).as_rows()),
+            );
+            cost::EstimatedRows::rows(rows)
+        }
+    }
+}
+
+fn node_range_count_cost(
+    plan: &exec::ExecNodeRangeCountPlan,
+    stats: &context::StatsSnapshot,
+    storage: &cost::StorageCostProfile,
+) -> cost::CostVector {
+    let driver_rows = stats
+        .node_range_cardinality
+        .get(&plan.driver.key)
+        .copied()
+        .map_or(storage.default_range_index_rows, cost::EstimatedRows::rows);
+    let filters = match &plan.membership {
+        exec::ExecNodeRangeMembershipPlan::All => Vec::new(),
+        exec::ExecNodeRangeMembershipPlan::BitmapFilters(filters) => filters
+            .iter()
+            .map(|filter| {
+                (
+                    node_bitmap_cost(filter, stats, storage),
+                    node_bitmap_rows(filter, stats, storage),
+                )
+            })
+            .collect(),
+    };
+    verified_range_count_cost(driver_rows, &filters, &plan.window, storage)
+}
+
+fn edge_range_count_cost(
+    plan: &exec::ExecEdgeRangeCountPlan,
+    stats: &context::StatsSnapshot,
+    storage: &cost::StorageCostProfile,
+) -> cost::CostVector {
+    let driver_rows = stats
+        .edge_range_cardinality
+        .get(&plan.driver.key)
+        .copied()
+        .map_or(storage.default_range_index_rows, cost::EstimatedRows::rows);
+    let filters = match &plan.membership {
+        exec::ExecEdgeRangeMembershipPlan::All => Vec::new(),
+        exec::ExecEdgeRangeMembershipPlan::BitmapFilters(filters) => filters
+            .iter()
+            .map(|filter| {
+                (
+                    edge_bitmap_cost(filter, stats, storage),
+                    edge_bitmap_rows(filter, stats, storage),
+                )
+            })
+            .collect(),
+    };
+    verified_range_count_cost(driver_rows, &filters, &plan.window, storage)
+}
+
+fn verified_range_count_cost(
+    driver_rows: cost::EstimatedRows,
+    filters: &[(cost::CostVector, cost::EstimatedRows)],
+    window: &exec::ExecCountWindowPlan,
+    storage: &cost::StorageCostProfile,
+) -> cost::CostVector {
+    let accepted_rows = filters
+        .iter()
+        .fold(driver_rows.as_rows(), |rows, (_, filter)| {
+            apply_membership_selectivity(rows, filter.as_rows(), driver_rows.as_rows())
+        });
+    let scanned_rows = static_window_threshold(window).map_or(driver_rows.as_rows(), |threshold| {
+        if threshold == 0 {
+            return 0;
+        }
+        if accepted_rows == 0 {
+            return driver_rows.as_rows();
+        }
+        let threshold = u64::try_from(threshold).unwrap_or(u64::MAX);
+        threshold
+            .saturating_mul(driver_rows.as_rows())
+            .saturating_add(accepted_rows.saturating_sub(1))
+            .checked_div(accepted_rows)
+            .unwrap_or(u64::MAX)
+            .min(driver_rows.as_rows())
+    });
+    let mut total = filters
+        .iter()
+        .fold(cost::CostVector::ZERO, |total, (filter, _)| {
+            total.serial(*filter)
+        });
+    if scanned_rows > 0 {
+        total =
+            total.serial(storage.secondary_range_lookup(cost::EstimatedRows::rows(scanned_rows)));
+    }
+    let mut candidates = scanned_rows;
+    for (_, filter_rows) in filters {
+        total =
+            total.serial(storage.secondary_set_operation(cost::EstimatedRows::rows(candidates)));
+        candidates =
+            apply_membership_selectivity(candidates, filter_rows.as_rows(), driver_rows.as_rows());
+    }
+    total
+}
+
+fn apply_membership_selectivity(rows: u64, filter_rows: u64, driver_rows: u64) -> u64 {
+    if driver_rows == 0 {
+        return 0;
+    }
+    let filter_rows = filter_rows.min(driver_rows);
+    let numerator = u128::from(rows).saturating_mul(u128::from(filter_rows));
+    let rounded = numerator.saturating_add(u128::from(driver_rows.saturating_sub(1)))
+        / u128::from(driver_rows);
+    u64::try_from(rounded).unwrap_or(u64::MAX)
+}
+
+fn static_window_threshold(window: &exec::ExecCountWindowPlan) -> Option<usize> {
+    let exec::ExecCountTake::AtMost(take) = &window.take else {
+        return None;
+    };
+    let skip = window.skip.evaluate(&mut |_| Err(())).ok()?;
+    let take = take.evaluate(&mut |_| Err(())).ok()?;
+    Some(skip.saturating_add(take))
 }
 
 fn cursor_cost(
@@ -2103,7 +2381,7 @@ mod tests {
             })
         ));
 
-        let [intersection] = plans(apply(
+        let intersections = plans(apply(
             access(edge_path(ir::EdgeAccessPlan::Intersect(
                 ir::AtLeast::from_pair(
                     edge_source("likes_weight", "weight", 1),
@@ -2112,16 +2390,15 @@ mod tests {
             ))),
             context::ParamBindings::default(),
             BTreeSet::new(),
-        ))
-        .try_into()
-        .unwrap();
-        assert!(matches!(
+        ));
+        assert_eq!(intersections.len(), 2);
+        assert!(intersections.iter().all(|intersection| matches!(
             intersection,
             exec::ExecCountPlan::EdgeBitmap(exec::ExecEdgeBitmapCountPlan {
                 bitmap: exec::ExecEdgeBitmapExpr::Intersect { .. },
                 ..
             })
-        ));
+        )));
 
         let range = ir::EdgeAccessSourcePlan::new(edge_range_plan()).unwrap();
         let [range_driven] = plans(apply(
@@ -2158,19 +2435,17 @@ mod tests {
             ))
             .unwrap()
         };
-        let [node_intersection] = plans(apply(
+        let node_intersections = plans(apply(
             access(node_path(ir::NodeAccessPlan::Intersect(
                 ir::AtLeast::from_pair(node_bitmap(1), node_bitmap(2)),
             ))),
             context::ParamBindings::default(),
             BTreeSet::new(),
-        ))
-        .try_into()
-        .unwrap();
-        assert!(matches!(
-            node_intersection,
-            exec::ExecCountPlan::NodeBitmap(_)
         ));
+        assert_eq!(node_intersections.len(), 2);
+        assert!(node_intersections
+            .iter()
+            .all(|plan| matches!(plan, exec::ExecCountPlan::NodeBitmap(_))));
 
         let [node_materialized] = plans(apply(
             access(node_path(ir::NodeAccessPlan::Intersect(
@@ -2241,6 +2516,306 @@ mod tests {
         assert_eq!(
             plan.window.take,
             exec::ExecCountTake::AtMost(exec::ExecUsizeExpr::Literal(10))
+        );
+    }
+
+    #[test]
+    fn bitmap_intersection_alternatives_are_costed_in_planner_selected_order() {
+        let child = |index: &str, property: &str| {
+            ir::NodeAccessSourcePlan::new(node_equality(
+                index,
+                property,
+                literal(PropertyValue::I64(1)),
+                catalog::IndexUniqueness::NonUnique,
+            ))
+            .unwrap()
+        };
+        let children = ir::AtLeast::from_pair_and_rest(
+            child("user_wide", "wide"),
+            child("user_medium", "medium"),
+            vec![child("user_narrow", "narrow")],
+        );
+        let alternatives = with_rule_input(|rule| {
+            node_intersection_count_plans(&children, exec::ExecCountWindowPlan::identity(), rule)
+                .unwrap()
+        });
+        assert_eq!(alternatives.len(), 3);
+
+        let storage = cost::StorageCostProfile::default();
+        for (wide, medium, narrow, expected) in [
+            (1, 10, 100, "wide"),
+            (100, 1, 10, "medium"),
+            (10, 100, 1, "narrow"),
+        ] {
+            let stats = context::StatsSnapshot::default()
+                .with_node_eq_cardinality(
+                    catalog::ScopedPropertyKey::try_new("User", "wide").unwrap(),
+                    wide,
+                )
+                .with_node_eq_cardinality(
+                    catalog::ScopedPropertyKey::try_new("User", "medium").unwrap(),
+                    medium,
+                )
+                .with_node_eq_cardinality(
+                    catalog::ScopedPropertyKey::try_new("User", "narrow").unwrap(),
+                    narrow,
+                );
+            let winner = alternatives
+                .iter()
+                .min_by_key(|plan| count_cost(plan, &stats, &storage).latency)
+                .unwrap();
+            let exec::ExecCountPlan::NodeBitmap(exec::ExecNodeBitmapCountPlan {
+                bitmap: exec::ExecNodeBitmapExpr::Intersect { driver, .. },
+                ..
+            }) = winner
+            else {
+                panic!("expected a bitmap intersection alternative")
+            };
+            assert!(matches!(
+                driver.as_ref(),
+                exec::ExecNodeBitmapExpr::PointRead { key, .. }
+                    if key.property.as_ref() == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn verified_range_costs_membership_order_and_literal_early_stopping() {
+        let range_key =
+            catalog::ScopedPropertyDirectionKey::try_new("User", "age", RangeIndexDirection::Asc)
+                .unwrap();
+        let range = ir::NodeAccessSourcePlan::new(ir::NodeAccessPlan::RangeIndex {
+            index: catalog::NodeRangeIndexMeta::try_new("user_age").unwrap(),
+            key: range_key.clone(),
+            range: ir::IndexRange::All,
+        })
+        .unwrap();
+        let filter = |index: &str, property: &str| {
+            ir::NodeAccessSourcePlan::new(node_equality(
+                index,
+                property,
+                literal(PropertyValue::Bool(true)),
+                catalog::IndexUniqueness::NonUnique,
+            ))
+            .unwrap()
+        };
+        let children = ir::AtLeast::from_pair_and_rest(
+            range,
+            filter("user_wide", "wide"),
+            vec![filter("user_narrow", "narrow")],
+        );
+        let window = exec::ExecCountWindowPlan::identity()
+            .then_skip(exec::ExecUsizeExpr::literal(20))
+            .then_limit(exec::ExecUsizeExpr::literal(5));
+        let alternatives =
+            with_rule_input(|rule| node_intersection_count_plans(&children, window, rule).unwrap());
+        assert_eq!(alternatives.len(), 2);
+
+        let stats = context::StatsSnapshot::default()
+            .with_node_range_cardinality(range_key, 1_000)
+            .with_node_eq_cardinality(
+                catalog::ScopedPropertyKey::try_new("User", "wide").unwrap(),
+                800,
+            )
+            .with_node_eq_cardinality(
+                catalog::ScopedPropertyKey::try_new("User", "narrow").unwrap(),
+                500,
+            );
+        let storage = cost::StorageCostProfile::default();
+        let winner = alternatives
+            .iter()
+            .min_by_key(|plan| count_cost(plan, &stats, &storage).latency)
+            .unwrap();
+        let winner_cost = count_cost(winner, &stats, &storage);
+        let exec::ExecCountPlan::NodeRange(exec::ExecNodeRangeCountPlan {
+            membership: exec::ExecNodeRangeMembershipPlan::BitmapFilters(filters),
+            ..
+        }) = winner
+        else {
+            panic!("expected a range membership alternative")
+        };
+        assert!(matches!(
+            filters.first(),
+            Some(exec::ExecNodeBitmapExpr::PointRead { key, .. })
+                if key.property.as_ref() == "narrow"
+        ));
+        assert_eq!(winner_cost.range_nexts, 63);
+        assert_eq!(winner_cost.authoritative_graph_reads, 63);
+        assert_eq!(winner_cost.object_reads, 65);
+    }
+
+    #[test]
+    fn set_order_generation_obeys_the_planner_guardrail() {
+        let values = ir::AtLeast::from_one_and_rest(1, vec![2, 3]);
+        assert_eq!(planner_selected_orders(&values, 1).len(), 1);
+        assert_eq!(planner_selected_orders(&values, 3).len(), 3);
+        assert_eq!(
+            set_order_alternative_limit(&context::PlannerLimits {
+                max_index_union_branches: context::IndexUnionBranchLimit::Disabled,
+            }),
+            1
+        );
+        assert_eq!(
+            set_order_alternative_limit(&context::PlannerLimits {
+                max_index_union_branches: context::IndexUnionBranchLimit::limited(2).unwrap(),
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn set_order_guardrail_stops_range_driver_enumeration() {
+        let node_children = ir::AtLeast::from_pair_and_rest(
+            ir::NodeAccessSourcePlan::new(node_range_plan()).unwrap(),
+            ir::NodeAccessSourcePlan::new(node_equality(
+                "user_active",
+                "active",
+                literal(PropertyValue::Bool(true)),
+                catalog::IndexUniqueness::NonUnique,
+            ))
+            .unwrap(),
+            vec![ir::NodeAccessSourcePlan::new(node_equality(
+                "user_status",
+                "status",
+                literal(PropertyValue::from("enabled")),
+                catalog::IndexUniqueness::NonUnique,
+            ))
+            .unwrap()],
+        );
+        let edge_children = ir::AtLeast::from_pair_and_rest(
+            ir::EdgeAccessSourcePlan::new(edge_range_plan()).unwrap(),
+            ir::EdgeAccessSourcePlan::new(edge_equality(
+                "likes_active",
+                "active",
+                literal(PropertyValue::Bool(true)),
+            ))
+            .unwrap(),
+            vec![ir::EdgeAccessSourcePlan::new(edge_equality(
+                "likes_status",
+                "status",
+                literal(PropertyValue::from("enabled")),
+            ))
+            .unwrap()],
+        );
+        let expr = logical::LogicalExpr::StreamCardinality(logical::StreamCardinality::new(
+            access(node_path(ir::NodeAccessPlan::AllScan)),
+        ));
+        let storage = cost::StorageCostProfile::default();
+        let indexes = catalog::IndexCatalogSnapshot::default();
+        let limits = context::PlannerLimits {
+            max_index_union_branches: context::IndexUnionBranchLimit::Disabled,
+        };
+        let stats = context::StatsSnapshot::default();
+        let rule = optimizer::RuleInput {
+            expr: &expr,
+            planner_limits: &limits,
+            stats: &stats,
+            storage: &storage,
+            indexes: &indexes,
+        };
+
+        assert_eq!(
+            node_intersection_count_plans(
+                &node_children,
+                exec::ExecCountWindowPlan::identity(),
+                &rule,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            edge_intersection_count_plans(
+                &edge_children,
+                exec::ExecCountWindowPlan::identity(),
+                &rule,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn bitmap_row_estimates_cover_nested_node_and_edge_sets() {
+        let storage = cost::StorageCostProfile::default();
+        let stats = context::StatsSnapshot::default()
+            .with_node_eq_cardinality(
+                catalog::ScopedPropertyKey::try_new("User", "status").unwrap(),
+                3,
+            )
+            .with_edge_eq_cardinality(
+                catalog::ScopedPropertyKey::try_new("LIKES", "status").unwrap(),
+                5,
+            );
+        let node_union = exec::ExecNodeBitmapExpr::Union {
+            driver: Box::new(exec_node_point("first")),
+            rest: ir::AtLeast::from_one(exec_node_point("second")),
+        };
+        let node_intersection = exec::ExecNodeBitmapExpr::Intersect {
+            driver: Box::new(node_union.clone()),
+            rest: ir::AtLeast::from_one(exec_node_point("third")),
+        };
+        assert_eq!(node_bitmap_rows(&node_union, &stats, &storage).as_rows(), 6);
+        assert_eq!(
+            node_bitmap_rows(&node_intersection, &stats, &storage).as_rows(),
+            3
+        );
+
+        let edge_union = exec::ExecEdgeBitmapExpr::Union {
+            driver: Box::new(exec_edge_point("first")),
+            rest: ir::AtLeast::from_one(exec_edge_point("second")),
+        };
+        let edge_intersection = exec::ExecEdgeBitmapExpr::Intersect {
+            driver: Box::new(edge_union.clone()),
+            rest: ir::AtLeast::from_one(exec_edge_point("third")),
+        };
+        assert_eq!(
+            edge_bitmap_rows(&edge_union, &stats, &storage).as_rows(),
+            10
+        );
+        assert_eq!(
+            edge_bitmap_rows(&edge_intersection, &stats, &storage).as_rows(),
+            5
+        );
+    }
+
+    #[test]
+    fn verified_range_cost_boundaries_and_dynamic_windows_are_exhaustive() {
+        let storage = cost::StorageCostProfile::default();
+        let zero_window =
+            exec::ExecCountWindowPlan::identity().then_limit(exec::ExecUsizeExpr::literal(0));
+        let zero_cost = verified_range_count_cost(
+            cost::EstimatedRows::rows(10),
+            &[(cost::CostVector::ZERO, cost::EstimatedRows::rows(5))],
+            &zero_window,
+            &storage,
+        );
+        assert_eq!(zero_cost.range_nexts, 0);
+
+        let no_matches = verified_range_count_cost(
+            cost::EstimatedRows::rows(10),
+            &[(cost::CostVector::ZERO, cost::EstimatedRows::rows(0))],
+            &exec::ExecCountWindowPlan::identity().then_limit(exec::ExecUsizeExpr::literal(1)),
+            &storage,
+        );
+        assert_eq!(no_matches.range_nexts, 10);
+        assert_eq!(apply_membership_selectivity(10, 5, 0), 0);
+
+        let parameter = exec::ExecUsizeExpr::Param(name("bound"));
+        assert_eq!(
+            static_window_threshold(&exec::ExecCountWindowPlan {
+                skip: parameter.clone(),
+                take: exec::ExecCountTake::AtMost(exec::ExecUsizeExpr::literal(1)),
+            }),
+            None
+        );
+        assert_eq!(
+            static_window_threshold(&exec::ExecCountWindowPlan {
+                skip: exec::ExecUsizeExpr::literal(1),
+                take: exec::ExecCountTake::AtMost(parameter),
+            }),
+            None
         );
     }
 
