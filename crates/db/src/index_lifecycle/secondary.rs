@@ -7171,3 +7171,7 @@ mod tests {
         db.close().await.expect("reopen test database closes");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/index_lifecycle_secondary_contracts.rs"]
+mod external_contracts;
