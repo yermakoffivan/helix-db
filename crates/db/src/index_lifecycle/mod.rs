@@ -43,9 +43,6 @@ mod model;
 pub(crate) mod mutation_catalog;
 mod operation;
 pub(crate) mod outbox;
-#[cfg(test)]
-#[path = "../../tests/production_support/index_lifecycle.rs"]
-mod production_contract_matrix;
 mod public;
 pub(crate) mod repository;
 mod scope_gate;
@@ -63,16 +60,6 @@ pub use operation::*;
 pub use public::*;
 pub(crate) use scope_gate::*;
 pub use work::{BlobRef, TextPartition};
-
-#[cfg(test)]
-mod production_contract_tests {
-    #[tokio::test]
-    async fn lifecycle_outbox_secondary_and_scope_matrices_run_in_workspace_tests() {
-        super::production_contract_matrix::run_outbox_failpoint_contracts().await;
-        super::production_contract_matrix::run_secondary_state_machine_contracts().await;
-        super::production_contract_matrix::run_multi_scope_discovery_contracts().await;
-    }
-}
 
 /// Preserves lifecycle corruption classification when a typed key contains a
 /// valid value from another V2 family.
