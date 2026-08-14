@@ -257,8 +257,10 @@ mod tests {
 
     #[test]
     fn executable_return_variables_reject_duplicate_names() {
+        let returned = ExecutableReturn::new(name("result"), ReturnShape::List);
+        assert_eq!(returned.name().as_ref(), "result");
         let duplicate = ir::AtLeast::from_one_and_rest(
-            ExecutableReturn::new(name("result"), ReturnShape::List),
+            returned,
             vec![ExecutableReturn::new(name("result"), ReturnShape::Object)],
         );
 
@@ -316,11 +318,17 @@ mod tests {
             ir::ReturnVariables::new(ir::AtLeast::from_one(name("result"))).unwrap(),
         );
 
-        let ExecutableReturns::Variables(resolved) =
-            ExecutableReturns::resolve(&requested, &[foreach]).unwrap()
-        else {
-            panic!("one requested return resolves to variables");
-        };
-        assert_eq!(resolved.as_ref()[0].shape(), ReturnShape::Object);
+        let expected = ExecutableReturns::Variables(
+            ExecutableReturnVariables::new(ir::AtLeast::from_one(ExecutableReturn::new(
+                name("result"),
+                ReturnShape::Object,
+            )))
+            .unwrap(),
+        );
+
+        assert_eq!(
+            ExecutableReturns::resolve(&requested, &[foreach]),
+            Ok(expected)
+        );
     }
 }
