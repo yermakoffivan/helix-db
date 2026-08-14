@@ -166,8 +166,9 @@ fn injected_error(failpoint: IndexOutboxFailpoint) -> HelixDbError {
     ))
 }
 
-#[cfg(feature = "production-coverage")]
+#[cfg(any(test, feature = "production-coverage"))]
 #[path = "../../tests/production_support/index_lifecycle_failpoints.rs"]
+#[allow(dead_code)]
 pub(crate) mod production_contracts;
 
 #[cfg(test)]
