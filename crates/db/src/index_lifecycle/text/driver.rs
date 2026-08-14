@@ -2566,18 +2566,6 @@ async fn scan_partition_documents(
                     });
                 }
                 let root_output_operations = root.output_operations();
-                if root_output_operations > limits.max_output_operations().get() {
-                    return Ok(PartitionScanSelection::Repository {
-                        empty_root: None,
-                        result: IndexOperationStepResult::Blocked(
-                            IndexOperationBlocker::ManifestLimit {
-                                partition: row_partition,
-                                observed: root_output_operations,
-                                limit: limits.max_output_operations().get(),
-                            },
-                        ),
-                    });
-                }
                 let root_output_bytes = root.output_bytes();
                 if root_output_bytes > limits.max_output_bytes().get() {
                     return Ok(PartitionScanSelection::Repository {
@@ -2738,16 +2726,6 @@ async fn scan_partition_documents(
             });
         }
         let root_output_operations = root.output_operations();
-        if root_output_operations > limits.max_output_operations().get() {
-            return Ok(PartitionScanSelection::Repository {
-                empty_root: None,
-                result: IndexOperationStepResult::Blocked(IndexOperationBlocker::ManifestLimit {
-                    partition: TextPartition::Unpartitioned,
-                    observed: root_output_operations,
-                    limit: limits.max_output_operations().get(),
-                }),
-            });
-        }
         let root_output_bytes = root.output_bytes();
         if root_output_bytes > limits.max_output_bytes().get() {
             return Ok(PartitionScanSelection::Repository {
@@ -3989,3 +3967,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/index_lifecycle_text_driver_prepared.rs"]
+mod prepared_contracts;
