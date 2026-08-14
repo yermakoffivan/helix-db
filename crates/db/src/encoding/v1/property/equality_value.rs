@@ -457,4 +457,91 @@ mod tests {
         assert_ne!(first.canonical(), second.canonical());
         assert_ne!(first, second);
     }
+
+    #[test]
+    fn equality_projection_covers_every_supported_scalar_array_and_bound() {
+        let indexed_values = [
+            PropertyValue::Bool(false),
+            PropertyValue::I64(i64::MIN),
+            PropertyValue::F64(f64::NEG_INFINITY),
+            PropertyValue::F64(f64::INFINITY),
+            PropertyValue::F32(-1.5),
+            PropertyValue::DateTime(i64::MAX),
+            PropertyValue::String("value".to_string()),
+            PropertyValue::Bytes(vec![0, 1, 2]),
+            PropertyValue::I64Array(vec![i64::MIN, i64::MAX]),
+            PropertyValue::F64Array(vec![f64::NEG_INFINITY, -1.5, 0.0, f64::INFINITY]),
+            PropertyValue::F32Array(vec![f32::NEG_INFINITY, -1.5, 0.0, f32::INFINITY]),
+            PropertyValue::StringArray(vec!["left".to_string(), "right".to_string()]),
+        ];
+        for value in indexed_values {
+            let EqualityValueProjection::Indexed(projected) = project_equality_value(&value) else {
+                panic!("supported equality value must be indexed: {value:?}");
+            };
+            assert_eq!(
+                CanonicalEqualityValue::try_from_parts(
+                    *projected.digest(),
+                    Bytes::copy_from_slice(projected.canonical()),
+                )
+                .expect("projected canonical frame validates"),
+                projected
+            );
+        }
+
+        assert_eq!(
+            project_equality_value(&PropertyValue::F32(f64::NAN)),
+            EqualityValueProjection::NonReflexive
+        );
+        assert_eq!(
+            project_equality_value(&PropertyValue::F32Array(vec![f32::NAN])),
+            EqualityValueProjection::NonReflexive
+        );
+        assert_eq!(
+            project_equality_value(&PropertyValue::Object(Default::default())),
+            EqualityValueProjection::Unsupported("Object")
+        );
+
+        let EqualityValueProjection::Oversized {
+            encoded_len,
+            maximum,
+        } = project_equality_value(&PropertyValue::Bytes(vec![0; MAX_EQUALITY_CANONICAL_LEN]))
+        else {
+            panic!("oversized canonical byte value must be rejected");
+        };
+        assert!(encoded_len > maximum);
+        assert_eq!(maximum, MAX_EQUALITY_CANONICAL_LEN);
+    }
+
+    #[test]
+    fn persisted_canonical_decoder_rejects_every_malformed_frame_family() {
+        let malformed = [
+            Vec::new(),
+            vec![BOOL_TAG],
+            vec![BOOL_TAG, 0x02],
+            vec![NUMBER_TAG],
+            vec![NUMBER_TAG, 0xFF],
+            vec![NUMBER_TAG, NEGATIVE_FINITE_TAG, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![NUMBER_TAG, POSITIVE_FINITE_TAG, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            vec![DATETIME_TAG, 0],
+            vec![STRING_TAG, 0, 0, 0, 1, 0xFF],
+            vec![BYTES_TAG, 0, 0, 0, 2, 1],
+            vec![I64_ARRAY_TAG, 0, 0, 0, 1, 0],
+            vec![F64_ARRAY_TAG, 0, 0, 0, 1],
+            vec![F32_ARRAY_TAG, 0, 0, 0, 1, 0xFE],
+            vec![STRING_ARRAY_TAG, 0, 0, 0, 1, 0, 0, 0, 1, 0xFF],
+            vec![0xFF],
+            vec![BOOL_TAG, 0, 0],
+        ];
+        for canonical in malformed {
+            let digest = equality_digest(&canonical);
+            assert!(
+                CanonicalEqualityValue::try_from_parts(digest, Bytes::from(canonical)).is_err()
+            );
+        }
+
+        let oversized = Bytes::from(vec![0; MAX_EQUALITY_CANONICAL_LEN.saturating_add(1)]);
+        assert!(
+            CanonicalEqualityValue::try_from_parts([0; EQUALITY_DIGEST_LEN], oversized).is_err()
+        );
+    }
 }
