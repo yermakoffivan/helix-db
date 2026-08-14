@@ -1,3 +1,8 @@
+use std::sync::Arc;
+
+use slatedb::object_store::memory::InMemory;
+use slatedb::{Db, IsolationLevel};
+
 use super::*;
 
 fn legacy_secondary(
@@ -298,5 +303,247 @@ fn legacy_range_direction_preserves_both_physical_directions() {
     assert_eq!(
         legacy_range_direction(config::RangeIndexDirection::Desc),
         crate::encoding::v1::indexes::range::RangeIndexDirection::Desc
+    );
+}
+
+#[tokio::test]
+async fn durable_job_and_readiness_markers_cover_absent_present_malformed_and_ordered_states() {
+    let db = Db::open("migration-readiness-contracts", Arc::new(InMemory::new()))
+        .await
+        .unwrap();
+    let scope = DataScope::LegacyUnscoped;
+    let id = MigrationId::GraphFormatV1Rewrite;
+    assert!(!migration_completed(&db, scope, id).await.unwrap());
+    assert_eq!(migration_processed_rows(&db, scope, id).await.unwrap(), 0);
+    ensure_migration_job(&db, scope, id, MigrationMode::BlockingStartup)
+        .await
+        .unwrap();
+    ensure_migration_job(&db, scope, id, MigrationMode::BlockingStartup)
+        .await
+        .unwrap();
+    assert!(!migration_completed(&db, scope, id).await.unwrap());
+    let mut completed = MigrationJob::new(id, MigrationMode::BlockingStartup);
+    completed.record_advanced(MigrationResumeKey::new(vec![1]).unwrap(), 7);
+    completed.complete();
+    db.put(
+        MigrationJobKey::new(scope, id).into_bytes(),
+        encode_json(&completed).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(migration_completed(&db, scope, id).await.unwrap());
+    assert_eq!(migration_processed_rows(&db, scope, id).await.unwrap(), 7);
+
+    assert!(!graph_format_v1_ready(&db, scope).await.unwrap());
+    assert!(!index_v2_migration_ready(&db, scope).await.unwrap());
+    assert!(!storage_schema_complete(&db, scope).await.unwrap());
+    assert!(!index_storage_v4_cleanup_ready(&db).await.unwrap());
+    assert!(!tenant_key_envelope_ready(&db).await.unwrap());
+    ensure_graph_format_v1_ready(&db, scope).await.unwrap();
+    ensure_graph_format_v1_ready(&db, scope).await.unwrap();
+    assert!(graph_format_v1_ready(&db, scope).await.unwrap());
+    assert_eq!(
+        storage_schema_progress(&db, scope).await.unwrap(),
+        StorageSchemaProgress::GraphReady
+    );
+
+    db.put(
+        scoped_metadata_key(scope, INDEX_V2_MIGRATION_READY),
+        Bytes::from_static(b"1"),
+    )
+    .await
+    .unwrap();
+    assert!(index_v2_migration_ready(&db, scope).await.unwrap());
+    assert_eq!(
+        storage_schema_progress(&db, scope).await.unwrap(),
+        StorageSchemaProgress::IndexReady
+    );
+    publish_storage_schema_completion(&db, scope).await.unwrap();
+    publish_storage_schema_completion(&db, scope).await.unwrap();
+    assert!(storage_schema_complete(&db, scope).await.unwrap());
+    assert_eq!(
+        storage_schema_progress(&db, scope).await.unwrap(),
+        StorageSchemaProgress::Complete
+    );
+
+    let transaction = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    stage_index_storage_v4_cleanup_ready(&transaction).unwrap();
+    stage_tenant_key_envelope_ready(&transaction).unwrap();
+    transaction.commit().await.unwrap();
+    assert!(index_storage_v4_cleanup_ready(&db).await.unwrap());
+    assert!(tenant_key_envelope_ready(&db).await.unwrap());
+
+    db.put(
+        scoped_metadata_key(DataScope::LegacyUnscoped, INDEX_STORAGE_V4_CLEANUP_READY),
+        Bytes::from_static(b"malformed"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        index_storage_v4_cleanup_ready(&db).await,
+        Err(HelixDbError::MigrationRequired { .. })
+    ));
+    db.put(
+        scoped_metadata_key(DataScope::LegacyUnscoped, INDEX_STORAGE_V4_CLEANUP_READY),
+        Bytes::from_static(b"1"),
+    )
+    .await
+    .unwrap();
+    db.put(
+        scoped_metadata_key(DataScope::LegacyUnscoped, TENANT_KEY_ENVELOPE_READY),
+        Bytes::from_static(b"malformed"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        tenant_key_envelope_ready(&db).await,
+        Err(HelixDbError::MigrationRequired { .. })
+    ));
+    db.put(
+        scoped_metadata_key(DataScope::LegacyUnscoped, TENANT_KEY_ENVELOPE_READY),
+        Bytes::from_static(b"1"),
+    )
+    .await
+    .unwrap();
+
+    db.delete(scoped_metadata_key(scope, GRAPH_FORMAT_V1_READY))
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage_schema_progress(&db, scope).await,
+        Err(HelixDbError::MigrationRequired { .. })
+    ));
+    assert!(matches!(
+        publish_storage_schema_completion(&db, scope).await,
+        Err(HelixDbError::MigrationRequired { .. })
+    ));
+    db.put(
+        scoped_metadata_key(scope, GRAPH_FORMAT_V1_READY),
+        Bytes::from_static(b"malformed"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        storage_schema_progress(&db, scope).await,
+        Err(HelixDbError::MigrationRequired { .. })
+    ));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_physical_retirement_dispatches_every_family_and_direction() {
+    let db = Db::open("migration-retirement-contracts", Arc::new(InMemory::new()))
+        .await
+        .unwrap();
+    let transaction = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let scope = DataScope::LegacyUnscoped;
+    let definitions = [
+        config::SecondaryIndexDefinition::node_equality("Document", "value").unwrap(),
+        config::SecondaryIndexDefinition::node_range("Document", "value").unwrap(),
+        config::SecondaryIndexDefinition::node_range_desc("Document", "value").unwrap(),
+        config::SecondaryIndexDefinition::edge_equality("REL", "value").unwrap(),
+        config::SecondaryIndexDefinition::edge_range("REL", "value").unwrap(),
+        config::SecondaryIndexDefinition::edge_range_desc("REL", "value").unwrap(),
+    ];
+    for definition in definitions {
+        let validated =
+            crate::index_lifecycle::ValidatedDynamicIndexDefinition::try_from(definition).unwrap();
+        retire_legacy_physical_rows(&transaction, scope, &validated)
+            .await
+            .unwrap();
+    }
+
+    let text = crate::index_lifecycle::ValidatedDynamicIndexDefinition::try_from(
+        config::TextIndexDefinition::new_node("Document", "body").unwrap(),
+    )
+    .unwrap();
+    retire_legacy_physical_rows(&transaction, scope, &text)
+        .await
+        .unwrap();
+    let vector = crate::index_lifecycle::ValidatedDynamicIndexDefinition::try_from(
+        config::VectorIndexDefinition::new_node(
+            "Document",
+            "embedding",
+            3,
+            crate::search::vector::VectorDistanceMetric::Euclidean,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        retire_legacy_physical_rows(&transaction, scope, &vector).await,
+        Err(HelixDbError::InvariantViolation(_))
+    ));
+    transaction.rollback();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_tombstone_retirement_requires_exact_source_and_v2_absence() {
+    let db = Db::open(
+        "migration-tombstone-retirement-contracts",
+        Arc::new(InMemory::new()),
+    )
+    .await
+    .unwrap();
+    let scope = DataScope::LegacyUnscoped;
+    let identity = LegacyDynamicIndexDefinition::Secondary(legacy_secondary(
+        config::SecondaryIndexElementType::Node,
+        config::SecondaryIndexKind::Equality,
+        false,
+        config::RangeIndexDirection::Asc,
+    ))
+    .key();
+    let storage_key = scoped_metadata_key(scope, b"external/legacy/tombstone");
+    db.put(storage_key.clone(), Bytes::from_static(b"legacy"))
+        .await
+        .unwrap();
+    retire_legacy_definition_row(&db, scope, storage_key.clone(), None, &identity)
+        .await
+        .unwrap();
+    assert!(db.get(&storage_key).await.unwrap().is_none());
+    assert!(matches!(
+        retire_legacy_definition_row(&db, scope, storage_key.clone(), None, &identity).await,
+        Err(HelixDbError::MigrationRequired { .. })
+    ));
+
+    let expected = LegacyDynamicIndexDefinition::Secondary(legacy_secondary(
+        config::SecondaryIndexElementType::Node,
+        config::SecondaryIndexKind::Equality,
+        false,
+        config::RangeIndexDirection::Asc,
+    ))
+    .into_validated()
+    .unwrap();
+    assert!(matches!(
+        retire_legacy_definition_row(&db, scope, storage_key, Some(&expected), &identity).await,
+        Err(HelixDbError::MigrationRequired { .. })
+    ));
+    db.close().await.unwrap();
+}
+
+#[test]
+fn receipt_projection_preserves_accepted_existing_and_active_shapes() {
+    use crate::index_lifecycle::{IndexDdlReceipt, IndexGenerationId, IndexId, IndexOperationId};
+
+    let operation_id = IndexOperationId::from_bytes([7; 16]).unwrap();
+    assert_eq!(
+        receipt_operation_id(IndexDdlReceipt::Accepted {
+            operation_id,
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+        }),
+        Some(operation_id)
+    );
+    assert_eq!(
+        receipt_operation_id(IndexDdlReceipt::ExistingOperation { operation_id }),
+        Some(operation_id)
+    );
+    assert_eq!(
+        receipt_operation_id(IndexDdlReceipt::AlreadyActive {
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+        }),
+        None
     );
 }
