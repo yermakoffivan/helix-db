@@ -8,7 +8,7 @@ use axum::http::{Request as HttpRequest, StatusCode};
 use db::encoding::keys::tenant::{DataScope, TenantId};
 use db::encoding::property::Property as DbProperty;
 use db::execution::interpreter::{
-    ElementRef, ExecutionResult, ExecutionRow, ExecutionValue, RowPath, RowSack,
+    ElementRef, ExecutionResult, ExecutionRow, ExecutionValue, ReturnedValue, RowPath, RowSack,
     RowVirtualProperties,
 };
 use db::query_service::{
@@ -257,11 +257,19 @@ fn transport_response_preserves_ranked_public_element_metadata() {
         returns: BTreeMap::from([
             (
                 NonEmptyString::new("distance").expect("return name is non-empty"),
-                ExecutionValue::Stream(vec![row(ElementRef::Node(7), "$distance", 0.25)]),
+                ReturnedValue::Present(ExecutionValue::Stream(vec![row(
+                    ElementRef::Node(7),
+                    "$distance",
+                    0.25,
+                )])),
             ),
             (
                 NonEmptyString::new("score").expect("return name is non-empty"),
-                ExecutionValue::Stream(vec![row(ElementRef::Edge(9), "$score", 1.5)]),
+                ReturnedValue::Present(ExecutionValue::Stream(vec![row(
+                    ElementRef::Edge(9),
+                    "$score",
+                    1.5,
+                )])),
             ),
         ]),
     })
