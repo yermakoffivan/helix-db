@@ -640,3 +640,7 @@ mod tests {
         assert!(next_page.stage(&transaction).await.unwrap());
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/index_lifecycle_text_manifest.rs"]
+mod external_contracts;

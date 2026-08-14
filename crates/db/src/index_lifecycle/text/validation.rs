@@ -1047,3 +1047,7 @@ mod tests {
         transaction.put(page_key, page_value).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/index_lifecycle_text_validation.rs"]
+mod external_contracts;
