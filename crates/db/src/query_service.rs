@@ -605,6 +605,18 @@ impl QueryServiceError {
         matches!(self, Self::Db(HelixDbError::QueryDeadlineExceeded))
     }
 
+    /// Stable machine-readable code for this public query failure.
+    pub fn error_code(&self) -> helix_ast::error_code::QueryErrorCode {
+        match self {
+            Self::InvalidRequest(_) => helix_ast::error_code::QueryErrorCode::InvalidRequest,
+            Self::Planner(error) => error.error_code(),
+            Self::Db(error) => error.error_code(),
+            Self::JsonSerialize(_) | Self::Serialize(_) => {
+                helix_ast::error_code::QueryErrorCode::ResponseSerializationError
+            }
+        }
+    }
+
     /// Stable index lifecycle error code, when this failure belongs to that
     /// public compatibility surface.
     pub fn index_error_code(&self) -> Option<&'static str> {
@@ -621,7 +633,7 @@ impl From<QueryServiceError> for HelixDbError {
         match value {
             QueryServiceError::Db(error) => error,
             QueryServiceError::Planner(error)
-                if error.index_error_code() == Some("index_not_found") =>
+                if error.error_code() == helix_ast::error_code::QueryErrorCode::IndexNotFound =>
             {
                 HelixDbError::IndexNotFound(error.to_string())
             }
