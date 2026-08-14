@@ -2943,7 +2943,7 @@ async fn public_query_boundary_restricts_node_and_edge_text_search_to_the_curren
         .as_array()
         .unwrap()
         .iter()
-        .filter(|id| matches!(id.as_u64(), Some(1 | 2 | 3)))
+        .filter(|id| matches!(id.as_u64(), Some(1..=3)))
         .take(2)
         .cloned()
         .collect::<Vec<_>>();
