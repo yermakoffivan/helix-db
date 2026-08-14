@@ -1193,3 +1193,254 @@ async fn partition_scan_separates_root_creation_document_upload_and_empty_exhaus
     drop(transaction);
     empty_db.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn compaction_preparation_requires_a_claim_and_exhaustion_advances_exactly_once() {
+    let scope = DataScope::LegacyUnscoped;
+    let definition = definition();
+    let operation_id = IndexOperationId::new_v4();
+    let progress = PrefixScanProgress {
+        cursor: None,
+        counters: OperationCounters::default(),
+    };
+    let unclaimed = IndexOperationRecord::try_new(
+        operation_id,
+        IndexId::initial(),
+        definition.identity(),
+        IndexGenerationId::initial(),
+        IndexRevision::initial(),
+        IndexOperationRevision::initial(),
+        IndexOperationKind::Build,
+        IndexOperationFamily::Text,
+        IndexOperationProgress::TextBuild(TextBuildProgress::Constructing(
+            TextBuildStage::Compact(progress.clone()),
+        )),
+        0,
+        IndexOperationExecutionState::Queued {
+            not_before_unix_millis: None,
+        },
+    )
+    .unwrap();
+    let claimed = unclaimed
+        .clone()
+        .claim(OperationClaim {
+            writer_epoch: WriterEpoch::from_bytes([9; 16]).unwrap(),
+            sequence: ClaimSequence::new(1).unwrap(),
+        })
+        .unwrap();
+    let runtime = TextStorageRuntime {
+        object_store: Arc::new(InMemory::new()),
+        db_path: "text-driver-empty-compaction".to_string(),
+        compaction_limits: crate::config::SearchIndexBackfillLimits::default().text_compaction(),
+    };
+    let db = Db::open("text-driver-empty-compaction", Arc::new(InMemory::new()))
+        .await
+        .unwrap();
+    assert!(prepare_compaction_step(
+        &db,
+        scope,
+        &unclaimed,
+        &progress,
+        limits(u64::MAX),
+        &runtime,
+    )
+    .await
+    .is_err());
+
+    let dynamic = ValidatedDynamicIndexDefinition::Text(definition.clone());
+    let record = IndexRecordV2::building(
+        IndexId::initial(),
+        dynamic,
+        IndexRevision::initial(),
+        crate::index_lifecycle::PhysicalGeneration::Text {
+            generation: IndexGenerationId::initial(),
+        },
+        operation_id,
+    )
+    .unwrap();
+    db.put(
+        scoped_index_key(scope, ScopedKey::index_record(record.identity().clone())),
+        crate::encoding::v2::values::encode_index_record(&record),
+    )
+    .await
+    .unwrap();
+    let PreparedTextOperationStep::Repository(prepared) =
+        prepare_compaction_step(&db, scope, &claimed, &progress, limits(u64::MAX), &runtime)
+            .await
+            .unwrap()
+    else {
+        panic!("an empty compaction lane advances through a repository step")
+    };
+    assert!(prepared.expected_reads.is_empty());
+    assert!(prepared.writes.is_empty());
+    assert!(matches!(
+        prepared.result,
+        IndexOperationStepResult::Progressed(IndexOperationProgress::TextBuild(
+            TextBuildProgress::Constructing(TextBuildStage::PrepareManifests(PrefixScanProgress {
+                cursor: None,
+                ..
+            }))
+        ))
+    ));
+
+    let partition = TextPartition::Unpartitioned;
+    let artifact_owner = TextBuildArtifactKey {
+        root: TextManifestRootKey {
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+            partition: partition.fingerprint(),
+        },
+        ordinal: 0,
+    };
+    let artifact_key = scoped_index_key(scope, ScopedKey::TextBuildArtifact(artifact_owner));
+    let split = work::SplitRef::try_new(
+        work::BlobRef::new([3; 32], 1),
+        0,
+        1,
+        0,
+        1,
+        work::SplitPruning::Unavailable,
+    )
+    .unwrap();
+    db.put(
+        artifact_key,
+        crate::encoding::v2::values::encode_build_artifact(&work::TextBuildArtifactValue {
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+            partition,
+            artifact_ordinal: 0,
+            split,
+        }),
+    )
+    .await
+    .unwrap();
+    let PreparedTextOperationStep::Repository(prepared) =
+        prepare_compaction_step(&db, scope, &claimed, &progress, limits(u64::MAX), &runtime)
+            .await
+            .unwrap()
+    else {
+        panic!("an undersized compaction group advances its cursor")
+    };
+    assert_eq!(prepared.expected_reads.len(), 1);
+    assert!(prepared.writes.is_empty());
+    assert!(matches!(
+        prepared.result,
+        IndexOperationStepResult::Progressed(IndexOperationProgress::TextBuild(
+            TextBuildProgress::Constructing(TextBuildStage::Compact(PrefixScanProgress {
+                cursor: Some(_),
+                ..
+            }))
+        ))
+    ));
+
+    let runtime_definition = definition.to_runtime();
+    let first_runtime_split = crate::search::text::persist_documents_as_split(
+        &runtime.object_store,
+        &runtime.db_path,
+        &runtime_definition,
+        &[
+            crate::search::text::TextDocumentInput::new(7, "old searchable document")
+                .with_logical_version(1),
+        ],
+    )
+    .await
+    .unwrap()
+    .expect("first compaction input split is non-empty");
+    let second_runtime_split = crate::search::text::persist_documents_as_split(
+        &runtime.object_store,
+        &runtime.db_path,
+        &runtime_definition,
+        &[
+            crate::search::text::TextDocumentInput::new(7, "current searchable document")
+                .with_logical_version(2),
+        ],
+    )
+    .await
+    .unwrap()
+    .expect("second compaction input split is non-empty");
+    let first_split = work::SplitRef::try_new(
+        work::BlobRef::new(
+            first_runtime_split.blob.sha256,
+            first_runtime_split.blob.size_bytes,
+        ),
+        first_runtime_split.footer_offset,
+        first_runtime_split.footer_len,
+        first_runtime_split.hotcache_len,
+        first_runtime_split.total_size_bytes,
+        work::SplitPruning::Unavailable,
+    )
+    .unwrap();
+    let second_split = work::SplitRef::try_new(
+        work::BlobRef::new(
+            second_runtime_split.blob.sha256,
+            second_runtime_split.blob.size_bytes,
+        ),
+        second_runtime_split.footer_offset,
+        second_runtime_split.footer_len,
+        second_runtime_split.hotcache_len,
+        second_runtime_split.total_size_bytes,
+        work::SplitPruning::Unavailable,
+    )
+    .unwrap();
+    for (ordinal, split) in [(0, first_split), (1, second_split)] {
+        let owner = TextBuildArtifactKey {
+            root: TextManifestRootKey {
+                index_id: IndexId::initial(),
+                generation: IndexGenerationId::initial(),
+                partition: TextPartition::Unpartitioned.fingerprint(),
+            },
+            ordinal,
+        };
+        db.put(
+            scoped_index_key(scope, ScopedKey::TextBuildArtifact(owner)),
+            crate::encoding::v2::values::encode_build_artifact(&work::TextBuildArtifactValue {
+                index_id: IndexId::initial(),
+                generation: IndexGenerationId::initial(),
+                partition: TextPartition::Unpartitioned,
+                artifact_ordinal: ordinal,
+                split,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let entity = crate::encoding::v2::keys::IndexEntity {
+        kind: crate::index_lifecycle::IndexElementKind::Node,
+        id: crate::index_lifecycle::IndexEntityId::new(7),
+    };
+    db.put(
+        scoped_index_key(
+            scope,
+            ScopedKey::TextEntityState(crate::encoding::v2::keys::TextEntityStateKey {
+                root: TextManifestRootKey {
+                    index_id: IndexId::initial(),
+                    generation: IndexGenerationId::initial(),
+                    partition: TextPartition::Unpartitioned.fingerprint(),
+                },
+                entity,
+            }),
+        ),
+        crate::encoding::v2::values::encode_text_entity_state(&work::TextEntityStateValue {
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+            partition: TextPartition::Unpartitioned,
+            entity_kind: crate::index_lifecycle::IndexElementKind::Node,
+            entity_id: entity.id,
+            logical_version: crate::index_lifecycle::TextLogicalVersion::new(2).unwrap(),
+            live: true,
+        }),
+    )
+    .await
+    .unwrap();
+    let PreparedTextOperationStep::CompactionUpload(prepared) =
+        prepare_compaction_step(&db, scope, &claimed, &progress, limits(u64::MAX), &runtime)
+            .await
+            .unwrap()
+    else {
+        panic!("two live-versioned splits produce one exact compaction upload")
+    };
+    assert_eq!(prepared.retired_artifact_keys.len(), 2);
+    assert!(prepared.uploaded_bytes > 0);
+    assert!(prepared.expected_reads.len() >= 3);
+    db.close().await.unwrap();
+}

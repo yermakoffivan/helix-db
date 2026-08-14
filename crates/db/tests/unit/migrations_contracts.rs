@@ -34,27 +34,25 @@ fn legacy_secondary_definition_matrix_accepts_only_representable_algorithms() {
                 for direction in [RangeIndexDirection::Asc, RangeIndexDirection::Desc] {
                     let result =
                         legacy_secondary(element_type, kind, unique, direction).into_runtime();
-                    let expected_valid = match (element_type, kind, unique, direction) {
+                    let expected_valid = matches!(
+                        (element_type, kind, unique, direction),
                         (
                             SecondaryIndexElementType::Node,
                             SecondaryIndexKind::Equality,
                             false | true,
                             RangeIndexDirection::Asc,
-                        ) => true,
-                        (
+                        ) | (
                             SecondaryIndexElementType::Node | SecondaryIndexElementType::Edge,
                             SecondaryIndexKind::Range,
                             false,
                             RangeIndexDirection::Asc | RangeIndexDirection::Desc,
-                        ) => true,
-                        (
+                        ) | (
                             SecondaryIndexElementType::Edge,
                             SecondaryIndexKind::Equality,
                             false,
                             RangeIndexDirection::Asc,
-                        ) => true,
-                        _ => false,
-                    };
+                        )
+                    );
                     assert_eq!(
                         result.is_ok(),
                         expected_valid,
@@ -289,9 +287,11 @@ fn migration_job_state_machine_preserves_counters_and_rejects_invalid_transition
     assert!(!key.as_ref().is_empty());
     assert_eq!(key.clone().into_bytes().as_ref(), key.as_ref());
     assert!(!migration_job_scan_prefix_scoped(DataScope::LegacyUnscoped).is_empty());
-    assert!(!MigrationStep::IDLE.advanced);
-    assert_eq!(MigrationStep::IDLE.rows, 0);
-    assert_eq!(MigrationStep::IDLE.admitted_bytes, 0);
+    const {
+        assert!(!MigrationStep::IDLE.advanced);
+        assert!(MigrationStep::IDLE.rows == 0);
+        assert!(MigrationStep::IDLE.admitted_bytes == 0);
+    }
 }
 
 #[test]
@@ -546,4 +546,67 @@ fn receipt_projection_preserves_accepted_existing_and_active_shapes() {
         }),
         None
     );
+}
+
+#[tokio::test]
+async fn empty_migration_controller_executes_every_stage_and_catalog_family_to_completion() {
+    let raw = Arc::new(
+        Db::open(
+            "migration-empty-controller-contracts",
+            Arc::new(InMemory::new()),
+        )
+        .await
+        .unwrap(),
+    );
+    let config = crate::config::DbConfig::default();
+    let writer = crate::HelixWriter::new(Arc::clone(&raw), config.id_lease_size());
+    let scope = DataScope::LegacyUnscoped;
+
+    assert!(
+        !process_migration_once_by_id(
+            &writer,
+            scope,
+            config.migrations(),
+            MigrationId::GraphFormatV1Rewrite,
+        )
+        .await
+        .unwrap(),
+        "an absent migration job is explicitly idle"
+    );
+    for id in [
+        MigrationId::GraphFormatV1Rewrite,
+        MigrationId::LegacyVectorPropertyMaterialization,
+        MigrationId::LegacyVectorPhysicalCleanup,
+        MigrationId::GraphFormatV1Cleanup,
+    ] {
+        ensure_migration_job(&raw, scope, id, MigrationMode::Background)
+            .await
+            .unwrap();
+        let mut turns = 0;
+        while !migration_completed(raw.as_ref(), scope, id).await.unwrap() {
+            assert!(
+                process_migration_once_by_id(&writer, scope, config.migrations(), id)
+                    .await
+                    .unwrap(),
+                "runnable empty migration {id:?} advances one closed stage"
+            );
+            turns += 1;
+            assert!(turns <= 16, "empty migration has a bounded stage family");
+        }
+        assert!(turns > 0);
+        assert!(
+            !process_migration_once_by_id(&writer, scope, config.migrations(), id)
+                .await
+                .unwrap(),
+            "a completed migration is explicitly idle"
+        );
+    }
+    assert!(!process_migration_once(&writer, scope, config.migrations())
+        .await
+        .unwrap());
+    drop(writer);
+    let Ok(raw) = Arc::try_unwrap(raw) else {
+        panic!("migration writer releases its database")
+    };
+    raw.close().await.unwrap();
 }

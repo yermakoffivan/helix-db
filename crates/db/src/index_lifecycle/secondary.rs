@@ -6432,7 +6432,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "nightly sparse bitmap larger than the default 8 MiB lifecycle input limit"]
     async fn oversized_v4_bitmap_cleanup_survives_reopen_at_default_limit() {
         let default_limits = SearchIndexBackfillLimits::default().batch();
         let input_limit = usize::try_from(default_limits.max_input_bytes().get())
@@ -6732,6 +6731,135 @@ mod tests {
             .await
             .expect("updated active entry is readable")
             .is_some());
+        db.close().await.expect("secondary test database closes");
+    }
+
+    #[tokio::test]
+    async fn driver_owned_catch_up_executes_the_legacy_exact_delta_contract() {
+        let db = test_db("secondary-driver-owned-catch-up").await;
+        let scope = DataScope::LegacyUnscoped;
+        let definition = validated(
+            SecondaryIndexDefinition::node_equality("User", "email")
+                .expect("node equality definition"),
+        );
+        let before = user_properties("before@example.com");
+        put_source(&db, scope, IndexElementKind::Node, 0, &before).await;
+        let (operation_id, index_id, generation) = create_build(&db, scope, &definition, 0).await;
+        let driver = SecondaryIndexDriver::new(Arc::new(IndexScopeGates::default()));
+        let mut claim_sequence = 1;
+
+        assert_eq!(
+            drive_one(&db, &driver, operation_id, &mut claim_sequence).await,
+            CommittedOperationStep::Progressed
+        );
+        let after = user_properties("after@example.com");
+        mutate_source(&db, scope, IndexElementKind::Node, 0, &before, &after)
+            .await
+            .expect("building mutation stores one durable delta");
+        let operation = read_operation(&db, scope, operation_id)
+            .await
+            .expect("catch-up operation is readable")
+            .expect("catch-up operation exists");
+        assert!(matches!(
+            operation.progress(),
+            IndexOperationProgress::SecondaryBuild(SecondaryBuildProgress::Constructing(
+                SecondaryBuildStage::CatchUp(_)
+            ))
+        ));
+
+        let transaction = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .expect("driver-owned catch-up transaction begins");
+        driver
+            .step(&db, &transaction, scope, &operation, one_entity_limits())
+            .await
+            .expect("driver-owned catch-up executes");
+        transaction
+            .commit()
+            .await
+            .expect("driver-owned catch-up commits");
+
+        assert!(
+            generation_rows(&db, scope, RecordKind::BuildDelta, index_id, generation,)
+                .await
+                .is_empty()
+        );
+        db.close().await.expect("secondary test database closes");
+    }
+
+    #[tokio::test]
+    async fn driver_owned_catch_up_stops_before_the_next_indivisible_write_plan() {
+        let db = test_db("secondary-driver-owned-catch-up-output-boundary").await;
+        let scope = DataScope::LegacyUnscoped;
+        let definition = validated(
+            SecondaryIndexDefinition::node_equality("User", "email")
+                .expect("node equality definition"),
+        );
+        let first_before = user_properties("first-before@example.com");
+        let second_before = user_properties("second-before@example.com");
+        put_source(&db, scope, IndexElementKind::Node, 0, &first_before).await;
+        put_source(&db, scope, IndexElementKind::Node, 1, &second_before).await;
+        let (operation_id, index_id, generation) = create_build(&db, scope, &definition, 1).await;
+        let driver = SecondaryIndexDriver::new(Arc::new(IndexScopeGates::default()));
+        let mut claim_sequence = 1;
+        assert_eq!(
+            drive_one(&db, &driver, operation_id, &mut claim_sequence).await,
+            CommittedOperationStep::Progressed
+        );
+
+        mutate_source(
+            &db,
+            scope,
+            IndexElementKind::Node,
+            0,
+            &first_before,
+            &user_properties("first-after@example.com"),
+        )
+        .await
+        .expect("first mutation stores a delta");
+        mutate_source(
+            &db,
+            scope,
+            IndexElementKind::Node,
+            1,
+            &second_before,
+            &user_properties("second-after@example.com"),
+        )
+        .await
+        .expect("second mutation stores a delta");
+        let operation = read_operation(&db, scope, operation_id)
+            .await
+            .expect("catch-up operation is readable")
+            .expect("catch-up operation exists");
+        let transaction = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .expect("bounded catch-up transaction begins");
+        let one_update_limits = SearchIndexBatchLimits::try_new(
+            std::num::NonZeroUsize::new(2).expect("two entities are positive"),
+            std::num::NonZeroU64::new(1024 * 1024).expect("one MiB is positive"),
+            std::num::NonZeroU64::new(4).expect("four writes are positive"),
+            std::num::NonZeroU64::new(1024 * 1024).expect("one MiB is positive"),
+            std::num::NonZeroU64::new(1024 * 1024).expect("one MiB is positive"),
+        )
+        .expect("one-update limits are internally consistent");
+        driver
+            .step(&db, &transaction, scope, &operation, one_update_limits)
+            .await
+            .expect("bounded driver-owned catch-up executes");
+        transaction
+            .commit()
+            .await
+            .expect("bounded driver-owned catch-up commits");
+
+        assert_eq!(
+            generation_rows(&db, scope, RecordKind::BuildDelta, index_id, generation,)
+                .await
+                .len(),
+            1,
+            "the second indivisible reconciliation remains durable"
+        );
         db.close().await.expect("secondary test database closes");
     }
 

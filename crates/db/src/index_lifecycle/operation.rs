@@ -1736,7 +1736,7 @@ mod tests {
             output_bytes: 4,
         };
         assert_eq!(
-            TextManifestPageValidationProgress::try_new(None, Some(partition.clone()), counters),
+            TextManifestPageValidationProgress::try_new(None, Some(partition), counters),
             Err(
                 IndexOperationModelError::InvalidTextManifestValidationProgress(
                     "an incomplete partition requires its last complete page cursor"

@@ -4,6 +4,11 @@ use slatedb::IsolationLevel;
 
 use super::*;
 use crate::config::SecondaryIndexDefinition;
+use crate::encoding::v1::property::Property;
+use crate::index_lifecycle::graph_mutation::{
+    CanonicalPropertyRow, GraphEntity, GraphMutationTransition, PropertyEdit, PropertyEditOutcome,
+};
+use crate::index_lifecycle::mutation_catalog::{MutationRouteTarget, RoutedMutationTargets};
 
 fn validated(definition: SecondaryIndexDefinition) -> ValidatedSecondaryIndexDefinition {
     let ValidatedDynamicIndexDefinition::Secondary(definition) =
@@ -777,7 +782,11 @@ async fn authoritative_equality_and_range_verification_reject_every_stale_shape(
     let key_value =
         match project_range_value(&PropertyValue::I64(7), StorageRangeIndexDirection::Asc) {
             RangeValueProjection::Indexed(value) => value,
-            _ => unreachable!("integer is a range value"),
+            RangeValueProjection::Unsupported(_)
+            | RangeValueProjection::NaN
+            | RangeValueProjection::Oversized { .. } => {
+                unreachable!("integer is a range value")
+            }
         };
     assert!(authoritative_range_matches(
         &db,
@@ -793,7 +802,11 @@ async fn authoritative_equality_and_range_verification_reject_every_stale_shape(
     let different =
         match project_range_value(&PropertyValue::I64(8), StorageRangeIndexDirection::Asc) {
             RangeValueProjection::Indexed(value) => value,
-            _ => unreachable!("integer is a range value"),
+            RangeValueProjection::Unsupported(_)
+            | RangeValueProjection::NaN
+            | RangeValueProjection::Oversized { .. } => {
+                unreachable!("integer is a range value")
+            }
         };
     assert!(!authoritative_range_matches(
         &db,
@@ -1021,6 +1034,211 @@ async fn generation_source_and_cursor_helpers_cover_empty_present_and_wrong_lane
         Some(&IndexCursor::try_new(Bytes::from_static(b"other/suffix")).unwrap()),
     )
     .is_err());
+    transaction.rollback();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn mutation_runtime_executes_build_delta_and_active_bitmap_programs_then_seals() {
+    let db = tests::test_db("secondary-mutation-runtime-contracts").await;
+    let scope = DataScope::LegacyUnscoped;
+    let definition = validated(SecondaryIndexDefinition::node_equality("User", "email").unwrap());
+    let entity_id = IndexEntityId::new(17);
+    let entity = IndexEntity {
+        kind: IndexElementKind::Node,
+        id: entity_id,
+    };
+    let route = [MutationRouteTarget::Secondary(0)];
+    let routes = RoutedMutationTargets::One(&route);
+
+    let building = SecondaryMutationSet {
+        targets: vec![SecondaryMutationTarget {
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+            definition: definition.clone(),
+            mode: SecondaryMutationMode::RecordBuildDelta,
+        }],
+    };
+    let created = GraphMutationTransition::create(
+        scope,
+        GraphEntity::node(entity_id.get()),
+        CanonicalPropertyRow::new(vec![
+            Property::string("$label", "User"),
+            Property::string("email", "created@example.com"),
+        ]),
+    );
+    let transaction = db
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    let mut runtime = SecondaryMutationRuntime::default();
+    runtime
+        .collect(scope, &building, &routes, &created)
+        .unwrap();
+    runtime.flush(&transaction, &building).await.unwrap();
+    let delta_key = scoped_index_key(
+        scope,
+        ScopedKey::BuildDelta(IndexEntityStateKey {
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+            entity,
+        }),
+    );
+    assert!(transaction.get(&delta_key).await.unwrap().is_some());
+    runtime.prepare(&transaction, &building).await.unwrap();
+    assert!(runtime
+        .collect(scope, &building, &routes, &created)
+        .is_err());
+    assert!(runtime.flush(&transaction, &building).await.is_err());
+    runtime.consume_prepared().unwrap();
+    assert!(SecondaryMutationRuntime::default()
+        .consume_prepared()
+        .is_err());
+    transaction.rollback();
+
+    let active = SecondaryMutationSet {
+        targets: vec![SecondaryMutationTarget {
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+            definition: definition.clone(),
+            mode: SecondaryMutationMode::MaintainActive,
+        }],
+    };
+    let before = CanonicalPropertyRow::new(vec![
+        Property::string("$label", "User"),
+        Property::string("email", "before@example.com"),
+    ]);
+    let PropertyEditOutcome::Changed(replaced) = GraphMutationTransition::edit(
+        scope,
+        GraphEntity::node(entity_id.get()),
+        before,
+        PropertyEdit::set(Property::string("email", "after@example.com")),
+    ) else {
+        panic!("email edit changes the authoritative row")
+    };
+    let transaction = db
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    let mut runtime = SecondaryMutationRuntime::default();
+    runtime.collect(scope, &active, &routes, &replaced).unwrap();
+    runtime.prepare(&transaction, &active).await.unwrap();
+    let before_key = secondary_entry_key(
+        scope,
+        IndexId::initial(),
+        IndexGenerationId::initial(),
+        &definition,
+        equality("before@example.com"),
+        entity_id,
+    )
+    .unwrap();
+    let after_key = secondary_entry_key(
+        scope,
+        IndexId::initial(),
+        IndexGenerationId::initial(),
+        &definition,
+        equality("after@example.com"),
+        entity_id,
+    )
+    .unwrap();
+    assert!(transaction.get(&before_key).await.unwrap().is_none());
+    let after = transaction
+        .get(&after_key)
+        .await
+        .unwrap()
+        .expect("active bitmap addition is staged");
+    assert!(SecondaryEqualityBitmapValue::decode(&after)
+        .unwrap()
+        .ids()
+        .contains(entity_id.get()));
+    transaction.rollback();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn mutation_runtime_filters_other_families_skips_noops_and_executes_unique_owner_reads() {
+    let db = tests::test_db("secondary-mutation-runtime-unique-contracts").await;
+    let scope = DataScope::LegacyUnscoped;
+    let definition =
+        validated(SecondaryIndexDefinition::node_unique_equality("User", "email").unwrap());
+    let mutations = SecondaryMutationSet {
+        targets: vec![SecondaryMutationTarget {
+            index_id: IndexId::initial(),
+            generation: IndexGenerationId::initial(),
+            definition: definition.clone(),
+            mode: SecondaryMutationMode::MaintainActive,
+        }],
+    };
+    let entity_id = IndexEntityId::new(23);
+    let created = GraphMutationTransition::create(
+        scope,
+        GraphEntity::node(entity_id.get()),
+        CanonicalPropertyRow::new(vec![
+            Property::string("$label", "User"),
+            Property::string("email", "unique@example.com"),
+        ]),
+    );
+    let route = [
+        MutationRouteTarget::Vector(0),
+        MutationRouteTarget::TextBuilding(0),
+        MutationRouteTarget::TextActive(0),
+        MutationRouteTarget::Secondary(0),
+    ];
+    let routes = RoutedMutationTargets::Owned(route.to_vec());
+    let transaction = db
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    let mut runtime = SecondaryMutationRuntime::default();
+    runtime
+        .collect(scope, &mutations, &routes, &created)
+        .unwrap();
+    runtime.prepare(&transaction, &mutations).await.unwrap();
+    let owner_key = secondary_entry_key(
+        scope,
+        IndexId::initial(),
+        IndexGenerationId::initial(),
+        &definition,
+        equality("unique@example.com"),
+        entity_id,
+    )
+    .unwrap();
+    assert_eq!(
+        decode_secondary_entry_value(
+            IndexId::initial(),
+            IndexGenerationId::initial(),
+            definition_lane(&definition),
+            &transaction
+                .get(&owner_key)
+                .await
+                .unwrap()
+                .expect("unique owner is staged"),
+        )
+        .unwrap(),
+        entity_id
+    );
+    transaction.rollback();
+
+    let irrelevant = GraphMutationTransition::create(
+        scope,
+        GraphEntity::node(24),
+        CanonicalPropertyRow::new(vec![Property::string("$label", "Other")]),
+    );
+    let transaction = db
+        .begin(IsolationLevel::SerializableSnapshot)
+        .await
+        .unwrap();
+    let mut runtime = SecondaryMutationRuntime::default();
+    runtime
+        .collect(
+            scope,
+            &mutations,
+            &RoutedMutationTargets::One(&[MutationRouteTarget::Secondary(0)]),
+            &irrelevant,
+        )
+        .unwrap();
+    runtime.prepare(&transaction, &mutations).await.unwrap();
+    runtime.consume_prepared().unwrap();
     transaction.rollback();
     db.close().await.unwrap();
 }
