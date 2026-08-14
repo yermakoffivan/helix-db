@@ -9,7 +9,9 @@ use std::{cmp::Ordering, collections::BTreeMap, num::NonZeroUsize, sync::Arc, ti
 
 use db::config::{self, VectorIndexDefinition};
 use db::encoding::v1::values::vectors::{decode_layer0_neighbors, encode_layer0_neighbors};
-use db::execution::interpreter::{ElementRef, ExecutionResult, ExecutionScalar, ExecutionValue};
+use db::execution::interpreter::{
+    ElementRef, ExecutionResult, ExecutionScalar, ExecutionValue, ReturnedValue,
+};
 use db::search::vector::distance::{Cosine, Distance, Euclidean, Manhattan};
 use db::search::vector::unaligned_vector::{SimHashError, UnalignedVector};
 use db::search::vector::{
@@ -151,7 +153,7 @@ fn public_query_response_exposes_telemetry_safe_planner_diagnostics() {
             )]),
             returns: BTreeMap::from([(
                 helix_planner::ir::NonEmptyString::from_static("count"),
-                ExecutionValue::Count(0),
+                ReturnedValue::Present(ExecutionValue::Count(0)),
             )]),
         },
         helix_planner::diagnostics::PlannerDiagnostics {
@@ -2950,7 +2952,7 @@ async fn public_query_boundary_restricts_node_and_edge_text_search_to_the_curren
         serde_json::Value::Array(expected_nodes)
     );
     assert_eq!(response["single_node"], serde_json::json!([2]));
-    assert_eq!(response["empty_nodes"], serde_json::json!([]));
+    assert_eq!(response["empty_nodes"], serde_json::Value::Null);
     assert!(response["node_sacks"]
         .as_array()
         .unwrap()

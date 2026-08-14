@@ -18,7 +18,9 @@ use serde_json::Value as JsonValue;
 use crate::encoding::keys::tenant::DataScope;
 use crate::encoding::property::property_value::PropertyValue as DbPropertyValue;
 use crate::error::HelixDbError;
-use crate::execution::interpreter::{ElementRef, ExecutionResult, ExecutionScalar, ExecutionValue};
+use crate::execution::interpreter::{
+    ElementRef, ExecutionResult, ExecutionScalar, ExecutionValue, ReturnedValue,
+};
 use crate::execution_control::ExecutionControl;
 use crate::HelixDB;
 
@@ -405,7 +407,7 @@ impl QueryResponse {
         let returns = result
             .returns
             .into_iter()
-            .map(|(name, value)| Ok((name.into_string(), execution_value_to_json(value)?)))
+            .map(|(name, value)| Ok((name.into_string(), returned_value_to_json(value)?)))
             .collect::<std::result::Result<BTreeMap<_, _>, QueryServiceError>>()?;
         Ok(Self {
             returns,
@@ -435,6 +437,16 @@ impl Serialize for QueryResponse {
         S: Serializer,
     {
         self.returns.serialize(serializer)
+    }
+}
+
+fn returned_value_to_json(
+    value: ReturnedValue,
+) -> std::result::Result<JsonValue, QueryServiceError> {
+    match value {
+        ReturnedValue::Present(value) => execution_value_to_json(value),
+        ReturnedValue::EmptyList => Ok(JsonValue::Array(Vec::new())),
+        ReturnedValue::EmptyObject => Ok(JsonValue::Null),
     }
 }
 
@@ -646,7 +658,7 @@ impl QueryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helix_ast::batch::{read_batch, write_batch};
+    use helix_ast::batch::{read_batch, write_batch, BatchCondition};
     use helix_ast::expr::Predicate;
     use helix_ast::graph::{EdgeRef, NodeRef};
     use helix_ast::index::IndexSpec;
@@ -1785,6 +1797,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_response_uses_planner_shape_only_for_empty_returns() {
+        let db = Arc::new(
+            HelixDB::open(HelixDbSource::InMemory {
+                database: "query-service-empty-return-shapes".to_string(),
+            })
+            .await
+            .expect("writer should open"),
+        );
+        let service = HelixQueryService::new(db);
+
+        let created = service
+            .execute_query(QueryRequest::write(
+                write_batch()
+                    .var_as(
+                        "created",
+                        g().add_n("User", Vec::<(&str, PropertyInput)>::new()),
+                    )
+                    .returning(["created"]),
+            ))
+            .await
+            .expect("fixture write should execute");
+        assert_eq!(
+            created.to_json_bytes().unwrap(),
+            br#"{"created":[{"$id":0}]}"#
+        );
+
+        let response = service
+            .execute_query(QueryRequest::read(
+                read_batch()
+                    .var_as("present_object", g().n(NodeRef::id(0)))
+                    .var_as("present_list", g().n_with_label("User"))
+                    .var_as("missing_object", g().n(NodeRef::id(999)))
+                    .var_as("missing_list", g().n_with_label("Missing"))
+                    .var_as("bounded_object", g().n_with_label("Missing").limit(1usize))
+                    .var_as("empty_fold", g().n(NodeRef::id(999)).fold())
+                    .var_as("seed", g().n_with_label("Missing"))
+                    .var_as_if(
+                        "skipped_object",
+                        BatchCondition::PrevNotEmpty,
+                        g().n(NodeRef::id(0)),
+                    )
+                    .var_as("count", g().n_with_label("Missing").count())
+                    .returning([
+                        "present_object",
+                        "missing_object",
+                        "missing_list",
+                        "bounded_object",
+                        "empty_fold",
+                        "skipped_object",
+                        "count",
+                        "present_list",
+                    ]),
+            ))
+            .await
+            .expect("shape read should execute");
+
+        assert_eq!(
+            response.to_json_bytes().unwrap(),
+            br#"{"bounded_object":null,"count":0,"empty_fold":[],"missing_list":[],"missing_object":null,"present_list":[{"$id":0}],"present_object":[{"$id":0}],"skipped_object":null}"#
+        );
+
+        let mutation = service
+            .execute_query(QueryRequest::write(
+                write_batch()
+                    .var_as("missing_mutation", g().n(NodeRef::id(999)).drop())
+                    .returning(["missing_mutation"]),
+            ))
+            .await
+            .expect("empty mutation should remain successful");
+        assert_eq!(
+            mutation.to_json_bytes().unwrap(),
+            br#"{"missing_mutation":[]}"#
+        );
+
+        let empty_returns = service
+            .execute_query(QueryRequest::read(
+                read_batch().var_as("ignored", g().n(NodeRef::id(999))),
+            ))
+            .await
+            .expect("empty return declaration should execute");
+        assert_eq!(empty_returns.to_json_bytes().unwrap(), br#"{}"#);
+    }
+
+    #[tokio::test]
     async fn query_service_wrappers_delegate_execute_warm_and_scoped_reads() {
         let db = Arc::new(
             HelixDB::open(HelixDbSource::InMemory {
@@ -1889,19 +1985,21 @@ mod tests {
             returns: BTreeMap::from([
                 (
                     name("users"),
-                    ExecutionValue::Scalars(vec![ExecutionScalar::Object(BTreeMap::from([(
-                        "name".to_string(),
-                        PropertyValue::String("alice".to_string()),
-                    )]))]),
+                    ReturnedValue::Present(ExecutionValue::Scalars(vec![ExecutionScalar::Object(
+                        BTreeMap::from([(
+                            "name".to_string(),
+                            PropertyValue::String("alice".to_string()),
+                        )]),
+                    )])),
                 ),
                 (
                     name("rows"),
-                    ExecutionValue::Stream(vec![{
+                    ReturnedValue::Present(ExecutionValue::Stream(vec![{
                         let mut row = ExecutionRow::empty();
                         row.current = Some(ElementRef::Node(7));
                         row.bindings = BTreeMap::from([(name("friend"), ElementRef::Edge(9))]);
                         row
-                    }]),
+                    }])),
                 ),
             ]),
         };
@@ -1933,21 +2031,25 @@ mod tests {
             returns: BTreeMap::from([
                 (
                     name("node"),
-                    ExecutionValue::Stream(vec![row(ElementRef::Node(7))]),
+                    ReturnedValue::Present(ExecutionValue::Stream(vec![row(ElementRef::Node(7))])),
                 ),
                 (
                     name("ranked_edge"),
-                    ExecutionValue::Stream(vec![row_with_virtual_properties(
-                        ElementRef::Edge(9),
-                        RowVirtualProperties::from_one(distance, PropertyValue::F64(0.25)),
-                    )]),
+                    ReturnedValue::Present(ExecutionValue::Stream(vec![
+                        row_with_virtual_properties(
+                            ElementRef::Edge(9),
+                            RowVirtualProperties::from_one(distance, PropertyValue::F64(0.25)),
+                        ),
+                    ])),
                 ),
                 (
                     name("scored_node"),
-                    ExecutionValue::Stream(vec![row_with_virtual_properties(
-                        ElementRef::Node(11),
-                        RowVirtualProperties::from_one(score, PropertyValue::F64(1.5)),
-                    )]),
+                    ReturnedValue::Present(ExecutionValue::Stream(vec![
+                        row_with_virtual_properties(
+                            ElementRef::Node(11),
+                            RowVirtualProperties::from_one(score, PropertyValue::F64(1.5)),
+                        ),
+                    ])),
                 ),
             ]),
         };
@@ -1979,15 +2081,20 @@ mod tests {
             returns: BTreeMap::from([
                 (
                     name("folded"),
-                    ExecutionValue::FoldedStream(FoldedStream::new(vec![folded_row])),
+                    ReturnedValue::Present(ExecutionValue::FoldedStream(FoldedStream::new(vec![
+                        folded_row,
+                    ]))),
                 ),
-                (name("exists"), ExecutionValue::Bool(true)),
+                (
+                    name("exists"),
+                    ReturnedValue::Present(ExecutionValue::Bool(true)),
+                ),
                 (
                     name("scalars"),
-                    ExecutionValue::Scalars(vec![
+                    ReturnedValue::Present(ExecutionValue::Scalars(vec![
                         ExecutionScalar::String("ready".to_string()),
                         ExecutionScalar::Value(PropertyValue::I64(7)),
-                    ]),
+                    ])),
                 ),
             ]),
         };

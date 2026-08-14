@@ -12,21 +12,32 @@ impl<'db> ExecutionContext<'db> {
     pub(in crate::execution::interpreter) fn finish(
         &mut self,
         root: exec::ExecStepId,
-        returns: &ir::ReturnPlan,
+        returns: &exec::ExecutableReturns,
     ) -> Result<ExecutionResult> {
         self.step_output_uses.remove(&root);
         let last = self.step_outputs.remove(&root);
         let returns = match returns {
-            ir::ReturnPlan::None => BTreeMap::new(),
-            ir::ReturnPlan::Variables(names) => names
+            exec::ExecutableReturns::None => BTreeMap::new(),
+            exec::ExecutableReturns::Variables(returns) => returns
                 .as_ref()
                 .iter()
-                .map(|name| {
-                    self.variables
-                        .get(name)
-                        .cloned()
-                        .map(|value| (name.clone(), value))
-                        .ok_or_else(|| missing_variable("return variable", name))
+                .map(|planned| {
+                    let value = match self.variables.get(planned.name()).cloned() {
+                        Some(value) if value.is_empty() => match planned.shape() {
+                            exec::ReturnShape::List => ReturnedValue::EmptyList,
+                            exec::ReturnShape::Object => ReturnedValue::EmptyObject,
+                            exec::ReturnShape::Scalar => ReturnedValue::Present(value),
+                        },
+                        Some(value) => ReturnedValue::Present(value),
+                        None => match planned.shape() {
+                            exec::ReturnShape::List => ReturnedValue::EmptyList,
+                            exec::ReturnShape::Object => ReturnedValue::EmptyObject,
+                            exec::ReturnShape::Scalar => {
+                                return Err(missing_variable("return variable", planned.name()));
+                            }
+                        },
+                    };
+                    Ok((planned.name().clone(), value))
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?,
         };
@@ -140,11 +151,16 @@ mod tests {
         test_support::name(value)
     }
 
-    fn return_variables(names: Vec<&str>) -> ir::ReturnPlan {
-        ir::ReturnPlan::Variables(
-            ir::ReturnVariables::new(
-                ir::AtLeast::<_, 1>::try_from_vec(names.into_iter().map(name).collect())
-                    .expect("non-empty return variable list"),
+    fn return_variables(returns: Vec<(&str, exec::ReturnShape)>) -> exec::ExecutableReturns {
+        exec::ExecutableReturns::Variables(
+            exec::ExecutableReturnVariables::new(
+                ir::AtLeast::<_, 1>::try_from_vec(
+                    returns
+                        .into_iter()
+                        .map(|(variable, shape)| exec::ExecutableReturn::new(name(variable), shape))
+                        .collect(),
+                )
+                .expect("non-empty return variable list"),
             )
             .expect("unique return variables"),
         )
@@ -167,7 +183,13 @@ mod tests {
             .insert(ignored.clone(), ExecutionValue::Stream(Vec::new()));
 
         let result = ctx
-            .finish(root, &return_variables(vec!["all", "selected"]))
+            .finish(
+                root,
+                &return_variables(vec![
+                    ("all", exec::ReturnShape::Scalar),
+                    ("selected", exec::ReturnShape::Scalar),
+                ]),
+            )
             .unwrap();
 
         assert_eq!(result.last, Some(ExecutionValue::Stream(vec![row(7)])));
@@ -177,10 +199,13 @@ mod tests {
             Some(&ExecutionValue::Stream(Vec::new()))
         );
         assert_eq!(result.returns.len(), 2);
-        assert_eq!(result.returns.get(&all), Some(&ExecutionValue::Count(11)));
+        assert_eq!(
+            result.returns.get(&all),
+            Some(&ReturnedValue::Present(ExecutionValue::Count(11)))
+        );
         assert_eq!(
             result.returns.get(&selected),
-            Some(&ExecutionValue::Bool(true))
+            Some(&ReturnedValue::Present(ExecutionValue::Bool(true)))
         );
         assert!(!result.returns.contains_key(&ignored));
     }
@@ -195,7 +220,7 @@ mod tests {
         ctx.variables
             .insert(bound.clone(), ExecutionValue::Stream(vec![row(1), row(2)]));
 
-        let result = ctx.finish(root, &ir::ReturnPlan::None).unwrap();
+        let result = ctx.finish(root, &exec::ExecutableReturns::None).unwrap();
 
         assert_eq!(result.last, Some(ExecutionValue::Count(3)));
         assert!(result.returns.is_empty());
@@ -211,12 +236,64 @@ mod tests {
         let mut ctx = ExecutionContext::new(&db, context::ParamBindings::default());
 
         let err = ctx
-            .finish(step_id(1), &return_variables(vec!["missing"]))
+            .finish(
+                step_id(1),
+                &return_variables(vec![("missing", exec::ReturnShape::Scalar)]),
+            )
             .unwrap_err();
 
         assert!(err
             .to_string()
             .contains("return variable `missing` is not bound"));
+    }
+
+    #[tokio::test]
+    async fn finish_normalizes_only_empty_list_and_object_returns() {
+        let db = test_support::open_db("state-finish-empty-shapes").await;
+        let root = step_id(1);
+        let list = name("list");
+        let object = name("object");
+        let scalar = name("scalar");
+        let missing_list = name("missing_list");
+        let missing_object = name("missing_object");
+        let mut ctx = ExecutionContext::new(&db, context::ParamBindings::default());
+        ctx.variables
+            .insert(list.clone(), ExecutionValue::Stream(Vec::new()));
+        ctx.variables
+            .insert(object.clone(), ExecutionValue::Scalars(Vec::new()));
+        ctx.variables
+            .insert(scalar.clone(), ExecutionValue::Count(0));
+
+        let result = ctx
+            .finish(
+                root,
+                &return_variables(vec![
+                    ("list", exec::ReturnShape::List),
+                    ("object", exec::ReturnShape::Object),
+                    ("scalar", exec::ReturnShape::Scalar),
+                    ("missing_list", exec::ReturnShape::List),
+                    ("missing_object", exec::ReturnShape::Object),
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(result.returns.get(&list), Some(&ReturnedValue::EmptyList));
+        assert_eq!(
+            result.returns.get(&object),
+            Some(&ReturnedValue::EmptyObject)
+        );
+        assert_eq!(
+            result.returns.get(&scalar),
+            Some(&ReturnedValue::Present(ExecutionValue::Count(0)))
+        );
+        assert_eq!(
+            result.returns.get(&missing_list),
+            Some(&ReturnedValue::EmptyList)
+        );
+        assert_eq!(
+            result.returns.get(&missing_object),
+            Some(&ReturnedValue::EmptyObject)
+        );
     }
 
     #[tokio::test]

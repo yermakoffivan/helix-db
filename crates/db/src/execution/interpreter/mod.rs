@@ -30,7 +30,7 @@ pub mod production_contracts;
 
 pub use types::{
     ElementRef, ExecutionResult, ExecutionRow, ExecutionScalar, ExecutionValue, FoldedStream,
-    RowPath, RowSack, RowVirtualProperties,
+    ReturnedValue, RowPath, RowSack, RowVirtualProperties,
 };
 use types::{ExecutionValueSlot, ExecutionValueStore};
 
@@ -160,7 +160,7 @@ impl<'db> Interpreter<'db> {
         {
             return Err(error);
         }
-        let result = self.ctx.finish(plan.root(), plan.returns());
+        let result = self.ctx.finish(plan.root(), plan.executable_returns());
         if result.is_ok()
             && matches!(
                 request_mode,
