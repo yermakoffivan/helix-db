@@ -4210,6 +4210,8 @@ to address the failure. Statuses list the current HTTP behavior; `400/503` and
 | `invalid_index_operation_id` | An index lifecycle operation ID is invalid. | 400 | After fixing the ID | Yes |
 | `unsupported_edge_all_target` | An all-edges reference was used as a finite mutation target. | 400 | After changing the traversal | Yes |
 | `non_literal_index_expression` | An index operation expression is not a literal or parameter. | 400 | After changing the expression | Yes |
+| `missing_planning_equality_parameter` | A parameter needed to plan an equality lookup is not bound. | 400 | After binding the parameter | Yes |
+| `unsupported_planning_equality_parameter` | An equality parameter cannot be represented by the selected index. | 400 | After changing the parameter value | Yes |
 | `invalid_search_tenant` | A tenant was supplied for an unscoped search index. | 400 | After fixing tenant usage | Yes |
 | `invalid_search_tenant_value` | A search tenant value has the wrong shape. | 400 | After fixing the value | Yes |
 | `invalid_search_result_count` | A search result count is zero. | 400 | After using a positive count | Yes |

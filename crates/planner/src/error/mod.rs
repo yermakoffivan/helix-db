@@ -297,6 +297,12 @@ impl PlannerError {
             Self::NonLiteralIndexExpression { .. } => {
                 error_code::QueryErrorCode::NonLiteralIndexExpression
             }
+            Self::MissingPlanningEqualityParameter { .. } => {
+                error_code::QueryErrorCode::MissingPlanningEqualityParameter
+            }
+            Self::UnsupportedPlanningEqualityParameter { .. } => {
+                error_code::QueryErrorCode::UnsupportedPlanningEqualityParameter
+            }
             Self::MissingSearchIndex { .. } => error_code::QueryErrorCode::IndexNotFound,
             Self::InvalidSearchTenant { .. } => error_code::QueryErrorCode::InvalidSearchTenant,
             Self::InvalidSearchTenantValue { .. } => {
@@ -438,6 +444,14 @@ mod tests {
                     expression: "param".to_string(),
                 },
                 Code::NonLiteralIndexExpression,
+            ),
+            (
+                PlannerError::MissingPlanningEqualityParameter { param: name() },
+                Code::MissingPlanningEqualityParameter,
+            ),
+            (
+                PlannerError::UnsupportedPlanningEqualityParameter { param: name() },
+                Code::UnsupportedPlanningEqualityParameter,
             ),
             (
                 PlannerError::MissingSearchIndex {

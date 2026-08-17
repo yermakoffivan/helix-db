@@ -36,6 +36,10 @@ pub enum QueryErrorCode {
     UnsupportedEdgeAllTarget,
     /// An index expression was not a literal or parameter.
     NonLiteralIndexExpression,
+    /// A parameter required to select an equality algorithm was not bound.
+    MissingPlanningEqualityParameter,
+    /// A bound equality parameter cannot be represented by an index literal.
+    UnsupportedPlanningEqualityParameter,
     /// A search tenant was supplied for an unscoped index.
     InvalidSearchTenant,
     /// A search tenant value has the wrong shape.
@@ -193,6 +197,8 @@ impl QueryErrorCode {
         Self::InternalPlannerError,
         Self::UnsupportedEdgeAllTarget,
         Self::NonLiteralIndexExpression,
+        Self::MissingPlanningEqualityParameter,
+        Self::UnsupportedPlanningEqualityParameter,
         Self::InvalidSearchTenant,
         Self::InvalidSearchTenantValue,
         Self::InvalidSearchResultCount,
@@ -279,6 +285,8 @@ impl QueryErrorCode {
             Self::InternalPlannerError => "internal_planner_error",
             Self::UnsupportedEdgeAllTarget => "unsupported_edge_all_target",
             Self::NonLiteralIndexExpression => "non_literal_index_expression",
+            Self::MissingPlanningEqualityParameter => "missing_planning_equality_parameter",
+            Self::UnsupportedPlanningEqualityParameter => "unsupported_planning_equality_parameter",
             Self::InvalidSearchTenant => "invalid_search_tenant",
             Self::InvalidSearchTenantValue => "invalid_search_tenant_value",
             Self::InvalidSearchResultCount => "invalid_search_result_count",
